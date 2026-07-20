@@ -1,0 +1,45 @@
+scale_estimation:
+  enabled: true
+  min_samples: 20
+  max_samples: 300
+  min_conf: 0.35
+  min_box_width_px: 30
+  min_box_height_px: 25
+  max_box_width_px: 500
+  max_box_height_px: 400
+
+  reference_vehicle_lengths_m:
+    car: 4.5
+    truck: 7.0
+    bus: 10.5
+    motorcycle: 2.1
+
+  reference_vehicle_widths_m:
+    car: 1.8
+    truck: 2.5
+    bus: 2.55
+    motorcycle: 0.8
+
+  use_width: true
+  use_height: true
+  trim_ratio: 0.15
+
+calibration_defaults:
+  tolerance_kmh: 5
+
+  road_roi:
+    enabled: false
+    polygon: []
+
+  measurement:
+    mode: "pixel_scale"
+    direction: "AUTO"
+    line_a: []
+    line_b: []
+    distance_m: null
+
+  scale:
+    source: "auto_vehicle_size"
+    meter_per_pixel: null
+    confidence: 0.0
+    user_corrected: false

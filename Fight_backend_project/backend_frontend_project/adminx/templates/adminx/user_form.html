@@ -1,0 +1,67 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Kullanıcı Düzenle{% endblock %}
+{% block page_title %}Kullanıcı Düzenle{% endblock %}
+{% block page_desc %}
+Admin olarak kullanıcı bilgilerini güncelleyebilirsiniz.
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/user_form.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<section class="edit-user-page">
+  <div class="edit-user-card">
+    <div class="edit-user-header">
+      <div>
+        <span class="edit-user-eyebrow">Kullanıcı İşlemi</span>
+        <h2>{{ profile.user.username }}</h2>
+        <p>Kullanıcı adı, e-posta, fakülte, rol ve hesap durumunu düzenleyin.</p>
+      </div>
+
+      <div class="edit-user-avatar">
+        {{ profile.user.username|first|upper }}
+      </div>
+    </div>
+
+    <form method="post" class="edit-user-form">
+      {% csrf_token %}
+
+      <div class="edit-user-grid">
+        {% for field in form %}
+        <div class="edit-user-field">
+          <label for="{{ field.id_for_label }}">{{ field.label }}</label>
+          {{ field }}
+
+          {% for error in field.errors %}
+          <small class="edit-user-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+
+      {% if form.non_field_errors %}
+      <div class="edit-user-error-box">
+        {{ form.non_field_errors }}
+      </div>
+      {% endif %}
+
+      <div class="edit-user-actions">
+        <button type="submit" class="btn primary">
+          Güncelle
+        </button>
+
+        <a href="{% url 'adminx:user_list' %}" class="btn ghost">
+          İptal
+        </a>
+      </div>
+    </form>
+  </div>
+</section>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{% static 'adminx/js/user_form.js' %}?v=1"></script>
+{% endblock %}

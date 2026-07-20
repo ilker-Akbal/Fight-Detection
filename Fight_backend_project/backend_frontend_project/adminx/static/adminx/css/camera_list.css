@@ -1,0 +1,111 @@
+.camera-list-page {
+  display: grid;
+  gap: 16px;
+}
+
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 7px 11px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.status-badge.active {
+  color: #166534;
+  background: #dcfce7;
+  border: 1px solid #bbf7d0;
+}
+
+.status-badge.passive {
+  color: #991b1b;
+  background: #fee2e2;
+  border: 1px solid #fecaca;
+}
+
+.status-badge.info {
+  color: #1d4ed8;
+  background: #dbeafe;
+  border: 1px solid #bfdbfe;
+}
+
+.status-badge.warning {
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fde68a;
+}
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.speed-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.speed-limit-text {
+  color: #334155;
+  font-size: 12px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+
+.source-cell {
+  max-width: 320px;
+  word-break: break-all;
+  color: #475569;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.admin-message-stack {
+  margin-bottom: 16px;
+  display: grid;
+  gap: 10px;
+}
+
+.admin-message {
+  padding: 14px 16px;
+  border-radius: 16px;
+  border: 1px solid rgba(22, 119, 255, 0.18);
+  background: #eff6ff;
+  color: #1d4ed8;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.admin-message.success {
+  border-color: rgba(22, 163, 74, 0.2);
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.admin-message.warning {
+  border-color: rgba(217, 119, 6, 0.22);
+  background: #fffbeb;
+  color: #92400e;
+}
+
+.admin-message.error,
+.admin-message.danger {
+  border-color: rgba(220, 38, 38, 0.2);
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+@media (max-width: 980px) {
+  .source-cell {
+    max-width: none;
+  }
+
+  .speed-limit-text {
+    white-space: normal;
+  }
+}

@@ -1,0 +1,191 @@
+{% load static %}
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}Admin Panel{% endblock %}</title>
+
+    <link rel="stylesheet" href="{% static 'adminx/css/base.css' %}?v=1" />
+
+    {% block extra_css %}{% endblock %}
+  </head>
+
+  <body
+    id="admin-base"
+    data-fight-status-url="{% url 'dashboard:events' %}"
+    data-speed-status-url="{% url 'speed_detection:status' %}"
+  >
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="sidebar__inner">
+          <div class="brand">
+            <div class="brand__mark">AI</div>
+
+            <div class="brand__text">
+              <h2 class="brand__title">Güvenlik Admin</h2>
+              <p class="brand__subtitle">Kavga + Hız Tespit Yönetimi</p>
+            </div>
+          </div>
+
+          <div class="nav-label">Yönetim</div>
+
+          <nav class="nav">
+            <a
+              href="{% url 'adminx:dashboard' %}"
+              class="{% if request.resolver_match.url_name == 'dashboard' %}is-active{% endif %}"
+            >
+              Dashboard
+            </a>
+
+            <a
+              href="{% url 'adminx:camera_list' %}"
+              class="{% if request.resolver_match.url_name == 'camera_list' or request.resolver_match.url_name == 'camera_create' or request.resolver_match.url_name == 'camera_edit' or request.resolver_match.url_name == 'camera_delete' %}is-active{% endif %}"
+            >
+              Kameralar
+            </a>
+
+            <a
+              href="{% url 'adminx:camera_create' %}"
+              class="{% if request.resolver_match.url_name == 'camera_create' %}is-active{% endif %}"
+            >
+              Kamera Ekle
+            </a>
+
+            <a
+              href="{% url 'adminx:faculty_location_list' %}"
+              class="{% if request.resolver_match.url_name == 'faculty_location_list' or request.resolver_match.url_name == 'faculty_location_edit' %}is-active{% endif %}"
+            >
+              Fakülte / Mevki Ekle
+            </a>
+
+            <a
+              href="{% url 'adminx:user_list' %}"
+              class="{% if request.resolver_match.url_name == 'user_list' or request.resolver_match.url_name == 'user_update' %}is-active{% endif %}"
+            >
+              Kullanıcılar
+            </a>
+
+            <a
+              href="{% url 'adminx:incident_list' %}"
+              class="nav-fight {% if request.resolver_match.url_name == 'incident_list' %}is-active{% endif %}"
+            >
+              Kavga Kayıtları
+            </a>
+
+            <a
+              href="{% url 'adminx:speed_record_list' %}"
+              class="nav-speed {% if request.resolver_match.url_name == 'speed_record_list' %}is-active{% endif %}"
+            >
+              Hız Kayıtları
+            </a>
+
+            <a href="{% url 'dashboard:index' %}" class="nav-fight">
+              Güvenlik Ekranı
+            </a>
+
+            <a href="{% url 'speed_detection:index' %}" class="nav-speed">
+              Hız Ekranı
+            </a>
+          </nav>
+        </div>
+      </aside>
+
+      <div class="main-shell">
+        <main class="main">
+          <div class="topbar">
+            <div class="topbar-left"></div>
+
+            <div class="top-actions">
+              <div class="user-badge">
+                <div class="user-badge__avatar">
+                  {{ request.user.username|slice:":1"|upper }}
+                </div>
+
+                <div class="user-badge__meta">
+                  <span class="user-badge__name">{{ request.user.username }}</span>
+                  <span class="user-badge__role">Administrator</span>
+                </div>
+              </div>
+
+              <form
+                method="post"
+                action="{% url 'accounts:logout' %}"
+                class="logout-form"
+              >
+                {% csrf_token %}
+                <button type="submit" class="btn danger">Çıkış Yap</button>
+              </form>
+            </div>
+          </div>
+
+          <div class="page-head">
+            <div class="page-head__content">
+              <h1>{% block page_title %}Admin Dashboard{% endblock %}</h1>
+              <p>{% block page_desc %}Kavga tespiti, hız tespiti, kamera ve kullanıcı yönetimi{% endblock %}</p>
+            </div>
+
+            <div class="page-head__actions">
+              {% block page_actions %}{% endblock %}
+            </div>
+          </div>
+
+          <div class="admin-live-status-grid">
+            <div class="admin-live-status" id="admin-fight-status-card">
+              <div class="admin-live-status__main">
+                <div class="admin-live-status__icon" id="admin-fight-status-icon">●</div>
+
+                <div class="admin-live-status__content">
+                  <span class="admin-live-status__label">Kavga Modülü</span>
+                  <h3>Kavga Tespit Sistemi</h3>
+                  <p id="admin-fight-status-text">
+                    Sistem durumu kontrol ediliyor...
+                  </p>
+                </div>
+              </div>
+
+              <div class="admin-live-status__stat">
+                <span>Durum</span>
+                <strong id="admin-fight-running" data-module-running>-</strong>
+              </div>
+
+              <div class="admin-live-status__stat">
+                <span>Aktif Kamera</span>
+                <strong id="admin-fight-camera-count">-</strong>
+              </div>
+            </div>
+
+            <div class="admin-live-status admin-live-status--speed" id="admin-speed-status-card">
+              <div class="admin-live-status__main">
+                <div class="admin-live-status__icon" id="admin-speed-status-icon">●</div>
+
+                <div class="admin-live-status__content">
+                  <span class="admin-live-status__label">Hız Modülü</span>
+                  <h3>Hız Tespit Sistemi</h3>
+                  <p id="admin-speed-status-text">
+                    Sistem durumu kontrol ediliyor...
+                  </p>
+                </div>
+              </div>
+
+              <div class="admin-live-status__stat">
+                <span>Durum</span>
+                <strong id="admin-speed-running" data-module-running>-</strong>
+              </div>
+
+              <div class="admin-live-status__stat">
+                <span>Aktif Kamera</span>
+                <strong id="admin-speed-camera-count">-</strong>
+              </div>
+            </div>
+          </div>
+
+          {% block content %}{% endblock %}
+        </main>
+      </div>
+    </div>
+
+    <script src="{% static 'adminx/js/base.js' %}?v=1"></script>
+    {% block extra_scripts %}{% endblock %}
+  </body>
+</html>

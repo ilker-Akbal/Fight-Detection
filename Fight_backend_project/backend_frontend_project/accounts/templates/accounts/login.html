@@ -1,0 +1,134 @@
+{% load static %}
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Giriş Yap</title>
+    <link rel="stylesheet" href="{% static 'accounts/login.css' %}" />
+  </head>
+
+  <body>
+    <div class="wrap single">
+      <main class="card auth-card">
+        <header class="card__header">
+          <div class="card__brand">
+            <img
+              class="card__logo"
+              src="{% static 'images/togu-logo.png' %}"
+              alt="TOGÜ Logo"
+            />
+            <div>
+              <h2>Giriş Yap</h2>
+              <p class="sub">Devam etmek için kullanıcı bilgilerini gir.</p>
+            </div>
+          </div>
+        </header>
+
+        {% if error %}
+        <div class="alert" role="alert">
+          <div class="alert__icon">!</div>
+          <div><b>Hata:</b> {{ error }}</div>
+        </div>
+        {% endif %}
+
+        <form
+          class="form auth-form"
+          method="post"
+          action="{% url 'accounts:login' %}"
+          novalidate
+          onsubmit="
+            document.getElementById('loginBtn').disabled = true;
+            document.getElementById('loginBtn').innerText =
+              'Giriş yapılıyor...';
+          "
+        >
+          {% csrf_token %}
+          <input type="hidden" name="next" value="{{ next_url }}" />
+
+          <div class="field">
+            <label for="username">Kullanıcı Adı</label>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              placeholder="ornek@togu.edu.tr"
+              autocomplete="username"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="password">Şifre</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              placeholder="••••••••"
+              autocomplete="current-password"
+              required
+            />
+          </div>
+
+          <button class="btn" id="loginBtn" type="submit">Giriş Yap</button>
+        </form>
+
+        <div class="auth-link-panel">
+          <a
+            href="{% url 'accounts:password_reset_request' %}"
+            class="auth-link-card"
+          >
+            <span class="auth-link-card__title">Şifremi Unuttum</span>
+            <span class="auth-link-card__text"
+              >Şifre yenileme bağlantısı al</span
+            >
+          </a>
+
+          <a href="{% url 'accounts:register' %}" class="auth-link-card">
+            <span class="auth-link-card__title">Kayıt Ol</span>
+            <span class="auth-link-card__text"
+              >Yeni hesap başvurusu oluştur</span
+            >
+          </a>
+        </div>
+
+        <section class="devs devs--compact" aria-label="Geliştiriciler">
+          <div class="devs__title">Geliştiriciler</div>
+
+          <div class="devs__grid">
+            <a
+              class="devs__item"
+              href="https://www.linkedin.com/in/huseyin-dogan-47136333b/"
+              target="_blank"
+              rel="noopener"
+            >
+              <span class="devs__avatar">H</span>
+              <span class="devs__content">
+                <span class="devs__name">Hüseyin Doğan</span>
+                <span class="devs__meta">LinkedIn ↗</span>
+              </span>
+            </a>
+
+            <a
+              class="devs__item"
+              href="https://www.linkedin.com/in/ilker-akbal-b963ab25a/"
+              target="_blank"
+              rel="noopener"
+            >
+              <span class="devs__avatar">İ</span>
+              <span class="devs__content">
+                <span class="devs__name">İlker Akbal</span>
+                <span class="devs__meta">LinkedIn ↗</span>
+              </span>
+            </a>
+          </div>
+        </section>
+
+        <div class="copyright">
+          © {% now "Y" %} Tokat Gaziosmanpaşa Üniversitesi Yapay Zeka
+          Koordinatörlüğü
+        </div>
+      </main>
+    </div>
+  </body>
+</html>

@@ -1,0 +1,493 @@
+.speed-page {
+    width: calc(100vw - 140px);
+    max-width: 1720px;
+    margin: 28px 40px 40px 100px;
+  }
+
+  .speed-hero {
+    display: grid;
+    grid-template-columns: 1.4fr 0.9fr;
+    gap: 18px;
+    margin-bottom: 20px;
+  }
+
+  .speed-card {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 28px;
+    box-shadow: 0 16px 40px rgba(15, 23, 42, 0.07);
+    padding: 22px;
+  }
+
+  .speed-card h2,
+  .speed-card h3 {
+    margin: 0;
+    color: #0f172a;
+    font-weight: 900;
+  }
+
+  .speed-card p {
+    margin: 8px 0 0;
+    color: #64748b;
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.6;
+  }
+
+  .speed-actions {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-top: 18px;
+  }
+
+  .speed-action-btn {
+    appearance: none;
+    border: 0;
+    cursor: pointer;
+    min-height: 38px;
+    padding: 0 16px;
+    border-radius: 999px;
+    font-size: 13px;
+    font-weight: 900;
+    text-decoration: none;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-shadow: 0 8px 20px rgba(15, 23, 42, 0.10);
+    transition: 0.15s ease;
+  }
+
+  .speed-action-btn--start {
+    color: #ffffff;
+    background: #16a34a;
+  }
+
+  .speed-action-btn--stop {
+    color: #ffffff;
+    background: #dc2626;
+  }
+
+  .speed-action-btn--settings {
+    color: #0f172a;
+    background: #e2e8f0;
+  }
+
+  .speed-action-btn--calibrate {
+    color: #ffffff;
+    background: #2563eb;
+  }
+
+  .speed-action-btn:hover {
+    filter: brightness(0.97);
+    transform: translateY(-1px);
+  }
+
+  .speed-action-btn:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+    transform: none;
+  }
+
+  .speed-messages {
+    display: grid;
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .speed-message {
+    padding: 13px 16px;
+    border-radius: 18px;
+    font-size: 13px;
+    font-weight: 800;
+    line-height: 1.5;
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+    color: #0f172a;
+    white-space: pre-wrap;
+  }
+
+  .speed-message.success {
+    background: #dcfce7;
+    border-color: #bbf7d0;
+    color: #166534;
+  }
+
+  .speed-message.error {
+    background: #fee2e2;
+    border-color: #fecaca;
+    color: #991b1b;
+  }
+
+  .speed-message.warning {
+    background: #fef3c7;
+    border-color: #fde68a;
+    color: #92400e;
+  }
+
+  .speed-runtime-error {
+    display: none;
+    margin-top: 14px;
+    padding: 14px;
+    border-radius: 18px;
+    background: #0f172a;
+    color: #e2e8f0;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    overflow-x: auto;
+    max-height: 260px;
+  }
+
+  .speed-summary {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+  }
+
+  .speed-summary__item {
+    padding: 16px;
+    border-radius: 20px;
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+  }
+
+  .speed-summary__item span {
+    display: block;
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 900;
+  }
+
+  .speed-summary__item strong {
+    display: block;
+    margin-top: 6px;
+    color: #0f172a;
+    font-size: 22px;
+    font-weight: 900;
+  }
+
+  .speed-camera-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(310px, 1fr));
+    gap: 16px;
+    margin-top: 14px;
+  }
+
+  .speed-camera-card {
+    border: 1px solid #e2e8f0;
+    border-radius: 22px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .speed-camera-card__head {
+    padding: 14px;
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .speed-camera-card__head strong {
+    display: block;
+    color: #0f172a;
+    font-size: 14px;
+    font-weight: 900;
+  }
+
+  .speed-camera-card__head small {
+    display: block;
+    margin-top: 3px;
+    color: #64748b;
+    font-size: 12px;
+    font-weight: 700;
+  }
+
+  .speed-preview {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #0f172a;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+
+  .speed-preview img,
+  .speed-live-stream {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
+  }
+
+  .speed-preview span {
+    color: #94a3b8;
+    font-size: 13px;
+    font-weight: 800;
+  }
+
+  .speed-camera-meta {
+    padding: 14px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .speed-camera-meta div {
+    padding: 10px;
+    border-radius: 14px;
+    background: #f8fafc;
+  }
+
+  .speed-camera-meta span {
+    display: block;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 900;
+  }
+
+  .speed-camera-meta strong {
+    display: block;
+    margin-top: 4px;
+    color: #0f172a;
+    font-size: 13px;
+    font-weight: 900;
+  }
+
+  .speed-camera-calibration {
+    padding: 0 14px 14px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .speed-camera-calibration small {
+    width: 100%;
+    display: block;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 800;
+    line-height: 1.45;
+  }
+
+  .speed-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 7px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 900;
+    white-space: nowrap;
+  }
+
+  .speed-badge--on {
+    color: #166534;
+    background: #dcfce7;
+    border: 1px solid #bbf7d0;
+  }
+
+  .speed-badge--off {
+    color: #991b1b;
+    background: #fee2e2;
+    border: 1px solid #fecaca;
+  }
+
+  .speed-badge--warn {
+    color: #92400e;
+    background: #fef3c7;
+    border: 1px solid #fde68a;
+  }
+
+  .speed-table-shell {
+    margin-top: 20px;
+  }
+
+  .speed-snapshot {
+    width: 132px;
+    height: 76px;
+    object-fit: cover;
+    border-radius: 12px;
+    border: 1px solid #e2e8f0;
+    background: #f8fafc;
+  }
+
+  .speed-video {
+    width: 180px;
+    max-width: 100%;
+    border-radius: 12px;
+    background: #0f172a;
+  }
+
+  .empty-state {
+    padding: 18px;
+    border-radius: 18px;
+    background: #f8fafc;
+    border: 1px dashed #cbd5e1;
+    color: #64748b;
+    font-size: 13px;
+    font-weight: 800;
+  }
+
+  @media (max-width: 1000px) {
+    .speed-page {
+      width: calc(100% - 24px);
+      margin: 16px auto 32px;
+    }
+
+    .speed-hero {
+      grid-template-columns: 1fr;
+    }
+
+    .speed-summary {
+      grid-template-columns: 1fr;
+    }
+  }
+
+/* ================================
+   CAMERA FULLSCREEN VIEWER
+================================ */
+
+body.speed-camera-fullscreen-open {
+  overflow: hidden;
+}
+
+.speed-preview {
+  position: relative;
+  cursor: zoom-in;
+}
+
+.speed-preview::after {
+  content: "⛶";
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  width: 34px;
+  height: 34px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #ffffff;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.28);
+  opacity: 0;
+  transform: translateY(4px);
+  transition: 0.16s ease;
+  pointer-events: none;
+  font-size: 17px;
+  font-weight: 900;
+}
+
+.speed-preview:hover::after {
+  opacity: 1;
+  transform: translateY(0);
+}
+
+.speed-camera-fullscreen-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  background: rgba(2, 6, 23, 0.82);
+  backdrop-filter: blur(7px);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.18s ease;
+}
+
+.speed-camera-fullscreen-backdrop.is-open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.speed-camera-card.is-fullscreen {
+  position: fixed;
+  inset: 24px;
+  z-index: 9999;
+  width: auto;
+  height: auto;
+  display: flex;
+  flex-direction: column;
+  border-radius: 28px;
+  overflow: hidden;
+  background: #ffffff;
+  box-shadow: 0 34px 110px rgba(0, 0, 0, 0.42);
+}
+
+.speed-camera-card.is-fullscreen .speed-camera-card__head {
+  flex: 0 0 auto;
+  background: #ffffff;
+  align-items: center;
+}
+
+.speed-camera-card.is-fullscreen .speed-preview {
+  flex: 1;
+  min-height: 0;
+  aspect-ratio: auto;
+  cursor: zoom-out;
+  background: #020617;
+}
+
+.speed-camera-card.is-fullscreen .speed-preview::after {
+  display: none;
+}
+
+.speed-camera-card.is-fullscreen .speed-preview img,
+.speed-camera-card.is-fullscreen .speed-live-stream {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #020617;
+}
+
+.speed-camera-card.is-fullscreen .speed-camera-meta,
+.speed-camera-card.is-fullscreen .speed-camera-calibration {
+  display: none;
+}
+
+.speed-camera-fullscreen-close {
+  appearance: none;
+  border: 0;
+  cursor: pointer;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: #ffffff;
+  background: #0f172a;
+  font-size: 13px;
+  font-weight: 900;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18);
+  transition: 0.15s ease;
+}
+
+.speed-camera-fullscreen-close:hover {
+  transform: translateY(-1px);
+  background: #1e293b;
+}
+
+.speed-camera-fullscreen-close span:first-child {
+  font-size: 20px;
+  line-height: 1;
+}
+
+@media (max-width: 768px) {
+  .speed-camera-card.is-fullscreen {
+    inset: 10px;
+    border-radius: 20px;
+  }
+
+  .speed-camera-fullscreen-close {
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 12px;
+  }
+}

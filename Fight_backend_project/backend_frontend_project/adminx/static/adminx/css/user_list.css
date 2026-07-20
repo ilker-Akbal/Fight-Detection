@@ -1,0 +1,254 @@
+.user-management-page {
+  width: 100%;
+  max-width: none;
+}
+
+.user-list-panel {
+  width: 100%;
+  max-width: none;
+  overflow: hidden;
+}
+
+.user-table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: hidden;
+  border-radius: 22px;
+  background: #ffffff;
+}
+
+.user-table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+}
+
+.user-table thead th {
+  padding: 16px 18px;
+  background: #f8fafc;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 900;
+  text-align: left;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-bottom: 1px solid #e2e8f0;
+  white-space: nowrap;
+}
+
+.user-table tbody td {
+  padding: 18px;
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 700;
+  vertical-align: middle;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.user-table tbody tr:hover {
+  background: #f8fafc;
+}
+
+.user-table th:nth-child(1),
+.user-table td:nth-child(1) {
+  width: 20%;
+}
+
+.user-table th:nth-child(2),
+.user-table td:nth-child(2) {
+  width: 18%;
+}
+
+.user-table th:nth-child(3),
+.user-table td:nth-child(3) {
+  width: 10%;
+}
+
+.user-table th:nth-child(4),
+.user-table td:nth-child(4) {
+  width: 15%;
+}
+
+.user-table th:nth-child(5),
+.user-table td:nth-child(5) {
+  width: 15%;
+}
+
+.user-table th:nth-child(6),
+.user-table td:nth-child(6) {
+  width: 12%;
+}
+
+.user-table th:nth-child(7),
+.user-table td:nth-child(7) {
+  width: 10%;
+}
+
+.user-main {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
+}
+
+.user-main__name {
+  color: #0f172a;
+  font-size: 14px;
+  font-weight: 900;
+  word-break: break-word;
+}
+
+.user-main__mail {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.user-faculty {
+  color: #0f172a;
+  font-size: 13px;
+  font-weight: 800;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.user-role {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 11px;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.user-status-stack {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.user-table .status-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 7px 11px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.user-date-stack,
+.user-login-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  color: #0f172a;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.user-date-stack span,
+.user-login-stack span {
+  color: #64748b;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.user-date-stack strong,
+.user-login-stack strong {
+  color: #0f172a;
+  font-size: 12px;
+  font-weight: 900;
+  word-break: break-word;
+}
+
+.user-login-muted {
+  color: #94a3b8 !important;
+}
+
+.user-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: stretch;
+}
+
+.user-actions form {
+  margin: 0;
+}
+
+.user-actions .btn {
+  width: 100%;
+  min-height: 34px;
+  padding: 8px 10px;
+  border-radius: 11px;
+  font-size: 11px;
+  font-weight: 900;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  white-space: nowrap;
+}
+
+.empty-row {
+  padding: 28px !important;
+  text-align: center;
+  color: #64748b;
+  font-weight: 800;
+}
+
+@media (max-width: 1200px) {
+  .user-table thead {
+    display: none;
+  }
+
+  .user-table,
+  .user-table tbody,
+  .user-table tr,
+  .user-table td {
+    display: block;
+    width: 100% !important;
+  }
+
+  .user-table tbody tr {
+    margin-bottom: 16px;
+    border: 1px solid #e2e8f0;
+    border-radius: 18px;
+    overflow: hidden;
+    background: #ffffff;
+  }
+
+  .user-table tbody td {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+    padding: 14px 16px;
+    border-bottom: 1px solid #e2e8f0;
+  }
+
+  .user-table tbody td::before {
+    content: attr(data-label);
+    flex: 0 0 130px;
+    color: #64748b;
+    font-size: 11px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .user-table tbody td:last-child {
+    border-bottom: none;
+  }
+
+  .user-actions {
+    width: 100%;
+    max-width: 220px;
+  }
+}

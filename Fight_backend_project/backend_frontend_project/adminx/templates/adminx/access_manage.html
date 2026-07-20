@@ -1,0 +1,69 @@
+{% extends "adminx/base.html" %} {% block title %}Kamera Yetkileri{% endblock %}
+{% block page_title %}Kamera Yetkileri{% endblock %} {% block page_desc
+%}Kullanıcılara kamera erişimi ver{% endblock %} {% block content %}
+<div class="card">
+  <form method="post" class="form-grid">
+    {% csrf_token %}
+
+    <div class="field">
+      <label for="{{ form.user.id_for_label }}">Kullanıcı</label>
+      {{ form.user }} {{ form.user.errors }}
+    </div>
+
+    <div class="field">
+      <label for="{{ form.camera.id_for_label }}">Kamera</label>
+      {{ form.camera }} {{ form.camera.errors }}
+    </div>
+
+    <div class="field">
+      <label for="{{ form.can_view.id_for_label }}">İzleme Yetkisi</label>
+      {{ form.can_view }} {{ form.can_view.errors }}
+    </div>
+
+    <div class="actions">
+      <button type="submit" class="btn success">Yetki Kaydet</button>
+    </div>
+  </form>
+</div>
+
+<div class="section">
+  <div class="section-head">
+    <h2>Mevcut Yetkiler</h2>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Kullanıcı</th>
+          <th>Kamera</th>
+          <th>İzleyebilir mi?</th>
+          <th>Atanma Tarihi</th>
+          <th>İşlem</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for access in access_list %}
+        <tr>
+          <td>{{ access.user.username }}</td>
+          <td>{{ access.camera.name }} ({{ access.camera.camera_id }})</td>
+          <td>{% if access.can_view %} Evet {% else %} Hayır {% endif %}</td>
+          <td>{{ access.assigned_at }}</td>
+          <td>
+            <a
+              href="{% url 'adminx:access_delete' access.pk %}"
+              class="btn danger"
+              >Sil</a
+            >
+          </td>
+        </tr>
+        {% empty %}
+        <tr>
+          <td colspan="5" class="muted">Henüz yetki ataması yok.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

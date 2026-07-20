@@ -1,0 +1,15 @@
+adminx/templates/adminx/camera_list.html
+guvenlik/templates/dashboard/index.html
+adminx/templates/adminx/camera_delete.html
+adminx/templates/adminx/user_list.html
+adminx/templates/adminx/base.html
+guvenlik/templates/dashboard/index.html
+adminx/templates/adminx/user_delete.html
+accounts/templates/accounts/account_settings.html
+templates/base.html
+adminx/templates/adminx/dashboard.html
+accounts/templates/accounts/password_reset_request.html
+accounts/templates/accounts/password_reset_confirm.html
+adminx/templates/adminx/user_form.html
+accounts/templates/accounts/password_reset_invalid.html
+adminx/templates/adminx/incident_list.html

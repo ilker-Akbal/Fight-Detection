@@ -1,0 +1,20 @@
+{% extends "adminx/base.html" %} {% block title %}Yetki Sil{% endblock %} {%
+block page_title %}Yetki Sil{% endblock %} {% block page_desc %}Kullanıcı kamera
+erişimi kaldırılacak{% endblock %} {% block content %}
+<div class="card">
+  <div class="danger-box">
+    <strong>{{ access.user.username }}</strong> kullanıcısının
+    <strong>{{ access.camera.name }}</strong> kamerasına olan erişimi silinecek.
+  </div>
+
+  <form method="post" style="margin-top: 18px">
+    {% csrf_token %}
+    <div class="actions">
+      <button type="submit" class="btn danger">Evet, Sil</button>
+      <a href="{% url 'adminx:access_manage' %}" class="btn secondary"
+        >Vazgeç</a
+      >
+    </div>
+  </form>
+</div>
+{% endblock %}

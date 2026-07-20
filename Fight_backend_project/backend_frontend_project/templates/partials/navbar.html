@@ -1,0 +1,33 @@
+<nav class="app-navbar">
+  <div class="app-navbar__inner">
+    <div class="app-navbar__left">
+      <a class="app-navbar__brand" href="{% url 'dashboard:index' %}">
+        <span class="app-navbar__brand-dot"></span>
+        <span class="app-navbar__brand-text">Fight Detection</span>
+      </a>
+    </div>
+
+    <button
+      class="app-navbar__toggle"
+      id="navbarToggle"
+      type="button"
+      aria-label="Menüyü Aç"
+    >
+      <span></span>
+      <span></span>
+      <span></span>
+    </button>
+
+    <div class="app-navbar__right" id="navbarMenu">
+      <a
+        class="app-navbar__link app-navbar__link--active"
+        href="{% url 'dashboard:index' %}"
+        >Genel Bakış</a
+      >
+      <a class="app-navbar__link" href="#ip-config">IP Yönetimi</a>
+      <a class="app-navbar__link" href="#stream-preview">Akış Önizleme</a>
+      <a class="app-navbar__link" href="#system-summary">Sistem Özeti</a>
+      <a class="app-navbar__action" href="{% url 'accounts:login' %}">Çıkış</a>
+    </div>
+  </div>
+</nav>

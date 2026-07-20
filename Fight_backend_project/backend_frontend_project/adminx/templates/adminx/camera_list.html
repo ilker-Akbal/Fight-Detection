@@ -1,0 +1,111 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Kameralar{% endblock %}
+{% block page_title %}Kamera Listesi{% endblock %}
+{% block page_desc %}Sistemde kayıtlı tüm kameralar{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/camera_list.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div class="section camera-list-page">
+  <div class="section-head">
+    <h2>Kameralar</h2>
+    <a href="{% url 'adminx:camera_create' %}" class="btn">+ Yeni Kamera</a>
+  </div>
+
+  {% if messages %}
+  <div class="admin-message-stack">
+    {% for message in messages %}
+    <div class="admin-message {{ message.tags }}">
+      {{ message }}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr>
+          <th>Ad</th>
+          <th>Camera ID</th>
+          <th>Fakülte</th>
+          <th>Kaynak</th>
+          <th>Durum</th>
+          <th>Modüller</th>
+          <th>Hız Tespiti</th>
+          <th>İşlem</th>
+        </tr>
+      </thead>
+
+      <tbody>
+        {% for camera in cameras %}
+        <tr>
+          <td>{{ camera.name }}</td>
+          <td>{{ camera.camera_id }}</td>
+          <td>{{ camera.get_faculty_display|default:"-" }}</td>
+          <td class="source-cell">{{ camera.source }}</td>
+
+          <td>
+            {% if camera.is_active %}
+            <span class="status-badge active">Aktif</span>
+            {% else %}
+            <span class="status-badge passive">Pasif</span>
+            {% endif %}
+          </td>
+
+          <td>
+            <div class="badge-row">
+              {% if camera.use_fight_detection %}
+              <span class="status-badge info">Kavga</span>
+              {% endif %}
+
+              {% if camera.use_speed_detection %}
+              <span class="status-badge warning">Hız</span>
+              {% endif %}
+
+              {% if not camera.use_fight_detection and not camera.use_speed_detection %}
+              <span class="status-badge passive">Modül Yok</span>
+              {% endif %}
+            </div>
+          </td>
+
+          <td>
+            <div class="speed-cell">
+              {% if camera.speed_config.enabled %}
+              <span class="status-badge active">Hız Aktif</span>
+              <span class="speed-limit-text">
+                Limit: {{ camera.speed_config.speed_limit_kmh }} km/h
+                + {{ camera.speed_config.tolerance_kmh }} tolerans
+              </span>
+              {% else %}
+              <span class="status-badge passive">Hız Pasif</span>
+              {% endif %}
+            </div>
+          </td>
+
+          <td>
+            <div class="actions">
+              <a href="{% url 'adminx:camera_edit' camera.pk %}" class="btn secondary">
+                Düzenle
+              </a>
+
+              <a href="{% url 'adminx:camera_delete' camera.pk %}" class="btn danger">
+                Sil
+              </a>
+            </div>
+          </td>
+        </tr>
+        {% empty %}
+        <tr>
+          <td colspan="8" class="muted">Henüz kamera kaydı yok.</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}

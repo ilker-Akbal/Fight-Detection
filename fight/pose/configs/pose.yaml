@@ -1,0 +1,46 @@
+model:
+  weights: yolo11s-pose.pt
+  device: 0
+  imgsz: 416
+  conf: 0.18
+  verbose: false
+
+input:
+  roi_size: 320
+  pad_value: 114
+
+filter:
+  min_persons: 2
+  min_kpt_conf: 0.30
+  min_valid_kpts: 7
+
+interaction:
+  max_center_dist_norm: 0.40
+  wrist_dist_norm: 0.18
+  upper_body_dist_norm: 0.22
+  torso_dist_norm: 0.24
+
+  wrist_to_head_norm: 0.16
+  wrist_to_upper_torso_norm: 0.18
+  wrist_to_torso_norm: 0.20
+
+  min_arm_extension: 0.58
+  min_arm_alignment: 0.50
+
+  strike_torso_dist_norm: 0.36
+  grapple_torso_dist_norm: 0.20
+  grapple_upper_body_dist_norm: 0.18
+  grapple_wrist_dist_norm: 0.16
+
+  min_interaction_score: 0.34
+  require_contact_like: true
+
+temporal:
+  window_size: 6
+  need_positive: 2
+  min_mean_score: 0.30
+  peak_score_thr: 0.54
+  min_consecutive: 2
+
+debug:
+  draw: true

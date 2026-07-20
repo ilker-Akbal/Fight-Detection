@@ -1,0 +1,356 @@
+/* =========================================================
+   CAMERA MODAL - VIEWPORT SAFE FULLSCREEN
+========================================================= */
+
+body.camera-modal-open {
+  overflow: hidden;
+}
+
+.camera-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 9998;
+  display: none;
+  padding: 24px;
+}
+
+.camera-modal.is-open {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.camera-modal__backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(2, 6, 23, 0.82);
+  backdrop-filter: blur(7px);
+}
+
+.camera-modal__content {
+  position: relative;
+  z-index: 1;
+  width: min(1280px, calc(100vw - 48px));
+  height: min(820px, calc(100vh - 48px));
+  height: min(820px, calc(100dvh - 48px));
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 28px;
+  background: #ffffff;
+  box-shadow: 0 34px 110px rgba(0, 0, 0, 0.42);
+  animation: cameraModalIn 0.18s ease-out;
+}
+
+.camera-modal__header {
+  flex: 0 0 auto;
+  padding: 16px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  border-bottom: 1px solid #e2e8f0;
+  background: #ffffff;
+}
+
+.camera-modal__header strong {
+  display: block;
+  color: #0f172a;
+  font-size: 16px;
+  font-weight: 900;
+}
+
+.camera-modal__header span {
+  display: block;
+  margin-top: 3px;
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.camera-modal__close {
+  appearance: none;
+  border: 0;
+  cursor: pointer;
+  min-height: 38px;
+  padding: 0 14px;
+  border-radius: 999px;
+  color: #ffffff;
+  background: #0f172a;
+  font-size: 13px;
+  font-weight: 900;
+  box-shadow: 0 10px 24px rgba(15, 23, 42, 0.18);
+  transition: 0.15s ease;
+  white-space: nowrap;
+}
+
+.camera-modal__close:hover {
+  transform: translateY(-1px);
+  background: #1e293b;
+}
+
+.camera-modal__stream {
+  flex: 1;
+  min-height: 0;
+  background: #020617;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.camera-modal__stream img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+  background: #020617;
+}
+
+@keyframes cameraModalIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.985);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* =========================================================
+   FIGHT ALERT MODAL - VIEWPORT SAFE
+========================================================= */
+
+body.fight-alert-modal-open {
+  overflow: hidden;
+}
+
+.fight-alert-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 10000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  overflow-y: auto;
+}
+
+.fight-alert-modal__backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(15, 23, 42, 0.72);
+  backdrop-filter: blur(6px);
+}
+
+.fight-alert-modal__box {
+  position: relative;
+  z-index: 1;
+  width: min(520px, calc(100vw - 48px));
+  max-height: calc(100vh - 48px);
+  max-height: calc(100dvh - 48px);
+  padding: 28px;
+  border-radius: 28px;
+  background: #ffffff;
+  box-shadow: 0 28px 80px rgba(15, 23, 42, 0.35);
+  display: flex;
+  gap: 18px;
+  overflow-y: auto;
+  animation: fightAlertIn 0.22s ease-out;
+}
+
+.fight-alert-modal.is-closing .fight-alert-modal__box {
+  animation: fightAlertOut 0.18s ease-in forwards;
+}
+
+.fight-alert-modal__icon {
+  width: 58px;
+  height: 58px;
+  border-radius: 20px;
+  background: #fee2e2;
+  color: #dc2626;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  font-weight: 900;
+  flex-shrink: 0;
+}
+
+.fight-alert-modal__content {
+  flex: 1;
+  min-width: 0;
+}
+
+.fight-alert-modal__eyebrow {
+  display: inline-flex;
+  margin-bottom: 8px;
+  padding: 5px 10px;
+  border-radius: 999px;
+  background: #fff1f2;
+  color: #be123c;
+  font-size: 11px;
+  font-weight: 900;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.fight-alert-modal__content h2 {
+  margin: 0;
+  color: #0f172a;
+  font-size: 24px;
+  font-weight: 900;
+}
+
+.fight-alert-modal__content p {
+  margin: 10px 0 0;
+  color: #475569;
+  font-size: 14px;
+  line-height: 1.6;
+  font-weight: 700;
+}
+
+.fight-alert-modal__details {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 8px;
+  margin-top: 18px;
+  padding: 14px;
+  border-radius: 18px;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.fight-alert-modal__details div {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.fight-alert-modal__details span {
+  color: #64748b;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.fight-alert-modal__details strong {
+  color: #0f172a;
+  font-size: 12px;
+  font-weight: 900;
+  text-align: right;
+  word-break: break-word;
+}
+
+.fight-alert-modal__actions {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 20px;
+  padding-top: 12px;
+  background: #ffffff;
+}
+
+.fight-alert-modal__primary,
+.fight-alert-modal__secondary {
+  min-height: 42px;
+  padding: 0 16px;
+  border-radius: 14px;
+  border: 0;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 900;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.fight-alert-modal__primary {
+  background: #dc2626;
+  color: #ffffff;
+}
+
+.fight-alert-modal__secondary {
+  background: #f1f5f9;
+  color: #334155;
+}
+
+@keyframes fightAlertIn {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.98);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+@keyframes fightAlertOut {
+  to {
+    opacity: 0;
+    transform: translateY(10px) scale(0.98);
+  }
+}
+
+/* =========================================================
+   RESPONSIVE
+========================================================= */
+
+@media (max-width: 768px) {
+  .camera-modal {
+    padding: 10px;
+  }
+
+  .camera-modal__content {
+    width: calc(100vw - 20px);
+    height: calc(100vh - 20px);
+    height: calc(100dvh - 20px);
+    max-height: calc(100vh - 20px);
+    max-height: calc(100dvh - 20px);
+    border-radius: 20px;
+  }
+
+  .camera-modal__header {
+    padding: 12px;
+  }
+
+  .camera-modal__close {
+    min-height: 34px;
+    padding: 0 12px;
+    font-size: 12px;
+  }
+}
+
+@media (max-width: 560px) {
+  .fight-alert-modal {
+    padding: 12px;
+    align-items: flex-start;
+  }
+
+  .fight-alert-modal__box {
+    width: 100%;
+    max-height: calc(100vh - 24px);
+    max-height: calc(100dvh - 24px);
+    flex-direction: column;
+    padding: 22px;
+    border-radius: 22px;
+  }
+
+  .fight-alert-modal__actions {
+    flex-direction: column;
+  }
+
+  .fight-alert-modal__primary,
+  .fight-alert-modal__secondary {
+    width: 100%;
+  }
+}

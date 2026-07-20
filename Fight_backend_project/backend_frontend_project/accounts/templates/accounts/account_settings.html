@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+
+{% block title %}Hesabım{% endblock %}
+
+{% block content %}
+<div class="account-page">
+  <section class="account-hero">
+    <div>
+      <span class="account-hero__eyebrow">Hesap Yönetimi</span>
+      <h1>Hesabım</h1>
+      <p>
+        Kullanıcı adı, e-posta, fakülte/mevki ve şifre bilgilerinizi bu ekrandan
+        güvenli şekilde güncelleyebilirsiniz.
+      </p>
+    </div>
+
+    <div class="account-hero__user">
+      <div class="account-hero__avatar">
+        {{ request.user.username|first|upper }}
+      </div>
+
+      <div>
+        <span>Aktif kullanıcı</span>
+        <strong>{{ request.user.username }}</strong>
+
+        {% if profile.faculty %}
+          <small>{{ profile.get_faculty_display }}</small>
+        {% else %}
+          <small>Fakülte / mevki bilgisi yok</small>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  {% if messages %}
+    <div class="account-messages">
+      {% for message in messages %}
+        <div class="account-message account-message--{{ message.tags }}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <div class="account-grid">
+    <section class="account-panel">
+      <div class="account-panel__header">
+        <h2>Hesap Bilgileri</h2>
+        <p>
+          Hesabınıza ait temel bilgileri buradan güncelleyebilirsiniz.
+          Fakülte/mevki seçenekleri admin panelinden eklenen aktif kayıtlardan gelir.
+        </p>
+      </div>
+
+      <form method="post" class="account-form">
+        {% csrf_token %}
+
+        {% if account_form.non_field_errors %}
+          <div class="account-form-errors">
+            {{ account_form.non_field_errors }}
+          </div>
+        {% endif %}
+
+        <div class="account-field">
+          <label for="{{ account_form.username.id_for_label }}">
+            Kullanıcı Adı
+          </label>
+
+          {{ account_form.username }}
+
+          {% for error in account_form.username.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-field">
+          <label for="{{ account_form.email.id_for_label }}">
+            E-posta
+          </label>
+
+          {{ account_form.email }}
+
+          {% for error in account_form.email.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-field">
+          <label for="{{ account_form.faculty.id_for_label }}">
+            Fakülte / Mevki
+          </label>
+
+          {{ account_form.faculty }}
+
+          {% for error in account_form.faculty.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-password-note">
+          Fakülte/mevki listesi admin panelindeki aktif kayıtlardan otomatik alınır.
+          Admin panelden pasifleştirilen kayıtlar burada görünmez.
+        </div>
+
+        <div class="account-actions">
+          <button type="submit" name="account_submit" class="account-primary-btn">
+            Bilgileri Güncelle
+          </button>
+        </div>
+      </form>
+    </section>
+
+    <section class="account-panel">
+      <div class="account-panel__header">
+        <h2>Şifre Güncelleme</h2>
+        <p>
+          Şifrenizi değiştirmek için mevcut şifrenizi doğrulayın ve yeni
+          şifrenizi belirleyin.
+        </p>
+      </div>
+
+      <form method="post" class="account-form">
+        {% csrf_token %}
+
+        {% if password_form.non_field_errors %}
+          <div class="account-form-errors">
+            {{ password_form.non_field_errors }}
+          </div>
+        {% endif %}
+
+        <div class="account-field">
+          <label for="{{ password_form.old_password.id_for_label }}">
+            Mevcut Şifre
+          </label>
+
+          {{ password_form.old_password }}
+
+          {% for error in password_form.old_password.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-field">
+          <label for="{{ password_form.new_password1.id_for_label }}">
+            Yeni Şifre
+          </label>
+
+          {{ password_form.new_password1 }}
+
+          {% for error in password_form.new_password1.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-field">
+          <label for="{{ password_form.new_password2.id_for_label }}">
+            Yeni Şifre Tekrar
+          </label>
+
+          {{ password_form.new_password2 }}
+
+          {% for error in password_form.new_password2.errors %}
+            <small class="account-error">{{ error }}</small>
+          {% endfor %}
+        </div>
+
+        <div class="account-password-note">
+          Şifre değiştirildikten sonra oturumunuz açık kalır.
+          Tekrar giriş yapmanız gerekmez.
+        </div>
+
+        <div class="account-actions">
+          <button type="submit" name="password_submit" class="account-primary-btn">
+            Şifreyi Güncelle
+          </button>
+        </div>
+      </form>
+    </section>
+  </div>
+</div>
+{% endblock %}

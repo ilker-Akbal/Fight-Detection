@@ -1,0 +1,167 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Kullanıcılar{% endblock %}
+{% block page_title %}Kullanıcı Yönetimi{% endblock %}
+{% block page_desc %}
+Sisteme kayıtlı kullanıcıları görüntüleyin, düzenleyin, onaylayın, reddedin veya silin.
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/user_list.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div class="content-stack user-management-page">
+  <section class="stats-grid">
+    <div class="card stat stat--purple">
+      <h3>Toplam Kullanıcı</h3>
+      <div class="stat__value">{{ user_count }}</div>
+      <div class="stat__meta">Sistemde kayıtlı tüm hesaplar</div>
+    </div>
+
+    <div class="card stat stat--blue">
+      <h3>Onay Bekleyenler</h3>
+      <div class="stat__value">{{ pending_user_count }}</div>
+      <div class="stat__meta">Admin işlemi bekleyen kullanıcılar</div>
+    </div>
+
+    <div class="card stat stat--mint">
+      <h3>Onaylı Kullanıcılar</h3>
+      <div class="stat__value">{{ approved_user_count }}</div>
+      <div class="stat__meta">Giriş yapabilen kullanıcılar</div>
+    </div>
+  </section>
+
+  <section class="card-panel user-list-panel">
+    <div class="section-head">
+      <div>
+        <h2>Kullanıcı Listesi</h2>
+        <p>Kullanıcıların durum, rol ve giriş bilgileri</p>
+      </div>
+    </div>
+
+    <div class="table-wrap user-table-wrap">
+      <table class="data-table user-table">
+        <thead>
+          <tr>
+            <th>Kullanıcı</th>
+            <th>Fakülte</th>
+            <th>Rol</th>
+            <th>Durum</th>
+            <th>Kayıt / Son Giriş</th>
+            <th>Giriş Bilgisi</th>
+            <th>İşlemler</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {% for item in users %}
+          <tr>
+            <td data-label="Kullanıcı">
+              <div class="user-main">
+                <div class="user-main__name">{{ item.user.username }}</div>
+                <div class="user-main__mail">{{ item.user.email|default:"-" }}</div>
+              </div>
+            </td>
+
+            <td data-label="Fakülte">
+              <div class="user-faculty">
+                {{ item.get_faculty_display|default:"-" }}
+              </div>
+            </td>
+
+            <td data-label="Rol">
+              <span class="user-role">{{ item.get_role_display }}</span>
+            </td>
+
+            <td data-label="Durum">
+              <div class="user-status-stack">
+                {% if item.status == "approved" %}
+                  <span class="status-badge status-success">Onaylandı</span>
+                {% elif item.status == "rejected" %}
+                  <span class="status-badge status-danger">Reddedildi</span>
+                {% else %}
+                  <span class="status-badge status-warning">Bekliyor</span>
+                {% endif %}
+
+                {% if item.user.is_active %}
+                  <span class="status-badge status-info">Aktif</span>
+                {% else %}
+                  <span class="status-badge status-danger">Pasif</span>
+                {% endif %}
+              </div>
+            </td>
+
+            <td data-label="Kayıt / Son Giriş">
+              <div class="user-date-stack">
+                <div>
+                  <span>Kayıt:</span>
+                  <strong>{{ item.user.date_joined|date:"d.m.Y H:i" }}</strong>
+                </div>
+
+                <div>
+                  <span>Son giriş:</span>
+                  {% if item.user.last_login %}
+                    <strong>{{ item.user.last_login|date:"d.m.Y H:i" }}</strong>
+                  {% else %}
+                    <strong class="user-login-muted">-</strong>
+                  {% endif %}
+                </div>
+              </div>
+            </td>
+
+            <td data-label="Giriş Bilgisi">
+              <div class="user-login-stack">
+                <div>
+                  <span>IP:</span>
+                  <strong>{{ item.last_ip|default:"-" }}</strong>
+                </div>
+
+                <div>
+                  <span>Giriş rolü:</span>
+                  <strong>{{ item.last_role_at_login|default:"-" }}</strong>
+                </div>
+
+                <div>
+                  <span>Giriş sayısı:</span>
+                  <strong>{{ item.login_count|default:"0" }}</strong>
+                </div>
+              </div>
+            </td>
+
+            <td data-label="İşlemler">
+              <div class="user-actions">
+                <a href="{% url 'adminx:user_update' item.pk %}" class="btn primary">
+                  Düzenle
+                </a>
+
+                {% if item.status == "pending" %}
+                <form method="post" action="{% url 'adminx:user_approve' item.pk %}">
+                  {% csrf_token %}
+                  <button type="submit" class="btn success">Onayla</button>
+                </form>
+
+                <form method="post" action="{% url 'adminx:user_reject' item.pk %}">
+                  {% csrf_token %}
+                  <button type="submit" class="btn danger">Reddet</button>
+                </form>
+                {% endif %}
+
+                <a href="{% url 'adminx:user_delete' item.pk %}" class="btn danger">
+                  Sil
+                </a>
+              </div>
+            </td>
+          </tr>
+          {% empty %}
+          <tr>
+            <td colspan="7" class="empty-row">Kayıtlı kullanıcı bulunamadı.</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

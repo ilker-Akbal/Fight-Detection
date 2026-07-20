@@ -1,0 +1,218 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}
+  Fakülte / Mevki Yönetimi
+{% endblock %}
+
+{% block page_title %}
+  Fakülte / Mevki Yönetimi
+{% endblock %}
+
+{% block page_desc %}
+  Kamera, kullanıcı ve olay kayıtlarında kullanılacak fakülte/mevki bilgisini buradan yönetebilirsin.
+{% endblock %}
+
+{% block page_actions %}
+  <a href="{% url 'adminx:camera_create' %}" class="btn secondary">
+    Kamera Ekle
+  </a>
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/faculty_location_list.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div class="content-stack">
+  <div class="stats-grid">
+    <div class="card stat stat--purple">
+      <h3>Toplam Kayıt</h3>
+      <div class="stat__value">{{ total_count }}</div>
+      <div class="stat__meta">Tanımlı fakülte / mevki sayısı</div>
+    </div>
+
+    <div class="card stat stat--blue">
+      <h3>Aktif</h3>
+      <div class="stat__value">{{ active_count }}</div>
+      <div class="stat__meta">Kullanıma açık kayıt</div>
+    </div>
+
+    <div class="card stat stat--mint">
+      <h3>Pasif</h3>
+      <div class="stat__value">{{ passive_count }}</div>
+      <div class="stat__meta">Geçici olarak kapalı kayıt</div>
+    </div>
+  </div>
+
+  <div class="faculty-layout-grid">
+    <section class="card">
+      <div class="section-head">
+        <div>
+          {% if editing_item %}
+          <h2>Kaydı Düzenle</h2>
+          <p>{{ editing_item.name }} kaydını güncelliyorsun.</p>
+          {% else %}
+          <h2>Yeni Fakülte / Mevki Ekle</h2>
+          <p>Yeni kamera ve kullanıcı tanımlarında kullanılacak fakülte/mevki bilgisini ekle.</p>
+          {% endif %}
+        </div>
+      </div>
+
+      <form method="post" class="form-grid">
+        {% csrf_token %}
+
+        {% if form.non_field_errors %}
+        <div class="danger-box">
+          {{ form.non_field_errors }}
+        </div>
+        {% endif %}
+
+        <div class="field">
+          <label for="{{ form.name.id_for_label }}">Fakülte / Mevki Adı</label>
+          {{ form.name }}
+
+          {% if form.name.errors %}
+          <div class="danger-box">{{ form.name.errors }}</div>
+          {% endif %}
+        </div>
+
+        <div class="field">
+          <label for="{{ form.description.id_for_label }}">Açıklama</label>
+          {{ form.description }}
+
+          {% if form.description.errors %}
+          <div class="danger-box">{{ form.description.errors }}</div>
+          {% endif %}
+        </div>
+
+        <div class="field">
+          <div class="faculty-status-box">
+            <div class="faculty-status-info">
+              <strong>Kayıt Durumu</strong>
+              <span>Aktif olduğunda kamera ve kullanıcı seçimlerinde görünür.</span>
+            </div>
+
+            <label class="faculty-switch" for="{{ form.is_active.id_for_label }}">
+              {{ form.is_active }}
+              <span class="faculty-switch-slider"></span>
+            </label>
+          </div>
+
+          {% if form.is_active.errors %}
+          <div class="faculty-active-errors">
+            {{ form.is_active.errors }}
+          </div>
+          {% endif %}
+        </div>
+
+        <div class="actions">
+          <button type="submit" class="btn">
+            {% if editing_item %}
+            Güncelle
+            {% else %}
+            Kaydet
+            {% endif %}
+          </button>
+
+          {% if editing_item %}
+          <a href="{% url 'adminx:faculty_location_list' %}" class="btn secondary">
+            Vazgeç
+          </a>
+          {% endif %}
+        </div>
+      </form>
+    </section>
+
+    <section class="table-card">
+      <div class="section-head faculty-table-head">
+        <div>
+          <h2>Kayıtlı Fakülte / Mevkiler</h2>
+          <p>Buradaki kayıtlar kamera, kullanıcı ve olay eşleştirmelerinde kullanılır.</p>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th>Ad</th>
+              <th>Kod</th>
+              <th>Durum</th>
+              <th>Açıklama</th>
+              <th>İşlem</th>
+            </tr>
+          </thead>
+
+          <tbody>
+            {% for item in items %}
+            <tr>
+              <td>
+                <strong>{{ item.name }}</strong>
+              </td>
+
+              <td>
+                <span class="muted">{{ item.code }}</span>
+              </td>
+
+              <td>
+                {% if item.is_active %}
+                <span class="badge success">Aktif</span>
+                {% else %}
+                <span class="badge danger">Pasif</span>
+                {% endif %}
+              </td>
+
+              <td>
+                {% if item.description %}
+                {{ item.description|truncatechars:80 }}
+                {% else %}
+                <span class="muted">-</span>
+                {% endif %}
+              </td>
+
+              <td>
+                <div class="faculty-table-actions">
+                  <a href="{% url 'adminx:faculty_location_edit' item.pk %}" class="btn secondary faculty-action-btn">
+                    Düzenle
+                  </a>
+
+                  <form method="post" action="{% url 'adminx:faculty_location_toggle' item.pk %}" class="faculty-toggle-form">
+                    {% csrf_token %}
+                    <button type="submit" class="btn secondary faculty-action-btn">
+                      {% if item.is_active %}
+                      Pasifleştir
+                      {% else %}
+                      Aktifleştir
+                      {% endif %}
+                    </button>
+                  </form>
+
+                  <form
+                    method="post"
+                    action="{% url 'adminx:faculty_location_delete' item.pk %}"
+                    class="faculty-toggle-form"
+                    onsubmit="return confirm('Bu fakülte/mevki kaydını silmek istediğine emin misin?');"
+                  >
+                    {% csrf_token %}
+                    <button type="submit" class="btn danger faculty-action-btn">
+                      Sil
+                    </button>
+                  </form>
+                </div>
+              </td>
+            </tr>
+            {% empty %}
+            <tr>
+              <td colspan="5" class="empty-row">
+                Henüz fakülte / mevki eklenmemiş.
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

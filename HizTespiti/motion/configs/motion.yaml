@@ -1,0 +1,26 @@
+runtime:
+  show: false
+  save_debug_video: true
+  output_dir: "HizTespiti/motion/out_motion"
+  resize_width: 960
+  max_fps: 0
+
+motion:
+  history: 500
+  var_threshold: 32
+  detect_shadows: true
+  blur_kernel: 5
+  threshold: 35
+  morph_open_kernel: 3
+  morph_close_kernel: 9
+  dilate_iterations: 2
+  min_area: 900
+  max_area_ratio: 0.55
+  min_motion_score: 0.004
+  open_frames: 3
+  close_frames: 8
+  ignore_first_frames: 20
+
+roi:
+  enabled: false
+  polygon: []

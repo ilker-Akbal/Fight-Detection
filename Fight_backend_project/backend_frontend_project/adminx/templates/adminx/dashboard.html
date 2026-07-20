@@ -1,0 +1,240 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Admin Dashboard{% endblock %}
+{% block page_title %}Admin Dashboard{% endblock %}
+{% block page_desc %}
+Kavga tespiti, hız tespiti, kamera durumu, kullanıcı onayları ve operasyon kayıtları
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/dashboard.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div
+  class="admin-dashboard-grid"
+  id="admin-dashboard"
+  data-fight-start-url="{% url 'dashboard:start_detection' %}"
+  data-fight-stop-url="{% url 'dashboard:stop_detection' %}"
+  data-speed-start-url="{% url 'speed_detection:start' %}"
+  data-speed-stop-url="{% url 'speed_detection:stop' %}"
+  data-camera-count="{{ camera_count|default:'0' }}"
+  data-active-camera-count="{{ active_camera_count|default:'0' }}"
+  data-passive-camera-count="{{ passive_camera_count|default:'0' }}"
+  data-fight-camera-count="{{ fight_camera_count|default:'0' }}"
+  data-speed-camera-count="{{ speed_camera_count|default:'0' }}"
+  data-fight-incident-count="{{ fight_incident_count|default:'0' }}"
+  data-speed-record-count="{{ speed_record_count|default:'0' }}"
+  data-approved-user-count="{{ approved_user_count|default:'0' }}"
+  data-pending-user-count="{{ pending_user_count|default:'0' }}"
+  data-rejected-user-count="{{ rejected_user_count|default:'0' }}"
+>
+  {% if messages %}
+  <section class="admin-messages">
+    {% for message in messages %}
+    <div class="admin-message {{ message.tags }}">
+      {{ message }}
+    </div>
+    {% endfor %}
+  </section>
+  {% endif %}
+
+  <section class="module-control-grid">
+    <article class="module-control-card">
+      <div class="module-control-card__head">
+        <div class="module-control-card__icon">⚡</div>
+
+        <div>
+          <h3>Kavga Tespit Kontrolü</h3>
+          <p>
+            Kavga tespit pipeline sürecini başlat, durdur ve güvenlik ekranındaki
+            canlı olay akışını yönet.
+          </p>
+        </div>
+      </div>
+
+      <div class="module-control-card__meta">
+        <div class="module-control-mini">
+          <span>Aktif Kamera</span>
+          <strong>{{ fight_camera_count|default:"0" }}</strong>
+        </div>
+
+        <div class="module-control-mini">
+          <span>Kavga Kaydı</span>
+          <strong>{{ fight_incident_count|default:"0" }}</strong>
+        </div>
+      </div>
+
+      <div class="module-control-card__actions">
+        <button type="button" class="module-control-btn module-control-btn--start" id="admin-fight-start-btn">
+          Kavga Tespitini Başlat
+        </button>
+
+        <button type="button" class="module-control-btn module-control-btn--stop" id="admin-fight-stop-btn">
+          Kavga Tespitini Durdur
+        </button>
+
+        <a href="{% url 'dashboard:index' %}" class="module-control-btn module-control-btn--open">
+          Güvenlik Ekranı
+        </a>
+
+        <a href="{% url 'adminx:incident_list' %}" class="module-control-btn module-control-btn--open">
+          Kavga Kayıtları
+        </a>
+      </div>
+
+      <div id="admin-fight-control-message" class="module-control-message"></div>
+    </article>
+
+    <article class="module-control-card module-control-card--speed">
+      <div class="module-control-card__head">
+        <div class="module-control-card__icon">⌁</div>
+
+        <div>
+          <h3>Hız Tespit Kontrolü</h3>
+          <p>
+            Hız tespiti aktif kameraları çalıştır, durdur ve hız ihlali kayıtlarını
+            admin panelinden takip et.
+          </p>
+        </div>
+      </div>
+
+      <div class="module-control-card__meta">
+        <div class="module-control-mini">
+          <span>Aktif Kamera</span>
+          <strong>{{ speed_camera_count|default:"0" }}</strong>
+        </div>
+
+        <div class="module-control-mini">
+          <span>Hız Kaydı</span>
+          <strong>{{ speed_record_count|default:"0" }}</strong>
+        </div>
+      </div>
+
+      <div class="module-control-card__actions">
+        <button type="button" class="module-control-btn module-control-btn--start" id="admin-speed-start-btn">
+          Hız Tespitini Başlat
+        </button>
+
+        <button type="button" class="module-control-btn module-control-btn--stop" id="admin-speed-stop-btn">
+          Hız Tespitini Durdur
+        </button>
+
+        <a href="{% url 'speed_detection:index' %}" class="module-control-btn module-control-btn--open">
+          Hız Ekranı
+        </a>
+
+        <a href="{% url 'adminx:speed_record_list' %}" class="module-control-btn module-control-btn--open">
+          Hız Kayıtları
+        </a>
+      </div>
+
+      <div id="admin-speed-control-message" class="module-control-message"></div>
+    </article>
+  </section>
+
+  <div class="admin-metrics-grid">
+    <div class="admin-metric-card">
+      <span>Toplam Kamera</span>
+      <strong>{{ camera_count|default:"0" }}</strong>
+      <p>Sistemde tanımlı toplam kamera sayısı.</p>
+    </div>
+
+    <div class="admin-metric-card">
+      <span>Kavga Kamerası</span>
+      <strong>{{ fight_camera_count|default:"0" }}</strong>
+      <p>Kavga tespit modülüne bağlı aktif kameralar.</p>
+    </div>
+
+    <div class="admin-metric-card admin-metric-card--speed">
+      <span>Hız Kamerası</span>
+      <strong>{{ speed_camera_count|default:"0" }}</strong>
+      <p>Hız tespit modülüne bağlı aktif kameralar.</p>
+    </div>
+
+    <div class="admin-metric-card admin-metric-card--danger">
+      <span>Onay Bekleyen</span>
+      <strong>{{ pending_user_count|default:"0" }}</strong>
+      <p>Admin onayı bekleyen kullanıcı hesapları.</p>
+    </div>
+  </div>
+
+  <div class="admin-metrics-grid">
+    <div class="admin-metric-card">
+      <span>Aktif Kamera</span>
+      <strong>{{ active_camera_count|default:"0" }}</strong>
+      <p>Canlı izleme ve pipeline için uygun kameralar.</p>
+    </div>
+
+    <div class="admin-metric-card">
+      <span>Pasif Kamera</span>
+      <strong>{{ passive_camera_count|default:"0" }}</strong>
+      <p>Şu anda izlemeye kapalı kamera kayıtları.</p>
+    </div>
+
+    <div class="admin-metric-card">
+      <span>Kavga Kaydı</span>
+      <strong>{{ fight_incident_count|default:"0" }}</strong>
+      <p>Admin panelinde listelenen kavga olay kayıtları.</p>
+    </div>
+
+    <div class="admin-metric-card admin-metric-card--speed">
+      <span>Hız Kaydı</span>
+      <strong>{{ speed_record_count|default:"0" }}</strong>
+      <p>Admin panelinde listelenen hız ihlali kayıtları.</p>
+    </div>
+  </div>
+
+  <div class="admin-chart-grid">
+    <section class="admin-chart-card">
+      <div class="admin-chart-card__head">
+        <h3>Kamera Durumu</h3>
+        <p>Aktif ve pasif kamera dağılımı.</p>
+      </div>
+
+      <div class="admin-chart-box admin-chart-box--small">
+        <canvas id="cameraStatusChart"></canvas>
+      </div>
+    </section>
+
+    <section class="admin-chart-card">
+      <div class="admin-chart-card__head">
+        <h3>Modül Dağılımı</h3>
+        <p>Kavga ve hız tespitinde kullanılan aktif kamera sayıları.</p>
+      </div>
+
+      <div class="admin-chart-box admin-chart-box--small">
+        <canvas id="moduleChart"></canvas>
+      </div>
+    </section>
+
+    <section class="admin-chart-card">
+      <div class="admin-chart-card__head">
+        <h3>Kayıt Dağılımı</h3>
+        <p>Kavga olayları ve hız ihlali kayıtlarının karşılaştırması.</p>
+      </div>
+
+      <div class="admin-chart-box admin-chart-box--small">
+        <canvas id="recordChart"></canvas>
+      </div>
+    </section>
+
+    <section class="admin-chart-card">
+      <div class="admin-chart-card__head">
+        <h3>Kullanıcı Onay Durumu</h3>
+        <p>Onaylı, bekleyen ve reddedilen kullanıcıların karşılaştırması.</p>
+      </div>
+
+      <div class="admin-chart-box">
+        <canvas id="userApprovalChart"></canvas>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="{% static 'adminx/js/dashboard.js' %}?v=1"></script>
+{% endblock %}

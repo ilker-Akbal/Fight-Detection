@@ -1,0 +1,181 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block title %}Hız Tespiti Dashboard{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css" />
+<link rel="stylesheet" href="{% static 'speed_detection/css/index.css' %}?v=1" />
+{% endblock %}
+
+{% block navbar_status %}
+<div id="speed-live-status-badge" class="system-status">
+  {% if speed.running %}
+  <span class="system-status__badge system-status__badge--on">
+    <span class="system-status__dot"></span>
+    Hız Tespiti Aktif
+  </span>
+  {% else %}
+  <span class="system-status__badge system-status__badge--off">
+    <span class="system-status__dot"></span>
+    Hız Tespiti Durdu
+  </span>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div
+  class="speed-page"
+  id="speed-page"
+  data-status-url="{% url 'speed_detection:status' %}"
+>
+  {% if messages %}
+  <div class="speed-messages">
+    {% for message in messages %}
+    <div class="speed-message {{ message.tags }}">
+      {{ message }}
+    </div>
+    {% endfor %}
+  </div>
+  {% endif %}
+
+  <section class="speed-card">
+    <h3>Hız Kameraları</h3>
+    <p>
+      Üst görüntü temiz ham kamera canlı akışıdır. İşlenmiş ROI, kutu, hız ve kanıt görüntüleri
+      aşağıdaki snapshot/clip kayıtlarında gösterilir.
+    </p>
+
+    <div class="speed-camera-grid" id="speed-camera-grid">
+      {% for camera in camera_cards %}
+      <article class="speed-camera-card" data-camera-id="{{ camera.camera_id }}">
+        <div class="speed-camera-card__head">
+          <div>
+            <strong data-speed-camera-name>{{ camera.name }}</strong>
+            <small data-speed-camera-id>{{ camera.camera_id }}</small>
+          </div>
+
+          {% if speed.running %}
+          <span class="speed-badge speed-badge--on" data-speed-card-status>Aktif</span>
+          {% else %}
+          <span class="speed-badge speed-badge--off" data-speed-card-status>Durdu</span>
+          {% endif %}
+        </div>
+
+        <div
+          class="speed-preview"
+          data-speed-preview
+          role="button"
+          tabindex="0"
+          title="Kamerayı büyüt"
+        >
+          {% if camera.stream_url %}
+          <img class="speed-live-stream" src="{{ camera.stream_url }}" alt="{{ camera.camera_id }} canlı kamera" />
+          {% elif camera.preview_url %}
+          <img src="{{ camera.preview_url }}" alt="{{ camera.camera_id }} preview" />
+          {% else %}
+          <span>Canlı akış bekleniyor</span>
+          {% endif %}
+        </div>
+
+        <div class="speed-camera-meta">
+          <div>
+            <span>Limit</span>
+            <strong data-speed-meta="limit">{{ camera.speed_limit_kmh|default:"-" }} km/h</strong>
+          </div>
+
+          <div>
+            <span>Tolerans</span>
+            <strong data-speed-meta="tolerance">{{ camera.tolerance_kmh|default:"-" }}</strong>
+          </div>
+
+          <div>
+            <span>Track</span>
+            <strong data-speed-meta="tracks">{{ camera.tracks|default:"0" }}</strong>
+          </div>
+
+          <div>
+            <span>Son Hız</span>
+            <strong data-speed-meta="latest_speed">{{ camera.latest_speed_kmh|default:"-" }}</strong>
+          </div>
+        </div>
+
+        <div class="speed-camera-calibration" data-speed-calibration>
+          {% if camera.calibration_ready %}
+          <span class="speed-badge speed-badge--on">Kalibre</span>
+          {% else %}
+          <span class="speed-badge speed-badge--warn">Kalibrasyon Gerekli</span>
+          <small>{{ camera.calibration_reason|default:"Kalibrasyon tamamlanmamış." }}</small>
+          {% endif %}
+        </div>
+      </article>
+      {% empty %}
+      <div class="empty-state">Hız tespiti için aktif kamera bulunmuyor.</div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="speed-card speed-table-shell">
+    <h3>Hız İhlalleri</h3>
+    <p>Hız limiti ve tolerans üstü araç kayıtları.</p>
+
+    <table id="speed-events-table" class="display">
+      <thead>
+        <tr>
+          <th>Kamera</th>
+          <th>Araç</th>
+          <th>Hız</th>
+          <th>Limit</th>
+          <th>Frame</th>
+          <th>Zaman</th>
+          <th>Snapshot</th>
+          <th>Clip</th>
+        </tr>
+      </thead>
+
+      <tbody id="speed-events-table-body">
+        {% for event in events %}
+        <tr data-row-key="{{ event.run_name|default:'-' }}__{{ event.camera_id|default:'-' }}__{{ event.track_id|default:'-' }}__{{ event.frame_idx|default:'-' }}">
+          <td>{{ event.camera_id }}</td>
+          <td>{{ event.vehicle_class }} / #{{ event.track_id }}</td>
+          <td>
+            <span class="speed-badge speed-badge--warn">
+              {{ event.speed_kmh }} km/h
+            </span>
+          </td>
+          <td>{{ event.speed_limit_kmh }} + {{ event.tolerance_kmh }}</td>
+          <td>{{ event.frame_idx }}</td>
+          <td>{{ event.created_at_text }}</td>
+          <td>
+            {% if event.snapshot_url %}
+            <a href="{{ event.snapshot_url }}" target="_blank" rel="noopener">
+              <img class="speed-snapshot" src="{{ event.snapshot_url }}" alt="snapshot" />
+            </a>
+            {% else %}
+            -
+            {% endif %}
+          </td>
+          <td>
+            {% if event.clip_url %}
+            <video class="speed-video" controls preload="metadata">
+              <source src="{{ event.clip_url }}" type="video/mp4" />
+            </video>
+            {% else %}
+            -
+            {% endif %}
+          </td>
+        </tr>
+        {% empty %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+<script src="{% static 'speed_detection/js/index.js' %}?v=1"></script>
+{% endblock %}

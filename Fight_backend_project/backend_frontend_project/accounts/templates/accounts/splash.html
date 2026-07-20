@@ -1,0 +1,341 @@
+<!-- Bu HTML dosyası, Tokat Gaziosmanpaşa Üniversitesi'nin logosunu ve 
+yazısını içeren bir animasyon içerir. Animasyon, yazının saat yönünde gelmesi,
+ halka animasyonları ve logo parçalarının merkez etrafında dönmesi gibi efektleri içerir.
+  Ayrıca, sağ alt parçanın kilitlenme anında bir parlama efekti de bulunmaktadır. 
+  CSS animasyonları ve SVG kullanılarak oluşturulmuştur. 
+  
+ © 2025 TOGU Bilgisayar Mühendisliği Yüksek Lisans Öğrencisi Sebahattin Gökcen Özden. Tüm hakları saklıdır.
+  -->
+
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Fight Detection</title>
+    <link
+      href="https://fonts.googleapis.com/css2?family=Jost:wght@400;500;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        --togu-lacivert: #361d53;
+        --togu-turkuaz: #009cb4;
+        --gumus-dis: #c8ccd1;
+        --gumus-ic: #e4e7eb;
+      }
+
+      body {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+        background-color: #fafafa;
+        overflow: hidden;
+        font-family: "Jost", sans-serif;
+      }
+
+      .ana-tasiyici {
+        position: relative;
+        width: 90vmin;
+        max-width: 800px;
+        aspect-ratio: 1 / 1;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+      }
+
+      /* --- YAZI ALANI --- */
+      .yazi-svg {
+        position: absolute;
+        width: 100%;
+        height: 100%;
+        animation: yazi-saat-yonunde-gel 3s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+        will-change: transform, opacity;
+      }
+
+      .yazi-metni {
+        font-size: 34px;
+        font-weight: 500;
+        fill: var(--togu-lacivert);
+        letter-spacing: 15px;
+      }
+
+      .yazi-tarih {
+        font-size: 38px;
+        font-weight: 500;
+        fill: var(--togu-lacivert);
+        letter-spacing: 22px;
+      }
+
+      .halka {
+        fill: none;
+        backface-visibility: hidden;
+      }
+
+      .halka-grup {
+        transform-box: fill-box;
+        transform-origin: center;
+        will-change: transform;
+      }
+
+      .halka-grup-dis {
+        animation: halka-dis-toplam 2s ease-in-out both;
+      }
+
+      .halka-grup-ic {
+        animation: none;
+      }
+
+      .halka-dis {
+        stroke: var(--gumus-dis);
+        stroke-width: 14;
+      }
+
+      .halka-dis-kenar {
+        fill: none;
+        stroke: #a8adb6;
+        stroke-width: 2;
+        opacity: 0.75;
+      }
+
+      .halka-ic {
+        stroke: var(--gumus-ic);
+        stroke-width: 6;
+      }
+
+      @keyframes halka-dis-toplam {
+        0% {
+          transform: rotateZ(135deg) rotateX(0deg);
+        }
+
+        100% {
+          transform: rotateZ(135deg) rotateX(360deg);
+        }
+      }
+
+      @keyframes halka-ic-toplam {
+        0% {
+          transform: rotateZ(45deg) rotateX(0deg);
+        }
+
+        30% {
+          transform: rotateZ(45deg) rotateX(180deg);
+        }
+
+        62% {
+          transform: rotateZ(45deg) rotateX(360deg);
+        }
+
+        100% {
+          transform: rotate(-95deg);
+        }
+      }
+
+      @keyframes yazi-saat-yonunde-gel {
+        0% {
+          transform: rotate(-180deg) scale(1.1);
+          opacity: 0;
+        }
+
+        100% {
+          transform: rotate(0deg) scale(1);
+          opacity: 1;
+        }
+      }
+
+      /* --- LOGO IZGARASI --- */
+      .logo-izgara {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: 1fr 1fr;
+        gap: 4.34%;
+        width: 57.5%;
+        height: 57.5%;
+        position: relative;
+        z-index: 1;
+      }
+
+      .yorunge-tasiyici {
+        width: 100%;
+        height: 100%;
+        animation: merkez-etrafida-don 2.2s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+        will-change: transform, opacity;
+      }
+
+      .orbit-sol-ust {
+        transform-origin: 104.54% 104.54%;
+        animation-delay: 0.1s;
+      }
+
+      .orbit-sol-alt {
+        transform-origin: 104.54% -4.54%;
+        animation-delay: 0.25s;
+      }
+
+      .orbit-sag-alt {
+        transform-origin: -4.54% -4.54%;
+        animation-delay: 0.4s;
+      }
+
+      .orbit-sag-ust {
+        transform-origin: -4.54% 104.54%;
+        animation-delay: 0.55s;
+      }
+
+      @keyframes merkez-etrafida-don {
+        0% {
+          transform: rotate(360deg) scale(2.5);
+          opacity: 0;
+        }
+
+        15% {
+          opacity: 1;
+        }
+
+        100% {
+          transform: rotate(0deg) scale(1);
+          opacity: 1;
+        }
+      }
+
+      /* --- ŞEKİL ÖZELLİKLERİ --- */
+      .sekil {
+        width: 100%;
+        height: 100%;
+        background-color: var(--togu-turkuaz);
+        clip-path: url(#mukemmel-kavis-008);
+        will-change: transform, background-color;
+      }
+
+      .sol-ust {
+        transform: rotate(0deg);
+      }
+
+      .sag-ust {
+        transform: rotate(90deg);
+      }
+
+      .sol-alt {
+        transform: rotate(270deg);
+      }
+
+      /* --- SAĞ ALT PARÇA (G'yi oluşturan kilitlenen parça) --- */
+      .yorunge-tasiyici.orbit-sag-alt {
+        /* Parlama efekti 3.8s'de başlar, zirvesi tam kilitlenme anı olan 4.4s'ye denk gelir */
+        animation:
+          merkez-etrafida-don 2.2s cubic-bezier(0.2, 0.8, 0.2, 1) both 0.4s,
+          parlama-efekti 1.2s ease-in-out both 3.8s;
+      }
+
+      .sag-alt {
+        transform-origin: center center;
+        animation:
+          sekil-yerine-kilitlen 2.2s ease-in-out both 2.2s,
+          renkGecisi 2.2s ease-in-out both 2.2s;
+      }
+
+      @keyframes renkGecisi {
+        0% {
+          background-color: var(--togu-turkuaz);
+        }
+
+        100% {
+          background-color: var(--togu-lacivert);
+        }
+      }
+
+      @keyframes parlama-efekti {
+        0% {
+          filter: drop-shadow(0 0 0px rgba(54, 29, 83, 0));
+        }
+
+        50% {
+          filter: drop-shadow(0 0 14px rgba(54, 29, 83, 0.7));
+        }
+
+        /* Zirve noktası */
+        100% {
+          filter: drop-shadow(0 0 0px rgba(54, 29, 83, 0));
+        }
+      }
+
+      @keyframes sekil-yerine-kilitlen {
+        0% {
+          transform: rotate(180deg);
+        }
+
+        100% {
+          transform: rotate(90deg);
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <svg style="position: absolute; width: 0; height: 0" aria-hidden="true">
+      <defs>
+        <clipPath id="mukemmel-kavis-008" clipPathUnits="objectBoundingBox">
+          <path d="M 0 0 L 1 0 L 1 0.09 Q 0.2 0.2 0.09 1 L 0 1 Z" />
+        </clipPath>
+      </defs>
+    </svg>
+
+    <div class="ana-tasiyici">
+      <svg class="yazi-svg" viewBox="0 0 800 800">
+        <defs>
+          <path
+            id="ust-yay"
+            d="M 400,749 A 349,349 0 1,1 400,51 A 349,349 0 1,1 400,749"
+          />
+          <path id="alt-yay" d="M 35,400 A 365,365 0 0,0 765,400" />
+        </defs>
+
+        <g class="halka-grup halka-grup-dis">
+          <circle class="halka halka-dis" cx="400" cy="400" r="388" />
+          <circle class="halka-dis-kenar" cx="400" cy="400" r="395" />
+        </g>
+        <g class="halka-grup halka-grup-ic">
+          <circle class="halka halka-ic" cx="400" cy="400" r="334" />
+        </g>
+
+        <text class="yazi-metni">
+          <textPath href="#ust-yay" startOffset="50%" text-anchor="middle">
+            TOKAT GAZİOSMANPAŞA ÜNİVERSİTESİ
+          </textPath>
+        </text>
+
+        <text class="yazi-tarih" dy="14">
+          <textPath href="#alt-yay" startOffset="50%" text-anchor="middle">
+            • 1992 •
+          </textPath>
+        </text>
+      </svg>
+
+      <div class="logo-izgara">
+        <div class="yorunge-tasiyici orbit-sol-ust">
+          <div class="sekil sol-ust"></div>
+        </div>
+
+        <div class="yorunge-tasiyici orbit-sag-ust">
+          <div class="sekil sag-ust"></div>
+        </div>
+
+        <div class="yorunge-tasiyici orbit-sol-alt">
+          <div class="sekil sol-alt"></div>
+        </div>
+
+        <div class="yorunge-tasiyici orbit-sag-alt">
+          <div class="sekil sag-alt"></div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
+<script>
+  setTimeout(function () {
+    window.location.href =
+      "{% url 'accounts:login' %}?next={{ next_url|urlencode }}";
+  }, 6000);
+</script>

@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% load static %}
+
+{% block title %}Güvenlik Dashboard{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="https://cdn.datatables.net/1.13.8/css/jquery.dataTables.min.css" />
+<link rel="stylesheet" href="{% static 'guvenlik/css/index.css' %}?v=1" />
+{% endblock %}
+
+{% block navbar_status %}
+<div id="live-status-badge" class="system-status">
+  {% if pipeline.running %}
+  <span class="system-status__badge system-status__badge--on">
+    <span class="system-status__dot"></span>
+    Sistem Aktif
+  </span>
+  {% else %}
+  <span class="system-status__badge system-status__badge--off">
+    <span class="system-status__dot"></span>
+    Sistem Durduruldu
+  </span>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block content %}
+<div
+  class="page page--single"
+  id="dashboard-overview"
+  data-events-url="{% url 'dashboard:events' %}"
+  data-events-stream-url="{% url 'dashboard:events_stream' %}"
+  data-incident-video-template="{% url 'dashboard:incident_video' '__RUN__' '__CLIP__' %}"
+  data-logo-url="{% static 'images/togu-logo.png' %}"
+>
+  <section class="panel right-panel">
+    <div class="panel__header">
+      <div>
+        <h2>Kavga Tespit Kontrolü</h2>
+      </div>
+    </div>
+
+    <div class="dashboard-summary dashboard-summary--compact" id="pipeline-summary">
+      <div class="summary-card">
+        <span>Sistem Durumu</span>
+        <strong>
+          {% if pipeline.running %}
+          Çalışıyor
+          {% else %}
+          Duruyor
+          {% endif %}
+        </strong>
+      </div>
+
+      <div class="summary-card">
+        <span>Aktif Kamera Sayısı</span>
+        <strong>{{ pipeline.camera_count|default:"0" }}</strong>
+      </div>
+    </div>
+
+    <div class="panel__header panel__header--spaced" id="camera-section">
+      <div>
+        <h2>Bağlı Kameralar</h2>
+        <p>
+          Aktif kameralar küçük kartlar halinde listelenir. Görüntüye basınca
+          büyük izleme ekranı açılır.
+        </p>
+      </div>
+    </div>
+
+    <div class="camera-cards camera-cards--compact">
+      {% for camera in camera_cards %}
+      <div
+        class="camera-card camera-card--compact"
+        data-camera-id="{{ camera.camera_id }}"
+        data-camera-name="{{ camera.name }}"
+      >
+        <div class="camera-card__header">
+          <div>
+            <strong>{{ camera.name }}</strong>
+            <small>{{ camera.camera_id }}</small>
+          </div>
+
+          {% if camera.is_active %}
+          <span class="camera-status camera-status--active">Aktif</span>
+          {% else %}
+          <span class="camera-status camera-status--passive">Pasif</span>
+          {% endif %}
+        </div>
+
+        <button
+          type="button"
+          class="camera-open-btn"
+          data-camera-name="{{ camera.name }}"
+          data-camera-id="{{ camera.camera_id }}"
+          aria-label="{{ camera.name }} kamerasını büyüt"
+        >
+          <div class="camera-card__stream camera-card__stream--compact">
+            <img
+              src="{% url 'dashboard:stream' camera.camera_id %}"
+              alt="{{ camera.name }} canlı akış"
+            />
+          </div>
+
+          <span class="camera-open-hint">Büyütmek için tıkla</span>
+        </button>
+      </div>
+      {% empty %}
+      <div class="empty-state">
+        Şu anda sistemde aktif kamera bulunmuyor.
+      </div>
+      {% endfor %}
+    </div>
+
+    <div id="camera-modal" class="camera-modal" aria-hidden="true">
+      <div class="camera-modal__backdrop" data-camera-modal-close></div>
+
+      <div class="camera-modal__content" role="dialog" aria-modal="true">
+        <div class="camera-modal__header">
+          <div>
+            <strong id="camera-modal-title">Kamera Görüntüsü</strong>
+            <span id="camera-modal-subtitle">Canlı akış</span>
+          </div>
+
+          <button type="button" class="camera-modal__close" data-camera-modal-close>
+            Kapat
+          </button>
+        </div>
+
+        <div class="camera-modal__stream">
+          <img id="camera-modal-img" src="" alt="Büyütülmüş kamera görüntüsü" />
+        </div>
+      </div>
+    </div>
+
+    <div class="panel__header panel__header--spaced" id="incident-section">
+      <div>
+        <h2>Kavga Kayıtları</h2>
+      </div>
+    </div>
+
+    <div class="incident-table-shell">
+      <table id="incidents-table" class="incident-table display">
+        <thead>
+          <tr>
+            <th>Kamera</th>
+            <th>Olay ID</th>
+            <th>Başlangıç</th>
+            <th>Bitiş</th>
+            <th>Etiket</th>
+            <th>Clip</th>
+          </tr>
+        </thead>
+
+        <tbody id="incidents-table-body">
+          {% for row in pipeline.recent_incidents %}
+          <tr data-row-key="{{ row.run_name|default:'-' }}__{{ row.camera_id|default:'-' }}__{{ row.incident_id|default:'-' }}__{{ row.clip_name|default:'-' }}">
+            <td>{{ row.camera_id }}</td>
+            <td>{{ row.incident_id }}</td>
+            <td>{{ row.start_ts }}</td>
+            <td>{{ row.end_ts }}</td>
+            <td>
+              <span class="status-badge status-other">{{ row.final_label }}</span>
+            </td>
+            <td class="incident-clip-cell">
+              {% if row.run_name and row.clip_name %}
+              <div class="incident-video-wrap">
+                <video class="incident-video" controls preload="metadata">
+                  <source src="{% url 'dashboard:incident_video' row.run_name row.clip_name %}" type="video/mp4" />
+                </video>
+              </div>
+              {% else %}
+              <span class="incident-empty">Clip yok</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% empty %}
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+<script src="https://cdn.datatables.net/1.13.8/js/jquery.dataTables.min.js"></script>
+<script src="{% static 'guvenlik/js/index.js' %}?v=1"></script>
+{% endblock %}

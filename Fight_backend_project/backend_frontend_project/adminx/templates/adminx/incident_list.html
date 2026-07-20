@@ -1,0 +1,181 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Kavga Kayıtları{% endblock %}
+{% block page_title %}Kavga Kayıtları{% endblock %}
+{% block page_desc %}
+Sistemde tespit edilen kavga olayları, kamera bilgileri ve clip kanıtları
+{% endblock %}
+
+{% block page_actions %}
+<a href="{% url 'dashboard:index' %}" class="btn">Güvenlik Ekranına Git</a>
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/incident_list.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div class="incident-record-page">
+  <section class="incident-record-stats">
+    <div class="incident-record-stat">
+      <span>Filtrelenen Olay</span>
+      <strong>{{ incident_count|default:"0" }}</strong>
+      <p>Seçili filtrelere göre görüntülenen olay sayısı.</p>
+    </div>
+
+    <div class="incident-record-stat">
+      <span>Tüm Olay</span>
+      <strong>{{ all_incident_count|default:"0" }}</strong>
+      <p>Son çalıştırmalardan toplanan toplam olay.</p>
+    </div>
+
+    <div class="incident-record-stat">
+      <span>Kavga Etiketi</span>
+      <strong>{{ fight_count|default:"0" }}</strong>
+      <p>Fight olarak kapanan olay kayıtları.</p>
+    </div>
+
+    <div class="incident-record-stat">
+      <span>İlgili Fakülte</span>
+      <strong>{{ faculty_count|default:"0" }}</strong>
+      <p>Kayıtlarda görünen farklı fakülte sayısı.</p>
+    </div>
+  </section>
+
+  <section class="incident-filter-card">
+    <form method="get" class="incident-filter-form">
+      <div class="field">
+        <label for="q">Arama</label>
+        <input
+          type="text"
+          name="q"
+          id="q"
+          value="{{ search_query }}"
+          placeholder="Olay, kamera, fakülte veya etiket ara"
+        />
+      </div>
+
+      <div class="field">
+        <label for="faculty">Fakülte</label>
+        <select name="faculty" id="faculty">
+          <option value="">Tümü</option>
+          {% for value, label in faculty_options %}
+          <option value="{{ value }}" {% if selected_faculty == value %}selected{% endif %}>
+            {{ label }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="camera">Kamera</label>
+        <select name="camera" id="camera">
+          <option value="">Tümü</option>
+          {% for camera in camera_options %}
+          <option value="{{ camera.camera_id }}" {% if selected_camera == camera.camera_id %}selected{% endif %}>
+            {{ camera.name }} / {{ camera.camera_id }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <button type="submit" class="btn">Filtrele</button>
+
+      <a href="{% url 'adminx:incident_list' %}" class="btn secondary">
+        Temizle
+      </a>
+    </form>
+  </section>
+
+  <section class="incident-record-grid">
+    {% for item in incidents %}
+    <article class="incident-record-card">
+      <div class="incident-record-card__head">
+        <div class="incident-record-title">
+          <h3>{{ item.camera_name }} / {{ item.camera_id }}</h3>
+          <p>{{ item.start_ts }} · Olay #{{ item.incident_id }}</p>
+        </div>
+
+        {% if item.final_label == "fight" %}
+        <div class="incident-label">{{ item.final_label }}</div>
+        {% else %}
+        <div class="incident-label incident-label--other">{{ item.final_label }}</div>
+        {% endif %}
+      </div>
+
+      <div class="incident-record-body">
+        <div class="incident-record-media">
+          {% if item.clip_url %}
+          <video controls preload="metadata">
+            <source src="{{ item.clip_url }}" type="video/mp4" />
+          </video>
+
+          <a href="{{ item.clip_url }}" target="_blank" rel="noopener" class="incident-open-link">
+            Clip'i Yeni Sekmede Aç
+          </a>
+          {% else %}
+          <div class="incident-record-media-empty">Clip yok</div>
+          {% endif %}
+        </div>
+
+        <div class="incident-record-info">
+          <div class="incident-info-item">
+            <span>Fakülte</span>
+            <strong>{{ item.faculty_label|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item">
+            <span>Olay ID</span>
+            <strong>{{ item.incident_id|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item">
+            <span>Başlangıç</span>
+            <strong>{{ item.start_ts|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item">
+            <span>Bitiş</span>
+            <strong>{{ item.end_ts|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item">
+            <span>Kamera ID</span>
+            <strong>{{ item.camera_id|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item">
+            <span>Parça</span>
+            <strong>{{ item.part_count|default:"-" }}</strong>
+          </div>
+
+          <div class="incident-info-item incident-info-item--wide">
+            <span>Kaynak</span>
+            <strong>{{ item.camera_source|default:"-" }}</strong>
+          </div>
+        </div>
+      </div>
+    </article>
+    {% empty %}
+    <div class="card">
+      <div class="empty-row">Kriterlere uygun kavga kaydı bulunamadı.</div>
+    </div>
+    {% endfor %}
+  </section>
+
+  {% if paginator.num_pages > 1 %}
+  <nav class="pagination-row">
+    {% if page_obj.has_previous %}
+    <a href="?{% if query_string %}{{ query_string }}&{% endif %}page={{ page_obj.previous_page_number }}">Önceki</a>
+    {% endif %}
+
+    <span class="is-current">{{ page_obj.number }} / {{ paginator.num_pages }}</span>
+
+    {% if page_obj.has_next %}
+    <a href="?{% if query_string %}{{ query_string }}&{% endif %}page={{ page_obj.next_page_number }}">Sonraki</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+</div>
+{% endblock %}

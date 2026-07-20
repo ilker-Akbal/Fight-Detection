@@ -1,0 +1,73 @@
+{% load static %}
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Admin Giriş</title>
+    <link rel="stylesheet" href="{% static 'accounts/login.css' %}" />
+  </head>
+
+  <body>
+    <div class="wrap single">
+      <main class="card">
+        <header class="card__header">
+          <div class="card__brand">
+            <img
+              class="card__logo"
+              src="{% static 'images/togu-logo.png' %}"
+              alt="TOGÜ Logo"
+            />
+            <div>
+              <h2>Admin Panel Girişi</h2>
+              <p class="sub">Yönetim paneline erişmek için admin girişi yap.</p>
+            </div>
+          </div>
+        </header>
+
+        {% if error %}
+        <div class="alert" role="alert">
+          <div class="alert__icon">!</div>
+          <div><b>Hata:</b> {{ error }}</div>
+        </div>
+        {% endif %}
+
+        <form
+          class="form"
+          method="post"
+          action="{% url 'accounts:admin_login' %}"
+          novalidate
+        >
+          {% csrf_token %}
+          <input type="hidden" name="next" value="{{ next_url }}" />
+
+          <div class="field">
+            <label for="username">Admin Kullanıcı Adı</label>
+            <input
+              id="username"
+              name="username"
+              type="text"
+              placeholder="Admin kullanıcı adı"
+              autocomplete="username"
+              required
+            />
+          </div>
+
+          <div class="field">
+            <label for="password">Şifre</label>
+            <input
+              id="password"
+              name="password"
+              type="password"
+              placeholder="Şifre"
+              autocomplete="current-password"
+              required
+            />
+          </div>
+
+          <button class="btn" id="loginBtn" type="submit">Admin Girişi</button>
+        </form>
+      </main>
+    </div>
+  </body>
+</html>

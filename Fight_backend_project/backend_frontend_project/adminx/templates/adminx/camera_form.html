@@ -1,0 +1,474 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}{{ page_title }}{% endblock %}
+{% block page_title %}{{ page_title }}{% endblock %}
+{% block page_desc %}Kamera bilgilerini doldur{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/camera_form.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div
+  class="card camera-form-card"
+  id="camera-form-page"
+  data-source-mode-name="{{ form.source_mode.html_name }}"
+  data-speed-module-checkbox-id="{{ form.use_speed_detection.id_for_label }}"
+  {% if speed_form %}
+  data-has-speed-form="1"
+  data-roi-hidden-input-id="{{ speed_form.roi_polygon_text.id_for_label }}"
+  {% else %}
+  data-has-speed-form="0"
+  data-roi-hidden-input-id=""
+  {% endif %}
+>
+  <form method="post" enctype="multipart/form-data" class="form-grid">
+    {% csrf_token %}
+
+    {% if form.non_field_errors %}
+    <div class="danger-box">
+      {{ form.non_field_errors }}
+    </div>
+    {% endif %}
+
+    {% if speed_form and speed_form.non_field_errors %}
+    <div class="danger-box">
+      {{ speed_form.non_field_errors }}
+    </div>
+    {% endif %}
+
+    {% if camera %}
+    <input
+      type="hidden"
+      id="camera-preview-url"
+      value="{% url 'adminx:camera_preview_frame' camera.pk %}"
+    />
+    {% else %}
+    <input type="hidden" id="camera-preview-url" value="" />
+    {% endif %}
+
+    <div class="camera-form-section">
+      <div class="field">
+        <label for="{{ form.name.id_for_label }}">Kamera Adı</label>
+        {{ form.name }}
+        <small class="muted">Örnek: Giriş Kapısı Kamera 1</small>
+
+        {% if form.name.errors %}
+        <div class="camera-field-errors">{{ form.name.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="field">
+        <label for="{{ form.camera_id.id_for_label }}">Camera ID</label>
+        {{ form.camera_id }}
+        <small class="muted">
+          Sadece kısa kimlik gir. Dosya yolu girme. Örnek: cam_01, giris_kapi, fight_test
+        </small>
+
+        {% if form.camera_id.errors %}
+        <div class="camera-field-errors">{{ form.camera_id.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="field">
+        <label>Kaynak Tipi</label>
+
+        <div class="camera-source-grid">
+          <label class="camera-source-card" for="sourceModeManual">
+            <input
+              type="radio"
+              id="sourceModeManual"
+              name="{{ form.source_mode.html_name }}"
+              value="manual"
+              {% if form.source_mode.value == "manual" or not form.source_mode.value %}checked{% endif %}
+            />
+
+            <div class="camera-source-card__body">
+              <div class="camera-source-card__icon">↗</div>
+
+              <div class="camera-source-card__content">
+                <strong>Manuel kaynak</strong>
+                <span>
+                  IP kamera, RTSP/HTTP adresi, cihaz index'i veya local video yolu gir.
+                </span>
+                <div class="camera-source-card__tag">Canlı / Path</div>
+              </div>
+            </div>
+          </label>
+
+          <label class="camera-source-card" for="sourceModeUpload">
+            <input
+              type="radio"
+              id="sourceModeUpload"
+              name="{{ form.source_mode.html_name }}"
+              value="upload"
+              {% if form.source_mode.value == "upload" %}checked{% endif %}
+            />
+
+            <div class="camera-source-card__body">
+              <div class="camera-source-card__icon">▣</div>
+
+              <div class="camera-source-card__content">
+                <strong>Video yükle</strong>
+                <span>
+                  Kullanıcının sisteme video dosyası yüklemesini ve pipeline kaynağı olarak kullanmasını sağlar.
+                </span>
+                <div class="camera-source-card__tag">Dosya Upload</div>
+              </div>
+            </div>
+          </label>
+        </div>
+
+        {% if form.source_mode.errors %}
+        <div class="camera-field-errors">{{ form.source_mode.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div id="manualSourcePanel" class="camera-source-panel">
+        <div class="field">
+          <label for="{{ form.source.id_for_label }}">Manuel Kaynak</label>
+          {{ form.source }}
+
+          <small class="muted">
+            Örnek: 0, rtsp://..., http://..., C:/.../fight.mp4
+          </small>
+
+          {% if form.source.errors %}
+          <div class="camera-field-errors">{{ form.source.errors }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div id="uploadSourcePanel" class="camera-source-panel">
+        <div class="field">
+          <label for="{{ form.uploaded_video.id_for_label }}">Video Dosyası</label>
+
+          <div class="camera-file-box">
+            <div class="camera-file-drop">
+              <div>
+                <div class="camera-file-drop__title">Video dosyasını seç</div>
+                <div class="camera-file-drop__text">
+                  Desteklenen formatlar: mp4, avi, mov, mkv, webm.
+                  Video yüklendiğinde kaynak otomatik oluşturulur.
+                </div>
+              </div>
+
+              {{ form.uploaded_video }}
+            </div>
+
+            {% if form.instance.uploaded_video %}
+            <div class="camera-current-file">
+              <strong>Mevcut video:</strong>
+              {{ form.instance.uploaded_video.name }}
+            </div>
+            {% endif %}
+          </div>
+
+          {% if form.uploaded_video.errors %}
+          <div class="camera-field-errors">{{ form.uploaded_video.errors }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="{{ form.description.id_for_label }}">Açıklama</label>
+        {{ form.description }}
+        <small class="muted">
+          İsteğe bağlı kamera açıklaması.
+        </small>
+
+        {% if form.description.errors %}
+        <div class="camera-field-errors">{{ form.description.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="field">
+        <label for="{{ form.faculty.id_for_label }}">Fakülte / Mevki</label>
+        {{ form.faculty }}
+        <small class="muted">
+          Bu kamera yalnızca seçilen fakülte/mevki ile ilişkilendirilir.
+        </small>
+
+        {% if form.faculty.errors %}
+        <div class="camera-field-errors">{{ form.faculty.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="field">
+        <div class="camera-active-box">
+          <div class="camera-active-info">
+            <strong>Kamera Durumu</strong>
+            <span>Aktif olduğunda kamera izleme ekranlarında görüntülenir.</span>
+          </div>
+
+          <label class="camera-switch" for="{{ form.is_active.id_for_label }}">
+            {{ form.is_active }}
+            <span class="camera-switch-slider"></span>
+          </label>
+        </div>
+
+        {% if form.is_active.errors %}
+        <div class="camera-active-errors">{{ form.is_active.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="speed-settings-box module-settings-box">
+        <div class="speed-settings-head">
+          <h3>Modül Seçimi</h3>
+          <p>
+            Bu kameranın hangi yapay zeka modüllerinde çalışacağını seç.
+            Bir kamera birden fazla modülde kullanılabilir.
+          </p>
+        </div>
+
+        <div class="field">
+          <div class="camera-active-box">
+            <div class="camera-active-info">
+              <strong>Kavga Tespiti</strong>
+              <span>Bu kamera kavga tespiti ekranında ve pipeline’ında kullanılır.</span>
+            </div>
+
+            <label class="camera-switch" for="{{ form.use_fight_detection.id_for_label }}">
+              {{ form.use_fight_detection }}
+              <span class="camera-switch-slider"></span>
+            </label>
+          </div>
+
+          {% if form.use_fight_detection.errors %}
+          <div class="camera-active-errors">{{ form.use_fight_detection.errors }}</div>
+          {% endif %}
+        </div>
+
+        <div class="field">
+          <div class="camera-active-box">
+            <div class="camera-active-info">
+              <strong>Hız Tespiti</strong>
+              <span>Bu kamera hız tespiti ekranında ve pipeline’ında kullanılır.</span>
+            </div>
+
+            <label class="camera-switch" for="{{ form.use_speed_detection.id_for_label }}">
+              {{ form.use_speed_detection }}
+              <span class="camera-switch-slider"></span>
+            </label>
+          </div>
+
+          {% if form.use_speed_detection.errors %}
+          <div class="camera-active-errors">{{ form.use_speed_detection.errors }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      {% if speed_form %}
+      <div
+        id="speedModuleConfigWrapper"
+        class="speed-settings-box speed-module-config-wrapper"
+      >
+        <div class="speed-settings-head">
+          <h3>Hız Tespiti Ayarları</h3>
+          <p>
+            Hız limiti, tolerans, iki çizgi kalibrasyonu ve kanıt kaydı ayarlarını
+            tek yerden yönetebilirsin. ROI artık ayrı seçilmiyor; kalibrasyon alanının
+            içinde seçilen yol bölgesi kullanılıyor.
+          </p>
+        </div>
+
+        <div class="field speed-full-field">
+          <div class="camera-active-box">
+            <div class="camera-active-info">
+              <strong>Hız Tespiti Durumu</strong>
+              <span>
+                Aktif olduğunda bu kamera hız tespiti pipeline’ına dahil edilir.
+              </span>
+            </div>
+
+            <label class="camera-switch" for="{{ speed_form.enabled.id_for_label }}">
+              {{ speed_form.enabled }}
+              <span class="camera-switch-slider"></span>
+            </label>
+          </div>
+
+          {% if speed_form.enabled.errors %}
+          <div class="camera-active-errors">{{ speed_form.enabled.errors }}</div>
+          {% endif %}
+        </div>
+
+        <div class="field">
+          <label for="{{ speed_form.speed_limit_kmh.id_for_label }}">
+            Hız Limiti (km/h)
+          </label>
+          {{ speed_form.speed_limit_kmh }}
+          <small class="muted">Örnek: 30</small>
+          {{ speed_form.speed_limit_kmh.errors }}
+        </div>
+
+        <div class="field">
+          <label for="{{ speed_form.tolerance_kmh.id_for_label }}">
+            Tolerans (km/h)
+          </label>
+          {{ speed_form.tolerance_kmh }}
+          <small class="muted">
+            Limit + tolerans üstü ihlal sayılır. Örnek: 30 + 10 = 40 km/h.
+          </small>
+          {{ speed_form.tolerance_kmh.errors }}
+        </div>
+
+        <div class="speed-hidden-field">
+          {{ speed_form.roi_polygon_text }}
+          <input type="hidden" name="{{ speed_form.roi_enabled.html_name }}" value="on" />
+        </div>
+
+        {% if camera %}
+        <div class="speed-calibration-card">
+          <div class="speed-calibration-card__head">
+            <div class="speed-calibration-card__title">
+              <strong>İki Çizgi Hız Kalibrasyonu</strong>
+              <span>
+                Bu bölüm hem yol bölgesini hem de hız ölçüm çizgilerini belirler.
+                Üstte ayrı ROI seçimi yok; sistem burada seçilen ROI’yi kullanır.
+              </span>
+            </div>
+
+            <div class="speed-calibration-actions">
+              <button type="button" class="btn secondary" id="speed-cal-load-btn">
+                Görüntüyü Al
+              </button>
+
+              <button type="button" class="btn secondary" id="speed-cal-roi-done-btn">
+                ROI Bitti
+              </button>
+
+              <button type="button" class="btn secondary" id="speed-cal-undo-btn">
+                Son Noktayı Sil
+              </button>
+
+              <button type="button" class="btn danger" id="speed-cal-reset-btn">
+                Temizle
+              </button>
+            </div>
+          </div>
+
+          <div class="speed-calibration-steps">
+            <div class="speed-step-pill is-active" data-speed-step-pill="roi">
+              <span>1. Adım</span>
+              <strong>Yol Bölgesi</strong>
+            </div>
+
+            <div class="speed-step-pill" data-speed-step-pill="line_a">
+              <span>2. Adım</span>
+              <strong>Başlangıç Çizgisi</strong>
+            </div>
+
+            <div class="speed-step-pill" data-speed-step-pill="line_b">
+              <span>3. Adım</span>
+              <strong>Bitiş Çizgisi</strong>
+            </div>
+
+            <div class="speed-step-pill" data-speed-step-pill="distance">
+              <span>4. Adım</span>
+              <strong>Gerçek Mesafe</strong>
+            </div>
+          </div>
+
+          <div class="speed-calibration-canvas-wrap">
+            <canvas id="speed-cal-canvas"></canvas>
+
+            <div class="speed-calibration-empty" id="speed-cal-empty-state">
+              Kalibrasyon için “Görüntüyü Al” butonuna bas.
+              <br />
+              Yeni kamera ekliyorsan önce kamerayı kaydet, sonra düzenleme ekranında kalibrasyon yap.
+            </div>
+          </div>
+
+          <div class="speed-calibration-info">
+            <span id="speed-cal-step-text">Adım: ROI seçimi</span>
+            <small id="speed-cal-help-text">
+              Yol alanı için en az 3 nokta seç, sonra ROI Bitti butonuna bas.
+            </small>
+          </div>
+
+          <div class="speed-calibration-footer">
+            <div class="field speed-cal-distance-field">
+              <label for="speed-cal-distance-input">İki çizgi arası gerçek mesafe (metre)</label>
+              <input id="speed-cal-distance-input" type="number" min="0.1" step="0.1" placeholder="Örnek: 30" />
+              <small class="muted">
+                Bu değer hız hesabında doğrudan kullanılır. Çizgiler arası gerçek yol mesafesini gir.
+              </small>
+            </div>
+
+            <button type="button" class="btn success" id="speed-cal-save-btn">
+              Kalibrasyonu Kaydet
+            </button>
+
+            <div class="speed-calibration-note">
+              Kaydetme sırası: Görüntüyü Al → yol bölgesini seç → ROI Bitti → başlangıç çizgisi için 2 nokta →
+              bitiş çizgisi için 2 nokta → gerçek mesafe → Kalibrasyonu Kaydet.
+            </div>
+          </div>
+        </div>
+
+        <input type="hidden" id="speed-cal-frame-url" value="{% url 'speed_detection:calibration_frame' camera.camera_id %}" />
+        <input type="hidden" id="speed-cal-save-url" value="{% url 'speed_detection:save_calibration' camera.camera_id %}" />
+        {% else %}
+        <div class="speed-calibration-note">
+          Kalibrasyon yapabilmek için önce kamerayı kaydet. Kamera kaydedildikten sonra düzenleme ekranında
+          görüntü alıp ROI, başlangıç çizgisi, bitiş çizgisi ve gerçek mesafeyi belirleyebilirsin.
+        </div>
+        {% endif %}
+
+        <details class="speed-advanced">
+          <summary>Gelişmiş hız ayarları</summary>
+
+          <div class="speed-advanced__body">
+            <div class="field">
+              <label for="{{ speed_form.calibration_path.id_for_label }}">
+                Kalibrasyon Dosyası
+              </label>
+              {{ speed_form.calibration_path }}
+              <small class="muted">
+                Normalde boş bırak. Boşsa sistem kamera ID’ye göre varsayılan kalibrasyon dosyasını kullanır.
+                Özel dosya kullanman gerekirse buradan verebilirsin.
+              </small>
+              {{ speed_form.calibration_path.errors }}
+            </div>
+          </div>
+        </details>
+
+        <div class="field speed-full-field">
+          <div class="camera-active-box">
+            <div class="camera-active-info">
+              <strong>Kanıt Kaydı</strong>
+              <span>İhlal anında snapshot ve clip kaydedilir.</span>
+            </div>
+
+            <div class="speed-inline-options">
+              <label class="speed-check-label">
+                {{ speed_form.save_snapshot }}
+                Snapshot
+              </label>
+
+              <label class="speed-check-label">
+                {{ speed_form.save_clip }}
+                Clip
+              </label>
+            </div>
+          </div>
+
+          {{ speed_form.save_snapshot.errors }}
+          {{ speed_form.save_clip.errors }}
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="actions">
+        <button type="submit" class="btn success">{{ submit_label }}</button>
+        <a href="{% url 'adminx:camera_list' %}" class="btn secondary">İptal</a>
+      </div>
+    </div>
+  </form>
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{% static 'adminx/js/camera_form.js' %}?v=1"></script>
+{% endblock %}

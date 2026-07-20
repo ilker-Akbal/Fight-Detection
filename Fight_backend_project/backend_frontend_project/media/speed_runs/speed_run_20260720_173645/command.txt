@@ -1,0 +1,13 @@
+COMMAND:
+C:\Users\HP\anaconda3\envs\torch_gpu\python.exe -m HizTespiti.speed_mp.run_multiprocess_speed --config C:\Users\HP\Desktop\Fight-Detection\Fight_backend_project\backend_frontend_project\media\speed_runs\speed_run_20260720_173645\run_config.json
+
+CWD: C:\Users\HP\Desktop\Fight-Detection
+PYTHON: C:\Users\HP\anaconda3\envs\torch_gpu\python.exe
+PYTHONPATH: C:\Users\HP\Desktop\Fight-Detection;/app
+
+ARGS:
+C:\Users\HP\anaconda3\envs\torch_gpu\python.exe
+-m
+HizTespiti.speed_mp.run_multiprocess_speed
+--config
+C:\Users\HP\Desktop\Fight-Detection\Fight_backend_project\backend_frontend_project\media\speed_runs\speed_run_20260720_173645\run_config.json

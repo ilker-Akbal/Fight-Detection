@@ -1,0 +1,59 @@
+services:
+  db:
+    image: postgres:16
+    container_name: fight_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-fightdb}
+      POSTGRES_USER: ${POSTGRES_USER:-fightuser}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fightpass}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5433:5432"
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fight_app_cuda
+    restart: unless-stopped
+    depends_on:
+      - db
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      PYTHONPATH: /app
+      SCRIPT_NAME: /fight-detection
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility,video
+    volumes:
+      - .:/app
+      - media_data:/app/Fight_backend_project/backend_frontend_project/media
+      - pipeline_runs:/app/Fight_backend_project/backend_frontend_project/media/pipeline_runs
+    ports:
+      - "127.0.0.1:8001:8000"
+    gpus: all
+    shm_size: "4gb"
+    command: >
+      bash -lc "
+      until nc -z db 5432; do echo 'PostgreSQL bekleniyor...'; sleep 1; done;
+      python manage.py migrate &&
+      python manage.py collectstatic --noinput || true;
+      gunicorn backend_frontend_project.wsgi:application
+      --bind 0.0.0.0:8000
+      --workers 2
+      --worker-class gthread
+      --threads 8
+      --timeout 300
+      --graceful-timeout 30
+      --access-logfile -
+      --error-logfile -
+      "
+
+volumes:
+  postgres_data:
+  media_data:
+  pipeline_runs:

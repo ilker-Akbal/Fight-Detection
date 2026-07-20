@@ -1,0 +1,8 @@
+imgsz: 960
+conf: 0.15
+iou: 0.45
+device: 0
+verbose: false
+classes: [0]
+agnostic_nms: false
+max_det: 20

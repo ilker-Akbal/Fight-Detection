@@ -1,0 +1,33 @@
+{% extends "adminx/base.html" %}
+
+{% block title %}Kullanıcı Sil{% endblock %}
+{% block page_title %}Kullanıcı Sil{% endblock %}
+{% block page_desc %}
+Bu kullanıcı hesabını sistemden kalıcı olarak kaldıracaksınız.
+{% endblock %}
+
+{% block content %}
+<div class="content-stack">
+  <section class="card-panel">
+    <div class="danger-box">
+      <strong>Bu kullanıcı silinsin mi?</strong>
+      <p>
+        <b>Kullanıcı:</b> {{ profile.user.username }}<br />
+        <b>Mail:</b> {{ profile.user.email|default:"-" }}<br />
+        <b>Fakülte:</b> {{ profile.get_faculty_display|default:"-" }}<br />
+        <b>Durum:</b> {{ profile.get_status_display }}
+      </p>
+      <p>Bu işlem geri alınamaz.</p>
+    </div>
+
+    <div class="actions" style="margin-top: 18px;">
+      <form method="post">
+        {% csrf_token %}
+        <button type="submit" class="btn danger">Evet, Sil</button>
+      </form>
+
+      <a href="{% url 'adminx:user_list' %}" class="btn secondary">Vazgeç</a>
+    </div>
+  </section>
+</div>
+{% endblock %}

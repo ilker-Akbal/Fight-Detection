@@ -1,0 +1,18 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+.env
+
+# Django collectstatic output
+staticfiles/
+**/staticfiles/
+
+# Media outputs
+media/
+**/media/pipeline_runs/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Env
+.env

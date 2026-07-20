@@ -1,0 +1,66 @@
+{
+  "camera_id": "00010",
+  "speed_limit_kmh": 30.0,
+  "tolerance_kmh": 5.0,
+  "road_roi": {
+    "enabled": true,
+    "polygon": [
+      [
+        452,
+        265
+      ],
+      [
+        382,
+        251
+      ],
+      [
+        61,
+        458
+      ],
+      [
+        338,
+        522
+      ]
+    ]
+  },
+  "measurement": {
+    "mode": "two_line_time_gate",
+    "direction": "A_TO_B",
+    "line_a": [
+      [
+        371,
+        250
+      ],
+      [
+        452,
+        269
+      ]
+    ],
+    "line_b": [
+      [
+        379,
+        440
+      ],
+      [
+        164,
+        365
+      ]
+    ],
+    "distance_m": 30.0
+  },
+  "scale": {
+    "source": "not_required_two_line_time_gate",
+    "meter_per_pixel": null,
+    "confidence": 1.0,
+    "user_corrected": true
+  },
+  "created_at": 1778687279.4371064,
+  "updated_at": 1778687279.4371064,
+  "meta": {
+    "created_by": "dashboard",
+    "camera_name": "trafik",
+    "source": "C:\\Users\\HP\\Desktop\\Fight-Detection\\HizTespiti\\traffic_video.avi",
+    "frame_coordinate_space": "pipeline_resize_width",
+    "resize_width": 960
+  }
+}

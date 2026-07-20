@@ -1,0 +1,156 @@
+{% load static %}
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>{% block title %}Akıllı Güvenlik Dashboard{% endblock %}</title>
+
+    <link rel="stylesheet" href="{% static 'navbar/navbar.css' %}?v=12" />
+    <link rel="stylesheet" href="{% static 'dashboard/dashboard.css' %}?v=12" />
+
+
+    {% block extra_css %}{% endblock %}
+  </head>
+
+  <body class="has-module-rail">
+    <nav class="module-rail" aria-label="Yapay zeka modül menüsü">
+      <a
+        href="{% url 'dashboard:index' %}"
+        class="module-rail__item {% if request.resolver_match and request.resolver_match.app_name == 'dashboard' %}is-active{% endif %}"
+        title="Kavga Tespiti"
+      >
+        <span class="module-rail__icon">⚠</span>
+        <span class="module-rail__label">Kavga Tespiti</span>
+      </a>
+
+      <a
+        href="{% url 'speed_detection:index' %}"
+        class="module-rail__item {% if request.resolver_match and request.resolver_match.app_name == 'speed_detection' %}is-active{% endif %}"
+        title="Hız Tespiti"
+      >
+        <span class="module-rail__icon">⏱</span>
+        <span class="module-rail__label">Hız Tespiti</span>
+      </a>
+
+
+
+      <div class="module-rail__hint">
+        Modül seçmek için üzerine gel veya tıkla.
+      </div>
+    </nav>
+
+    <header class="topbar">
+      <div class="topbar__inner">
+        <div class="topbar__left">
+          <a href="{% url 'dashboard:index' %}" class="brand">
+            <div class="brand__logo brand__logo--image">
+              <img src="{% static 'images/togu-logo.png' %}" alt="TOGÜ Logo" />
+            </div>
+
+            <div class="brand__content">
+              <strong>Akıllı Güvenlik Dashboard</strong>
+              <span>Kavga, hız ve akıllı güvenlik modülleri</span>
+            </div>
+          </a>
+        </div>
+
+        <div class="topbar__center">
+          {% block navbar_status %}{% endblock %}
+        </div>
+
+        <div class="topbar__right">
+          {% if request.user.is_authenticated %}
+          <div class="account-menu">
+            <div class="account-avatar">
+              {{ request.user.username|first|upper }}
+            </div>
+
+            <div class="account-info">
+              <span class="account-info__label">Hoş geldiniz</span>
+
+              {% if request.user.get_full_name %}
+              <strong>{{ request.user.get_full_name }}</strong>
+              {% else %}
+              <strong>{{ request.user.username }}</strong>
+              {% endif %}
+            </div>
+
+            <a
+              href="{% url 'accounts:account_settings' %}"
+              class="account-link-btn"
+            >
+              Hesabım
+            </a>
+
+            <form
+              method="post"
+              action="{% url 'accounts:logout' %}"
+              class="logout-form"
+            >
+              {% csrf_token %}
+              <button type="submit" class="logout-btn">
+                <span class="logout-btn__icon">↗</span>
+                <span>Çıkış Yap</span>
+              </button>
+            </form>
+          </div>
+          {% else %}
+          <a href="{% url 'accounts:login' %}" class="login-link">
+            Giriş Yap
+          </a>
+          {% endif %}
+        </div>
+      </div>
+    </header>
+
+    {% if messages %}
+    <div
+      class="app-message-modal is-open"
+      id="app-message-modal"
+      aria-hidden="false"
+    >
+      <div class="app-message-modal__backdrop" data-message-modal-close></div>
+
+      <div class="app-message-modal__box" role="dialog" aria-modal="true">
+        <div class="app-message-modal__logo">
+          <img src="{% static 'images/togu-logo.png' %}" alt="TOGÜ Logo" />
+        </div>
+
+        <div class="app-message-modal__header">
+          <h2>İşlem Bildirimi</h2>
+          <p>Sistem tarafından oluşturulan bilgilendirme mesajı.</p>
+        </div>
+
+        <div class="app-message-modal__list">
+          {% for message in messages %}
+          <div
+            class="app-message-modal__item app-message-modal__item--{{ message.tags|default:'info' }}"
+          >
+            <span class="app-message-modal__item-icon"></span>
+            <span>{{ message }}</span>
+          </div>
+          {% endfor %}
+        </div>
+
+        <div class="app-message-modal__actions">
+          <button
+            type="button"
+            class="app-message-modal__close"
+            data-message-modal-close
+          >
+            Kapat
+          </button>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+
+    <main class="page-shell">{% block content %}{% endblock %}</main>
+
+
+
+    {% block extra_scripts %}{% endblock %}
+  </body>
+</html>

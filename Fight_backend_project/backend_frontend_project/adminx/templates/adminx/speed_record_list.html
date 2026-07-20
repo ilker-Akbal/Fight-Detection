@@ -1,0 +1,177 @@
+{% extends "adminx/base.html" %}
+{% load static %}
+
+{% block title %}Hız Kayıtları{% endblock %}
+{% block page_title %}Hız Kayıtları{% endblock %}
+{% block page_desc %}
+Hız limiti ve tolerans üstü araç ihlalleri, snapshot ve clip kanıtları
+{% endblock %}
+
+{% block page_actions %}
+<a href="{% url 'speed_detection:index' %}" class="btn speed">Hız Ekranına Git</a>
+{% endblock %}
+
+{% block extra_css %}
+<link rel="stylesheet" href="{% static 'adminx/css/speed_record_list.css' %}?v=1" />
+{% endblock %}
+
+{% block content %}
+<div class="speed-record-page">
+  <section class="speed-record-stats">
+    <div class="speed-record-stat">
+      <span>Filtrelenen Kayıt</span>
+      <strong>{{ record_count|default:"0" }}</strong>
+      <p>Seçili filtrelere göre görüntülenen hız ihlali.</p>
+    </div>
+
+    <div class="speed-record-stat">
+      <span>Tüm Kayıt</span>
+      <strong>{{ all_record_count|default:"0" }}</strong>
+      <p>Son hız çalıştırmalarından toplanan toplam ihlal.</p>
+    </div>
+
+    <div class="speed-record-stat">
+      <span>Kamera</span>
+      <strong>{{ camera_count|default:"0" }}</strong>
+      <p>Bu kayıtlar içinde görünen farklı kamera sayısı.</p>
+    </div>
+
+    <div class="speed-record-stat">
+      <span>Maksimum Hız</span>
+      <strong>{{ max_speed_kmh|default:"-" }}</strong>
+      <p>Filtrelenen kayıtlar içindeki en yüksek hız.</p>
+    </div>
+  </section>
+
+  <section class="speed-filter-card">
+    <form method="get" class="speed-filter-form">
+      <div class="field">
+        <label for="q">Arama</label>
+        <input id="q" name="q" value="{{ search_query }}" placeholder="Kamera, araç, hız..." />
+      </div>
+
+      <div class="field">
+        <label for="faculty">Fakülte</label>
+        <select id="faculty" name="faculty">
+          <option value="">Tümü</option>
+          {% for value, label in faculty_options %}
+          <option value="{{ value }}" {% if selected_faculty == value %}selected{% endif %}>
+            {{ label }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="camera">Kamera</label>
+        <select id="camera" name="camera">
+          <option value="">Tümü</option>
+          {% for cam in camera_options %}
+          <option value="{{ cam.camera_id }}" {% if selected_camera == cam.camera_id %}selected{% endif %}>
+            {{ cam.name }} / {{ cam.camera_id }}
+          </option>
+          {% endfor %}
+        </select>
+      </div>
+
+      <button type="submit" class="btn speed">Filtrele</button>
+    </form>
+  </section>
+
+  <section class="speed-record-grid">
+    {% for record in records %}
+    <article class="speed-record-card">
+      <div class="speed-record-card__head">
+        <div class="speed-record-title">
+          <h3>{{ record.camera_name }} / {{ record.camera_id }}</h3>
+          <p>{{ record.created_at_text }} · {{ record.vehicle_class }} #{{ record.track_id }}</p>
+        </div>
+
+        <div class="speed-value">
+          {{ record.speed_kmh }} km/h
+        </div>
+      </div>
+
+      <div class="speed-record-body">
+        <div class="speed-record-media">
+          {% if record.snapshot_url %}
+          <a href="{{ record.snapshot_url }}" target="_blank" rel="noopener">
+            <img src="{{ record.snapshot_url }}" alt="Hız snapshot" />
+          </a>
+          {% else %}
+          <div class="speed-record-media-empty">Snapshot yok</div>
+          {% endif %}
+
+          {% if record.clip_url %}
+          <video controls preload="metadata">
+            <source src="{{ record.clip_url }}" type="video/mp4" />
+          </video>
+          {% else %}
+          <div class="speed-record-media-empty">Clip yok</div>
+          {% endif %}
+        </div>
+
+        <div class="speed-record-info">
+          <div class="speed-info-item">
+            <span>Fakülte</span>
+            <strong>{{ record.faculty_label|default:"-" }}</strong>
+          </div>
+
+          <div class="speed-info-item">
+            <span>Kamera ID</span>
+            <strong>{{ record.camera_id|default:"-" }}</strong>
+          </div>
+
+          <div class="speed-info-item">
+            <span>Limit</span>
+            <strong>{{ record.speed_limit_kmh }} + {{ record.tolerance_kmh }}</strong>
+          </div>
+
+          <div class="speed-info-item">
+            <span>Eşik</span>
+            <strong>{{ record.threshold_kmh|default:"-" }} km/h</strong>
+          </div>
+
+          <div class="speed-info-item">
+            <span>Track</span>
+            <strong>#{{ record.track_id|default:"-" }}</strong>
+          </div>
+
+          <div class="speed-info-item">
+            <span>Araç</span>
+            <strong>{{ record.vehicle_class|default:"-" }}</strong>
+          </div>
+
+          <div class="speed-info-item speed-info-item--wide">
+            <span>Kaynak</span>
+            <strong>{{ record.camera_source|default:"-" }}</strong>
+          </div>
+        </div>
+      </div>
+    </article>
+    {% empty %}
+    <div class="card">
+      <div class="empty-row">Hız kaydı bulunamadı.</div>
+    </div>
+    {% endfor %}
+  </section>
+
+  {% if paginator.num_pages > 1 %}
+  <nav class="pagination-row">
+    {% if page_obj.has_previous %}
+    <a href="?{% if query_string %}{{ query_string }}&{% endif %}page={{ page_obj.previous_page_number }}">Önceki</a>
+    {% endif %}
+
+    <span class="is-current">{{ page_obj.number }} / {{ paginator.num_pages }}</span>
+
+    {% if page_obj.has_next %}
+    <a href="?{% if query_string %}{{ query_string }}&{% endif %}page={{ page_obj.next_page_number }}">Sonraki</a>
+    {% endif %}
+  </nav>
+  {% endif %}
+</div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{% static 'adminx/js/speed_record_list.js' %}?v=1"></script>
+{% endblock %}

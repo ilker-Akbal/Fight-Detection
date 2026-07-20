@@ -1,0 +1,103 @@
+{% load static %}
+<!doctype html>
+<html lang="tr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kullanıcı Oluştur</title>
+    <link rel="stylesheet" href="{% static 'accounts/register.css' %}" />
+  </head>
+
+  <body>
+    <div class="wrap single">
+      <main class="card auth-card">
+        <header class="card__header">
+          <div class="card__brand">
+            <img
+              class="card__logo"
+              src="{% static 'images/togu-logo.png' %}"
+              alt="TOGÜ Logo"
+            />
+            <div>
+              <h2>Kullanıcı Oluştur</h2>
+              <p class="sub">
+                Sisteme erişim için kurumsal kullanıcı hesabınızı oluşturun.
+              </p>
+            </div>
+          </div>
+        </header>
+
+        {% if form.non_field_errors %}
+        <div class="alert" role="alert">
+          <div class="alert__icon">!</div>
+          <div>
+            {% for error in form.non_field_errors %}
+            <div><b>Hata:</b> {{ error }}</div>
+            {% endfor %}
+          </div>
+        </div>
+        {% endif %}
+
+        <form
+          class="form auth-form"
+          method="post"
+          action="{% url 'accounts:register' %}"
+          novalidate
+          onsubmit="
+            document.getElementById('registerBtn').disabled = true;
+            document.getElementById('registerBtn').innerText =
+              'Kullanıcı oluşturuluyor...';
+          "
+        >
+          {% csrf_token %}
+
+          <div class="field">
+            <label for="{{ form.faculty.id_for_label }}">Fakülte</label>
+            {{ form.faculty }} {% for error in form.faculty.errors %}
+            <small class="error-text">{{ error }}</small>
+            {% endfor %}
+          </div>
+
+          <div class="field">
+            <label for="{{ form.email.id_for_label }}">Mail</label>
+            {{ form.email }} {% for error in form.email.errors %}
+            <small class="error-text">{{ error }}</small>
+            {% endfor %}
+          </div>
+
+          <div class="field">
+            <label for="{{ form.password1.id_for_label }}">Şifre</label>
+            {{ form.password1 }} {% for error in form.password1.errors %}
+            <small class="error-text">{{ error }}</small>
+            {% endfor %}
+          </div>
+
+          <div class="field">
+            <label for="{{ form.password2.id_for_label }}">Şifre Tekrar</label>
+            {{ form.password2 }} {% for error in form.password2.errors %}
+            <small class="error-text">{{ error }}</small>
+            {% endfor %}
+          </div>
+
+          <button class="btn" id="registerBtn" type="submit">
+            Kullanıcı Oluştur
+          </button>
+        </form>
+
+        <div class="actions-bottom register-action-row">
+          <a
+            href="{% url 'accounts:login' %}"
+            class="pill-link register-panel-btn"
+          >
+            Giriş Yap
+          </a>
+        </div>
+
+        <div class="copyright">
+          © {% now "Y" %} Tokat Gaziosmanpaşa Üniversitesi Yapay Zeka
+          Koordinatörlüğü
+        </div>
+      </main>
+    </div>
+  </body>
+</html>
