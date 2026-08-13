@@ -5,7 +5,7 @@ import time
 
 from fight.pipeline.adapters import Stage3Adapter
 from fight.pipeline_mp.common import configure_process_runtime, now_str, ts_to_str
-from fight.pipeline_mp.messages import ReportMessage, Stage3ResultMessage
+from fight.pipeline_mp.messages import IncidentLifecycleMessage, ReportMessage, Stage3ResultMessage
 
 
 def _report(report_queue, kind: str, row: dict) -> None:
@@ -65,7 +65,18 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
         if job is None:
             break
 
+        if isinstance(job, IncidentLifecycleMessage):
+            try:
+                incident_queue.put(job, timeout=1.0)
+            finally:
+                stage3_queue.task_done()
+            continue
+
         try:
+            incident_queue.put(
+                IncidentLifecycleMessage(job.camera_id, job.source, "stage3_pending", job.event_id),
+                timeout=1.0,
+            )
             _report(
                 report_queue,
                 "status",
@@ -124,6 +135,14 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                         timeout=1.0,
                     )
                 except Exception:
+                    try:
+                        incident_queue.put(
+                            IncidentLifecycleMessage(
+                                job.camera_id, job.source, "stage3_dropped", job.event_id
+                            ), timeout=1.0,
+                        )
+                    except Exception:
+                        pass
                     _report(
                         report_queue,
                         "status",
@@ -136,6 +155,12 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                             "event_id": job.event_id,
                         },
                     )
+            else:
+                incident_queue.put(
+                    IncidentLifecycleMessage(
+                        job.camera_id, job.source, "stage3_dropped", job.event_id
+                    ), timeout=1.0,
+                )
 
             _report(
                 report_queue,
@@ -160,6 +185,15 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
             )
 
         except Exception as exc:
+            try:
+                incident_queue.put(
+                    IncidentLifecycleMessage(
+                        getattr(job, "camera_id", "-"), getattr(job, "source", "-"),
+                        "stage3_dropped", getattr(job, "event_id", ""),
+                    ), timeout=1.0,
+                )
+            except Exception:
+                pass
             _report(
                 report_queue,
                 "status",

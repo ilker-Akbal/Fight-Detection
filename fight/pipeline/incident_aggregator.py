@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import shutil
 import subprocess
 import tempfile
@@ -68,6 +69,9 @@ class TemporalIncidentState:
     last_event_end_ts: Optional[float] = None
     cooldown_until_ts: float = 0.0
     alarm_sent: bool = False
+    event_chain_open: bool = False
+    lifecycle_seen: bool = False
+    pending_stage3: int = 0
 
     def add_segment(self, seg: IncidentSegment, vote_window: int) -> None:
         self.segments.append(seg)
@@ -228,6 +232,10 @@ class IncidentAggregator:
 
             st = self.by_camera.get(camera_id)
 
+            # A result completes exactly one previously announced Stage-3 job.
+            if st is not None and st.lifecycle_seen and st.pending_stage3 > 0:
+                st.pending_stage3 -= 1
+
             if st is None and result.fight_prob < self.keep_thr:
                 print(
                     f"[INCIDENT][IGNORE] camera={camera_id} event={result.event_id} "
@@ -302,6 +310,40 @@ class IncidentAggregator:
                 flush=True,
             )
 
+            self._finalize_if_drained_locked(camera_id)
+
+    def lifecycle(self, camera_id: str, source: str, action: str) -> None:
+        """Apply camera-chain/Stage-3 lifecycle messages in queue order."""
+        with self.lock:
+            st = self.by_camera.get(str(camera_id))
+            if st is None:
+                st = self._new_state(str(camera_id), str(source))
+                self.by_camera[str(camera_id)] = st
+            st.lifecycle_seen = True
+            st.last_update_wall_ts = time.time()
+            if action == "event_chain_opened":
+                st.event_chain_open = True
+            elif action == "stage3_pending":
+                st.pending_stage3 += 1
+            elif action == "stage3_dropped":
+                st.pending_stage3 = max(0, st.pending_stage3 - 1)
+            elif action == "event_chain_closed":
+                st.event_chain_open = False
+            else:
+                raise ValueError(f"unknown incident lifecycle action: {action}")
+            self._finalize_if_drained_locked(str(camera_id))
+
+    def _finalize_if_drained_locked(self, camera_id: str) -> None:
+        st = self.by_camera.get(camera_id)
+        if st is None or not st.lifecycle_seen:
+            return
+        if st.event_chain_open or st.pending_stage3 > 0:
+            return
+        if st.state in ("active", "confirmed"):
+            self._finalize_locked(camera_id, force=(st.state == "confirmed"))
+        elif not st.segments and st.state != "cooldown":
+            self.by_camera.pop(camera_id, None)
+
     def close_all(self) -> None:
         self._stop_event.set()
         try:
@@ -321,29 +363,24 @@ class IncidentAggregator:
 
     def _sweeper_loop(self) -> None:
         while not self._stop_event.is_set():
-            finalize_items: List[tuple[str, bool]] = []
-
-            with self.lock:
-                now_wall = time.time()
-
-                for camera_id, st in list(self.by_camera.items()):
-                    if st.state not in ("active", "confirmed"):
-                        continue
-
-                    idle_for = now_wall - float(st.last_update_wall_ts)
-                    if idle_for < self.stale_finalize_sec:
-                        continue
-
-                    if st.state == "active" and self._can_confirm(st):
-                        st.state = "confirmed"
-                        st.alarm_sent = True
-
-                    finalize_items.append((camera_id, st.state == "confirmed"))
-
-            for camera_id, force in finalize_items:
-                self.finalize(camera_id, force=force)
-
+            self._sweep_once()
             time.sleep(self.sweep_interval_sec)
+
+    def _sweep_once(self) -> None:
+        finalize_items: List[tuple[str, bool]] = []
+        with self.lock:
+            now_wall = time.time()
+            for camera_id, st in list(self.by_camera.items()):
+                if st.state not in ("active", "confirmed") or st.lifecycle_seen:
+                    continue
+                if now_wall - float(st.last_update_wall_ts) < self.stale_finalize_sec:
+                    continue
+                if st.state == "active" and self._can_confirm(st):
+                    st.state = "confirmed"
+                    st.alarm_sent = True
+                finalize_items.append((camera_id, st.state == "confirmed"))
+        for camera_id, force in finalize_items:
+            self.finalize(camera_id, force=force)
 
     def _normalize_result(self, result: Stage3Result) -> Stage3Result:
         start_ts = float(result.event_start_ts)
@@ -699,37 +736,57 @@ class IncidentAggregator:
         if not clip_path.exists() or clip_path.stat().st_size <= 0:
             return False
 
-        tmp_path = clip_path.with_name(f"{clip_path.stem}__ai_overlay_tmp.mp4")
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            print("[INCIDENT][WARN] ffmpeg not found; keeping concat clip", flush=True)
+            return False
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{clip_path.stem}__overlay_", suffix=".mp4", dir=str(clip_path.parent)
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
 
         cap = None
-        writer = None
+        encoder = None
+        encoder_stderr = None
 
         try:
             cap = cv2.VideoCapture(str(clip_path))
 
             if not cap.isOpened():
+                tmp_path.unlink(missing_ok=True)
                 return False
 
             fps = cap.get(cv2.CAP_PROP_FPS)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            if not fps or fps <= 1:
+            if not fps or not math.isfinite(float(fps)) or fps <= 1:
                 fps = 16.0
 
             if width <= 0 or height <= 0:
+                cap.release()
+                cap = None
+                tmp_path.unlink(missing_ok=True)
                 return False
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(
-                str(tmp_path),
-                fourcc,
-                float(fps),
-                (width, height),
+            # A file-backed stderr stream cannot fill up and deadlock a long
+            # raw-video encode while the parent is still feeding stdin.
+            encoder_stderr = tempfile.TemporaryFile()
+            encoder = subprocess.Popen(
+                [
+                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                    "-f", "rawvideo", "-pix_fmt", "bgr24",
+                    "-s:v", f"{width}x{height}", "-r", f"{float(fps):.6f}",
+                    "-i", "pipe:0", "-an", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-movflags", "+faststart",
+                    str(tmp_path),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=encoder_stderr,
             )
-
-            if not writer.isOpened():
-                return False
 
             pose_model = None
             pose_model_loaded = False
@@ -801,27 +858,41 @@ class IncidentAggregator:
                             )
 
                 frame = draw_ai_clip_overlay(frame, meta)
-                writer.write(frame)
+                if encoder.stdin is None:
+                    raise RuntimeError("ffmpeg stdin unavailable")
+                encoder.stdin.write(frame.tobytes())
                 wrote_any = True
                 frame_index += 1
 
             cap.release()
             cap = None
 
-            writer.release()
-            writer = None
+            if encoder.stdin is not None:
+                encoder.stdin.close()
+                encoder.stdin = None
+            returncode = encoder.wait()
+            encoder_stderr.seek(0)
+            stderr = encoder_stderr.read()
+            encoder = None
 
-            if not wrote_any:
+            if not wrote_any or returncode != 0:
+                if stderr:
+                    print(
+                        f"[INCIDENT][WARN] ffmpeg overlay failed: "
+                        f"{stderr.decode('utf-8', errors='replace')[-1000:]}", flush=True,
+                    )
                 tmp_path.unlink(missing_ok=True)
                 return False
 
-            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            if not self._validate_browser_mp4(tmp_path):
                 tmp_path.unlink(missing_ok=True)
                 return False
 
-            tmp_path.replace(clip_path)
+            # Same-directory os.replace is atomic. The known-good concat clip is
+            # untouched until encoding and validation have both succeeded.
+            os.replace(tmp_path, clip_path)
 
-            return clip_path.exists() and clip_path.stat().st_size > 0
+            return True
 
         except Exception as exc:
             print(
@@ -836,8 +907,13 @@ class IncidentAggregator:
                 pass
 
             try:
-                if writer is not None:
-                    writer.release()
+                if encoder is not None:
+                    if encoder.stdin is not None:
+                        encoder.stdin.close()
+                        encoder.stdin = None
+                    if encoder.poll() is None:
+                        encoder.kill()
+                    encoder.wait(timeout=2.0)
             except Exception:
                 pass
 
@@ -846,7 +922,73 @@ class IncidentAggregator:
             except Exception:
                 pass
 
+            try:
+                if encoder_stderr is not None:
+                    encoder_stderr.close()
+            except Exception:
+                pass
+
             return False
+
+        finally:
+            try:
+                if encoder_stderr is not None:
+                    encoder_stderr.close()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _probe_mp4(path: Path) -> Optional[dict]:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        res = subprocess.run(
+            [
+                ffprobe, "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=codec_name,pix_fmt:format=duration",
+                "-of", "json", str(path),
+            ],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+        if res.returncode != 0:
+            return {}
+        try:
+            return json.loads(res.stdout.decode("utf-8"))
+        except Exception:
+            return {}
+
+    @classmethod
+    def _validate_browser_mp4(cls, path: Path) -> bool:
+        if not path.exists() or path.stat().st_size <= 0:
+            return False
+        probe = cls._probe_mp4(path)
+        if probe is not None:
+            streams = probe.get("streams") or []
+            fmt = probe.get("format") or {}
+            if not streams:
+                return False
+            try:
+                duration = float(fmt.get("duration", 0.0))
+            except (TypeError, ValueError):
+                return False
+            return (
+                streams[0].get("codec_name") == "h264"
+                and streams[0].get("pix_fmt") == "yuv420p"
+                and duration > 0.0
+            )
+
+        # ffprobe is optional in production. When absent, require OpenCV to
+        # decode at least one frame and report a positive duration/frame count.
+        cap = cv2.VideoCapture(str(path))
+        try:
+            if not cap.isOpened():
+                return False
+            fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+            frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+            ok, frame = cap.read()
+            return bool(ok and frame is not None and fps > 0.0 and frames > 0.0)
+        finally:
+            cap.release()
 
     def _concat_mp4s(self, clip_paths: List[str], out_path: Path) -> bool:
         valid = [str(Path(p)) for p in clip_paths if Path(p).exists()]
@@ -855,14 +997,30 @@ class IncidentAggregator:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if len(valid) == 1:
+        # Copying is safe only when ffprobe can positively identify the source;
+        # OpenCV's decode-only fallback cannot distinguish H.264 from mp4v.
+        if (
+            len(valid) == 1
+            and self._probe_mp4(Path(valid[0])) is not None
+            and self._validate_browser_mp4(Path(valid[0]))
+        ):
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{out_path.stem}__concat_",
+                suffix=".mp4",
+                dir=str(out_path.parent),
+            )
+            os.close(fd)
+            tmp_path = Path(tmp_name)
             try:
-                src = Path(valid[0])
-                if src.resolve() != out_path.resolve():
-                    shutil.copy2(src, out_path)
-                return out_path.exists() and out_path.stat().st_size > 0
+                shutil.copy2(valid[0], tmp_path)
+                if not self._validate_browser_mp4(tmp_path):
+                    return False
+                os.replace(tmp_path, out_path)
+                return True
             except Exception:
-                pass
+                return False
+            finally:
+                tmp_path.unlink(missing_ok=True)
 
         ffmpeg = shutil.which("ffmpeg")
         if ffmpeg:
@@ -893,7 +1051,11 @@ class IncidentAggregator:
                     stderr=subprocess.PIPE,
                     check=False,
                 )
-                if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                if (
+                    res.returncode == 0
+                    and self._probe_mp4(out_path) is not None
+                    and self._validate_browser_mp4(out_path)
+                ):
                     return True
 
                 cmd_reencode = [
@@ -920,80 +1082,17 @@ class IncidentAggregator:
                     stderr=subprocess.PIPE,
                     check=False,
                 )
-                if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                if res.returncode == 0 and self._validate_browser_mp4(out_path):
                     return True
 
-        return self._concat_with_opencv(valid, out_path)
-
-    def _concat_with_opencv(self, clip_paths: List[str], out_path: Path) -> bool:
-        writer = None
+        # OpenCV's mp4v writer is deliberately not a fallback: a final incident
+        # must never be persisted as MPEG-4 Part 2. Without libx264 we keep the
+        # source segments and report concat failure.
         try:
-            target_size = None
-            target_fps = None
-
-            for p in clip_paths:
-                cap = cv2.VideoCapture(p)
-                if not cap.isOpened():
-                    continue
-
-                fps = cap.get(cv2.CAP_PROP_FPS)
-                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
-                if width > 0 and height > 0 and target_size is None:
-                    target_size = (width, height)
-
-                if fps and fps > 1 and target_fps is None:
-                    target_fps = float(fps)
-
-                cap.release()
-
-                if target_size is not None and target_fps is not None:
-                    break
-
-            if target_size is None:
-                return False
-
-            if target_fps is None:
-                target_fps = 16.0
-
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(out_path), fourcc, float(target_fps), target_size)
-            if not writer.isOpened():
-                return False
-
-            wrote_any = False
-
-            for p in clip_paths:
-                cap = cv2.VideoCapture(p)
-                if not cap.isOpened():
-                    continue
-
-                while True:
-                    ok, frame = cap.read()
-                    if not ok or frame is None:
-                        break
-
-                    if (frame.shape[1], frame.shape[0]) != target_size:
-                        frame = cv2.resize(frame, target_size)
-
-                    writer.write(frame)
-                    wrote_any = True
-
-                cap.release()
-
-            writer.release()
-            writer = None
-
-            return wrote_any and out_path.exists() and out_path.stat().st_size > 0
-
+            out_path.unlink(missing_ok=True)
         except Exception:
-            try:
-                if writer is not None:
-                    writer.release()
-            except Exception:
-                pass
-            return False
+            pass
+        return False
 
     @staticmethod
     def _append_jsonl(path: Path, row: dict) -> None:

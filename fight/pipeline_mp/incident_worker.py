@@ -4,7 +4,7 @@ import queue
 
 from fight.pipeline.incident_aggregator import IncidentAggregator, Stage3Result
 from fight.pipeline_mp.common import configure_process_runtime, now_str
-from fight.pipeline_mp.messages import ReportMessage, Stage3ResultMessage
+from fight.pipeline_mp.messages import IncidentLifecycleMessage, ReportMessage, Stage3ResultMessage
 
 
 def _report(report_queue, kind: str, row: dict) -> None:
@@ -65,6 +65,9 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
                 break
 
             try:
+                if isinstance(msg, IncidentLifecycleMessage):
+                    agg.lifecycle(msg.camera_id, msg.source, msg.action)
+                    continue
                 if not isinstance(msg, Stage3ResultMessage):
                     continue
 

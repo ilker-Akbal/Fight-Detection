@@ -21,7 +21,7 @@ from fight.pipeline_mp.common import (
     now_str,
     ts_to_str,
 )
-from fight.pipeline_mp.messages import ActiveEvent, ReportMessage, Stage3Job
+from fight.pipeline_mp.messages import ActiveEvent, IncidentLifecycleMessage, ReportMessage, Stage3Job
 from fight.pose.src.pose_gate import PoseGate
 from shared_inference.protocol import InferenceClient
 
@@ -229,6 +229,7 @@ class CameraProcessRunner:
         self.frame_idx = -1
         self.event_counter = 0
         self.active_event: ActiveEvent | None = None
+        self.event_chain_open = False
         self.prebuffer = deque(maxlen=int(self.runtime.get("prebuffer_frames", 24)))
 
         self.default_clip_fps = float(self.runtime.get("clip_fps", 16.0))
@@ -431,6 +432,15 @@ class CameraProcessRunner:
     def new_event(self, now_ts: float, seed_frames: list, pose_score: float, start_reason: str) -> None:
         self.event_counter += 1
         event_id = f"{self.camera_id}_{self.event_counter:06d}"
+
+        if not self.event_chain_open:
+            self.stage3_queue.put(
+                IncidentLifecycleMessage(
+                    self.camera_id, self.source, "event_chain_opened", event_id
+                ),
+                timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
+            )
+            self.event_chain_open = True
 
         prebuffer_frames = int(self.runtime.get("prebuffer_frames", 24))
         raw_seed_frames = list(seed_frames or [])
@@ -707,8 +717,28 @@ class CameraProcessRunner:
             },
         )
 
+        if reason != "max_event_frames":
+            self.close_event_chain(ev.event_id)
+
+    def close_event_chain(self, event_id: str = "") -> None:
+        if not self.event_chain_open:
+            return
+        self.stage3_queue.put(
+            IncidentLifecycleMessage(
+                self.camera_id, self.source, "event_chain_closed", event_id
+            ),
+            timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
+        )
+        self.event_chain_open = False
+
     def _close_active_if_grace_expired(self, reason: str) -> bool:
         if self.active_event is None:
+            # max_event_frames closes only the physical segment.  If no next
+            # segment starts within the normal event grace, close the chain.
+            grace = int(self.runtime.get("event_close_grace_frames", 12))
+            if self.event_chain_open and (self.frame_idx - self.last_event_close_frame_idx) >= grace:
+                self.close_event_chain()
+                return True
             return False
 
         gap = self.frame_idx - int(self.active_event.last_positive_frame_idx)
@@ -1086,6 +1116,8 @@ class CameraProcessRunner:
                         if self.source_is_file:
                             if self.active_event is not None:
                                 self.close_event("source_eof")
+                            else:
+                                self.close_event_chain()
 
                             if file_loop:
                                 self.open()
@@ -1115,6 +1147,8 @@ class CameraProcessRunner:
 
         if self.active_event is not None:
             self.close_event("shutdown")
+        else:
+            self.close_event_chain()
 
         try:
             self.motion.close()

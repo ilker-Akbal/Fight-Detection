@@ -16,6 +16,22 @@ def job(pipeline="fight", stage="person_detection", camera="cam1", generation="g
 
 
 class ProtocolTests(unittest.TestCase):
+    def test_job_validation_and_queue_full_drop(self):
+        invalid = job()
+        invalid.pipeline = "unknown"
+        self.assertFalse(invalid.valid())
+
+        jobs = queue.Queue(maxsize=1)
+        jobs.put(object())
+        client = InferenceClient(
+            pipeline="fight", camera_id="c", session_id="s", generation_id="g",
+            result_channel=queue.Queue(), job_queues={"person_detection": jobs},
+            timeout_sec=.05,
+        )
+        self.assertIsNone(client.infer("person_detection", 1, time.time_ns(), object()))
+        self.assertEqual(client.metrics["dropped"], 1)
+        self.assertEqual(client.pending, {})
+
     def test_result_preserves_all_job_identity(self):
         item = job(frame=7)
         result = InferenceResult.from_job(item, success=True, payload=[1])
@@ -46,6 +62,37 @@ class ProtocolTests(unittest.TestCase):
         results.put(None)
         thread.join(1)
 
+    def test_router_isolates_three_interleaved_camera_channels(self):
+        results, commands = queue.Queue(), queue.Queue()
+        channels = {
+            ("fight", "cam001"): queue.Queue(),
+            ("fight", "cam002"): queue.Queue(),
+            ("speed", "cam001"): queue.Queue(),
+        }
+        stop = threading.Event()
+        thread = threading.Thread(
+            target=result_router_main,
+            args=(results, commands, stop, channels),
+            daemon=True,
+        )
+        thread.start()
+        specs = [
+            ("fight", "person_detection", "cam001", "g1", "a"),
+            ("fight", "pose", "cam002", "g2", "b"),
+            ("speed", "vehicle_detection", "cam001", "g3", "c"),
+        ]
+        jobs = []
+        for pipeline, stage, camera, generation, payload in specs:
+            commands.put(RouteCommand("register", pipeline, camera, "s1", generation))
+            jobs.append((job(pipeline, stage, camera, generation), payload))
+        for item, payload in reversed(jobs):
+            results.put(InferenceResult.from_job(item, success=True, payload=payload))
+        self.assertEqual(channels[("fight", "cam001")].get(timeout=1).payload, "a")
+        self.assertEqual(channels[("fight", "cam002")].get(timeout=1).payload, "b")
+        self.assertEqual(channels[("speed", "cam001")].get(timeout=1).payload, "c")
+        results.put(None)
+        thread.join(1)
+
     def test_camera_rejects_unknown_duplicate_and_out_of_order(self):
         client = InferenceClient(pipeline="fight", camera_id="c", session_id="s1",
                                  generation_id="g1", result_channel=queue.Queue(),
@@ -59,6 +106,26 @@ class ProtocolTests(unittest.TestCase):
         self.assertIsNone(client._accept(InferenceResult.from_job(newer, success=True), expected_stage=newer.stage))
         self.assertEqual(client.metrics["stale_results"], 1)
         self.assertEqual(client.metrics["unknown_request"], 1)
+
+    def test_camera_rejects_stage_frame_and_timestamp_mismatch(self):
+        client = InferenceClient(
+            pipeline="fight", camera_id="c", session_id="s1", generation_id="g1",
+            result_channel=queue.Queue(), job_queues={}, timeout_sec=.1,
+        )
+        item = job(camera="c", frame=5)
+        client.pending[item.request_id] = (
+            item.stage, item.frame_id, item.timestamp_ns, time.monotonic()
+        )
+        wrong_stage = InferenceResult.from_job(item, success=True)
+        wrong_stage.stage = "pose"
+        self.assertIsNone(client._accept(wrong_stage, expected_stage="pose"))
+        self.assertIn(item.request_id, client.pending)
+
+        mismatch = InferenceResult.from_job(item, success=True)
+        mismatch.timestamp_ns += 1
+        self.assertIsNone(client._accept(mismatch, expected_stage=item.stage))
+        self.assertNotIn(item.request_id, client.pending)
+        self.assertEqual(client.metrics["stale_results"], 1)
 
     def test_camera_rejects_old_session_and_expires_pending(self):
         client = InferenceClient(pipeline="speed", camera_id="c", session_id="new",
@@ -102,6 +169,45 @@ class ProtocolTests(unittest.TestCase):
         self.assertNotIn("secret", returned[1].error_code)
         jobs.put(None)
         thread.join(1)
+
+    def test_worker_ready_factory_count_stop_and_full_result_queue(self):
+        jobs, results, ready = queue.Queue(), queue.Queue(maxsize=1), queue.Queue()
+        results.put("occupied")
+        stop = threading.Event()
+        builds = []
+
+        def build():
+            builds.append(1)
+            return lambda value: value
+
+        thread = threading.Thread(target=inference_worker_main, kwargs={
+            "stage": "person_detection", "job_queue": jobs, "result_queue": results,
+            "stop_event": stop, "build_handler": build,
+            "max_batch_size": 2, "max_batch_wait_ms": 0, "ready_queue": ready,
+        }, daemon=True)
+        thread.start()
+        self.assertTrue(ready.get(timeout=1)["ready"])
+        jobs.put(job(frame=1))
+        jobs.put(None)
+        thread.join(1)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(builds), 1)
+        self.assertEqual(results.get_nowait(), "occupied")
+
+    def test_worker_model_build_failure_reports_safe_code(self):
+        ready = queue.Queue()
+
+        def fail():
+            raise RuntimeError("secret model path")
+
+        with self.assertRaisesRegex(RuntimeError, "secret model path"):
+            inference_worker_main(
+                stage="pose", job_queue=queue.Queue(), result_queue=queue.Queue(),
+                stop_event=threading.Event(), build_handler=fail, ready_queue=ready,
+            )
+        status = ready.get_nowait()
+        self.assertEqual(status["error_code"], "MODEL_LOAD_FAILED")
+        self.assertNotIn("secret", str(status))
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import argparse
 import multiprocessing as mp
 import os
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -152,16 +153,27 @@ def _wait_for_pipeline_settle(
     - IncidentAggregator sweeper stale_finalize_sec süresini görüp incidents.jsonl yazabilsin
     diye var.
     """
-    stale_finalize_sec = float(runtime.get("incident_stale_finalize_sec", 3.0))
     clip_ready_wait_sec = float(runtime.get("incident_clip_ready_wait_sec", 8.0))
 
-    settle_empty_sec = float(runtime.get("file_run_queue_empty_settle_sec", stale_finalize_sec + 1.0))
+    settle_empty_sec = float(runtime.get("file_run_queue_empty_settle_sec", 0.0))
     max_wait_sec = float(
         runtime.get(
             "file_run_finalize_wait_sec",
-            max(12.0, stale_finalize_sec + clip_ready_wait_sec + 5.0),
+            max(12.0, clip_ready_wait_sec + 5.0),
         )
     )
+
+    drained = threading.Event()
+
+    def _join_in_order() -> None:
+        # Queue.empty() can become true while a worker still owns an item.
+        # JoinableQueue.join() includes those in-flight tasks. Stage-3 must
+        # drain first because it is the producer for the incident queue.
+        stage3_queue.join()
+        incident_queue.join()
+        drained.set()
+
+    threading.Thread(target=_join_in_order, name="pipeline_drain", daemon=True).start()
 
     deadline = time.time() + max_wait_sec
     empty_since: float | None = None
@@ -185,7 +197,7 @@ def _wait_for_pipeline_settle(
         stage3_empty = _safe_empty(stage3_queue)
         incident_empty = _safe_empty(incident_queue)
 
-        if stage3_empty and incident_empty:
+        if drained.is_set():
             if empty_since is None:
                 empty_since = time.time()
 

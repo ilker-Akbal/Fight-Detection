@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from fight.pipeline.adapters import YoloAdapter
-from fight.pose.src.pose_adapter import PoseAdapter
 from shared_inference.runtime import inference_worker_main
 
 
@@ -12,6 +11,8 @@ def person_handler(config: dict):
 
 
 def pose_handler(config: dict):
+    from fight.pose.src.pose_adapter import PoseAdapter
+
     adapter = PoseAdapter(config["models"]["pose_config"])
 
     def infer(image):
