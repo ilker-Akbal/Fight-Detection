@@ -4,9 +4,7 @@ import argparse
 import multiprocessing as mp
 import os
 import sys
-import threading
 import time
-import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,9 +21,6 @@ from fight.pipeline_mp.incident_worker import incident_process_main
 from fight.pipeline_mp.messages import ReportMessage
 from fight.pipeline_mp.reporter import reporter_process_main
 from fight.pipeline_mp.stage3_worker import stage3_process_main
-from fight.pipeline_mp.inference_workers import person_worker_main, pose_worker_main
-from shared_inference.protocol import RouteCommand
-from shared_inference.runtime import result_router_main
 
 
 def _put_status(report_queue, row: dict) -> None:
@@ -153,27 +148,16 @@ def _wait_for_pipeline_settle(
     - IncidentAggregator sweeper stale_finalize_sec süresini görüp incidents.jsonl yazabilsin
     diye var.
     """
+    stale_finalize_sec = float(runtime.get("incident_stale_finalize_sec", 3.0))
     clip_ready_wait_sec = float(runtime.get("incident_clip_ready_wait_sec", 8.0))
 
-    settle_empty_sec = float(runtime.get("file_run_queue_empty_settle_sec", 0.0))
+    settle_empty_sec = float(runtime.get("file_run_queue_empty_settle_sec", stale_finalize_sec + 1.0))
     max_wait_sec = float(
         runtime.get(
             "file_run_finalize_wait_sec",
-            max(12.0, clip_ready_wait_sec + 5.0),
+            max(12.0, stale_finalize_sec + clip_ready_wait_sec + 5.0),
         )
     )
-
-    drained = threading.Event()
-
-    def _join_in_order() -> None:
-        # Queue.empty() can become true while a worker still owns an item.
-        # JoinableQueue.join() includes those in-flight tasks. Stage-3 must
-        # drain first because it is the producer for the incident queue.
-        stage3_queue.join()
-        incident_queue.join()
-        drained.set()
-
-    threading.Thread(target=_join_in_order, name="pipeline_drain", daemon=True).start()
 
     deadline = time.time() + max_wait_sec
     empty_since: float | None = None
@@ -197,7 +181,7 @@ def _wait_for_pipeline_settle(
         stage3_empty = _safe_empty(stage3_queue)
         incident_empty = _safe_empty(incident_queue)
 
-        if drained.is_set():
+        if stage3_empty and incident_empty:
             if empty_since is None:
                 empty_since = time.time()
 
@@ -258,18 +242,13 @@ def _start_camera(
     stage3_queue,
     report_queue,
     stop_event,
-    inference_queues,
-    result_channel,
-    session_id,
-    generation_id,
 ) -> mp.Process:
     cid = _camera_id(cam)
 
     return _start_process(
         f"camera_{cid}",
         camera_process_main,
-        (config, cam, stage3_queue, report_queue, stop_event, inference_queues,
-         result_channel, session_id, generation_id),
+        (config, cam, stage3_queue, report_queue, stop_event),
     )
 
 
@@ -296,18 +275,6 @@ def run(config: dict) -> int:
     stage3_queue = ctx.JoinableQueue(maxsize=stage3_queue_size)
     incident_queue = ctx.JoinableQueue(maxsize=incident_queue_size)
     report_queue = ctx.JoinableQueue(maxsize=report_queue_size)
-    inference_queue_size = int(runtime.get("inference_queue_size", 64))
-    result_queue = ctx.Queue(maxsize=int(runtime.get("inference_result_queue_size", 128)))
-    route_commands = ctx.Queue(maxsize=max(32, len(cameras) * 4))
-    ready_queue = ctx.Queue(maxsize=16)
-    person_queue = ctx.Queue(maxsize=inference_queue_size)
-    pose_queue = ctx.Queue(maxsize=inference_queue_size)
-    inference_queues = {"person_detection": person_queue, "pose": pose_queue}
-    result_channels = {
-        ("fight", _camera_id(cam)): ctx.Queue(
-            maxsize=int(runtime.get("camera_result_queue_size", 4))
-        ) for cam in cameras
-    }
 
     write_json(output_dir / "run_config.effective.json", config)
 
@@ -345,21 +312,7 @@ def run(config: dict) -> int:
         (config, stage3_queue, incident_queue, report_queue, stop_event),
     )
 
-    router = _start_process("inference_router", result_router_main,
-                            (result_queue, route_commands, stop_event, result_channels))
-    inference_workers: list[mp.Process] = []
-    for idx in range(max(1, int(runtime.get("person_worker_count", 1)))):
-        inference_workers.append(_start_process(
-            f"person_inference_{idx}", person_worker_main,
-            (config, person_queue, result_queue, stop_event, ready_queue)))
-    if bool(runtime.get("use_pose", True)):
-        for idx in range(max(1, int(runtime.get("pose_worker_count", 1)))):
-            inference_workers.append(_start_process(
-                f"pose_inference_{idx}", pose_worker_main,
-                (config, pose_queue, result_queue, stop_event, ready_queue)))
-
     camera_processes: dict[str, mp.Process] = {}
-    camera_generations: dict[str, tuple[str, str]] = {}
     finished_cameras: set[str] = set()
 
     for cam in cameras:
@@ -367,19 +320,12 @@ def run(config: dict) -> int:
         if not cid:
             raise RuntimeError(f"Geçersiz kamera kaydı: {cam}")
 
-        session_id, generation_id = uuid.uuid4().hex, uuid.uuid4().hex
-        camera_generations[cid] = (session_id, generation_id)
-        route_commands.put(RouteCommand("register", "fight", cid, session_id, generation_id))
         p = _start_camera(
             config=config,
             cam=cam,
             stage3_queue=stage3_queue,
             report_queue=report_queue,
             stop_event=stop_event,
-            inference_queues=inference_queues,
-            result_channel=result_channels[("fight", cid)],
-            session_id=session_id,
-            generation_id=generation_id,
         )
         camera_processes[cid] = p
 
@@ -418,13 +364,6 @@ def run(config: dict) -> int:
 
     try:
         while not stop_event.is_set():
-            while True:
-                try:
-                    worker_status = ready_queue.get_nowait()
-                except Exception:
-                    break
-                _put_status(report_queue, {"ts": now_str(), "camera_id": "__system__",
-                            "stage": "inference_worker", **worker_status})
             if not stage3.is_alive():
                 _put_status(
                     report_queue,
@@ -453,13 +392,6 @@ def run(config: dict) -> int:
                 )
                 stop_event.set()
                 exit_code = 3
-                break
-
-            if not router.is_alive() or any(not worker.is_alive() for worker in inference_workers):
-                _put_status(report_queue, {"ts": now_str(), "camera_id": "__system__",
-                            "stage": "orchestrator", "detail": "inference_process_dead"})
-                stop_event.set()
-                exit_code = 4
                 break
 
             for cam in cameras:
@@ -526,22 +458,12 @@ def run(config: dict) -> int:
                     },
                 )
 
-                old = camera_generations.get(cid)
-                if old:
-                    route_commands.put(RouteCommand("unregister", "fight", cid, old[0], old[1]))
-                session_id, generation_id = uuid.uuid4().hex, uuid.uuid4().hex
-                camera_generations[cid] = (session_id, generation_id)
-                route_commands.put(RouteCommand("register", "fight", cid, session_id, generation_id))
                 np = _start_camera(
                     config=config,
                     cam=cam,
                     stage3_queue=stage3_queue,
                     report_queue=report_queue,
                     stop_event=stop_event,
-                    inference_queues=inference_queues,
-                    result_channel=result_channels[("fight", cid)],
-                    session_id=session_id,
-                    generation_id=generation_id,
                 )
                 camera_processes[cid] = np
 
@@ -598,22 +520,6 @@ def run(config: dict) -> int:
 
         for _, p in camera_processes.items():
             _terminate_process(p, timeout=4.0)
-
-        for cid, generation in camera_generations.items():
-            try:
-                route_commands.put(RouteCommand("unregister", "fight", cid, generation[0], generation[1]), timeout=0.1)
-            except Exception:
-                pass
-        for q, count in ((person_queue, int(runtime.get("person_worker_count", 1))),
-                         (pose_queue, int(runtime.get("pose_worker_count", 1)))):
-            for _ in range(max(1, count)):
-                try: q.put(None, timeout=0.1)
-                except Exception: pass
-        for worker in inference_workers:
-            _terminate_process(worker, timeout=8.0)
-        try: result_queue.put(None, timeout=0.2)
-        except Exception: pass
-        _terminate_process(router, timeout=5.0)
 
         try:
             stage3_queue.put(None, timeout=1.0)

@@ -1,12 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
+from .vehicle_detector import VehicleDetection
 from .utils import bbox_center_xyxy
-
-if TYPE_CHECKING:
-    from .vehicle_detector import VehicleDetection
 
 
 def iou_xyxy(a, b) -> float:

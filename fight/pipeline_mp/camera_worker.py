@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import cv2
 import yaml
 
-from fight.pipeline.adapters import MotionAdapter
+from fight.pipeline.adapters import MotionAdapter, YoloAdapter
 from fight.pipeline.clip_buffer import save_clip_mp4
 from fight.pipeline.pair_selector import LivePairRoiController
 from fight.pipeline.person_stabilizer import TemporalPersonStabilizer
@@ -21,9 +21,9 @@ from fight.pipeline_mp.common import (
     now_str,
     ts_to_str,
 )
-from fight.pipeline_mp.messages import ActiveEvent, IncidentLifecycleMessage, ReportMessage, Stage3Job
+from fight.pipeline_mp.messages import ActiveEvent, ReportMessage, Stage3Job
+from fight.pose.src.pose_adapter import PoseAdapter
 from fight.pose.src.pose_gate import PoseGate
-from shared_inference.protocol import InferenceClient
 
 
 def _report(report_queue, kind: str, row: dict, block: bool = False) -> None:
@@ -165,8 +165,7 @@ class CameraProcessRunner:
     - Son karar X3D-M + incident aggregation tarafındadır.
     """
 
-    def __init__(self, config: dict, camera: dict, stage3_queue, report_queue, stop_event,
-                 inference_queues, result_channel, session_id: str, generation_id: str):
+    def __init__(self, config: dict, camera: dict, stage3_queue, report_queue, stop_event):
         self.config = config
         self.camera = camera
         self.stage3_queue = stage3_queue
@@ -186,14 +185,8 @@ class CameraProcessRunner:
         self.args.output_dir = str(self.paths.output_dir)
 
         self.motion = MotionAdapter(self.models["motion_config"])
-        self.pose_enabled = bool(self.runtime.get("use_pose", True))
-        self.inference = InferenceClient(
-            pipeline="fight", camera_id=self.camera_id, session_id=session_id,
-            generation_id=generation_id, result_channel=result_channel,
-            job_queues=inference_queues,
-            timeout_sec=float(self.runtime.get("inference_request_timeout_sec", 2.0)),
-            max_inflight=int(self.runtime.get("max_inflight_per_camera", 2)),
-        )
+        self.yolo = YoloAdapter(self.models["yolo_config"], self.models["yolo_weights"])
+        self.pose = PoseAdapter(self.models["pose_config"]) if bool(self.runtime.get("use_pose", True)) else None
 
         temporal_cfg = _load_pose_temporal(self.models["pose_config"])
         self.pose_gate = PoseGate(
@@ -229,7 +222,6 @@ class CameraProcessRunner:
         self.frame_idx = -1
         self.event_counter = 0
         self.active_event: ActiveEvent | None = None
-        self.event_chain_open = False
         self.prebuffer = deque(maxlen=int(self.runtime.get("prebuffer_frames", 24)))
 
         self.default_clip_fps = float(self.runtime.get("clip_fps", 16.0))
@@ -276,7 +268,6 @@ class CameraProcessRunner:
         }
         if extra:
             row.update(extra)
-        row["inference_metrics"] = self.inference.status()
         _report(self.report_queue, "status", row)
 
     def open(self) -> None:
@@ -370,23 +361,22 @@ class CameraProcessRunner:
             self.prebuffer.clear()
 
     def detect_persons(self, frame_bgr):
-        dets = self.inference.infer(
-            "person_detection", self.frame_idx, time.time_ns(), frame_bgr
-        ) or []
+        dets = self.yolo.detect_persons(frame_bgr)
         person_conf = float(self.runtime.get("person_conf", 0.25))
         dets = [(c, box) for (c, box) in dets if float(c) >= person_conf]
         dets.sort(key=lambda x: x[0], reverse=True)
         return dets
 
     def pose_check(self, roi_bgr):
-        if not self.pose_enabled:
+        if self.pose is None:
             return None
-        payload = self.inference.infer("pose", self.frame_idx, time.time_ns(), roi_bgr)
-        if payload is None:
-            return SimpleNamespace(score=0.0, ok=False, hist_positive=0)
-        dec = self.pose_gate.update(float(payload["score"]), bool(payload["ok"]))
-        return SimpleNamespace(score=float(payload["score"]), ok=dec.pose_ok,
-                               hist_positive=dec.hist_positive)
+
+        raw = self.pose.evaluate(roi_bgr)
+        dec = self.pose_gate.update(raw.score, raw.ok)
+
+        raw.ok = dec.pose_ok
+        raw.hist_positive = dec.hist_positive
+        return raw
 
     def maybe_write_preview(
         self,
@@ -432,15 +422,6 @@ class CameraProcessRunner:
     def new_event(self, now_ts: float, seed_frames: list, pose_score: float, start_reason: str) -> None:
         self.event_counter += 1
         event_id = f"{self.camera_id}_{self.event_counter:06d}"
-
-        if not self.event_chain_open:
-            self.stage3_queue.put(
-                IncidentLifecycleMessage(
-                    self.camera_id, self.source, "event_chain_opened", event_id
-                ),
-                timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
-            )
-            self.event_chain_open = True
 
         prebuffer_frames = int(self.runtime.get("prebuffer_frames", 24))
         raw_seed_frames = list(seed_frames or [])
@@ -717,28 +698,8 @@ class CameraProcessRunner:
             },
         )
 
-        if reason != "max_event_frames":
-            self.close_event_chain(ev.event_id)
-
-    def close_event_chain(self, event_id: str = "") -> None:
-        if not self.event_chain_open:
-            return
-        self.stage3_queue.put(
-            IncidentLifecycleMessage(
-                self.camera_id, self.source, "event_chain_closed", event_id
-            ),
-            timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
-        )
-        self.event_chain_open = False
-
     def _close_active_if_grace_expired(self, reason: str) -> bool:
         if self.active_event is None:
-            # max_event_frames closes only the physical segment.  If no next
-            # segment starts within the normal event grace, close the chain.
-            grace = int(self.runtime.get("event_close_grace_frames", 12))
-            if self.event_chain_open and (self.frame_idx - self.last_event_close_frame_idx) >= grace:
-                self.close_event_chain()
-                return True
             return False
 
         gap = self.frame_idx - int(self.active_event.last_positive_frame_idx)
@@ -1018,7 +979,7 @@ class CameraProcessRunner:
 
         pose_trigger_hold_sec = float(self.runtime.get("pose_trigger_hold_sec", 2.4))
         pose_capture_active = (
-            not self.pose_enabled
+            self.pose is None
             or (
                 self.last_pose_trigger_ts > 0
                 and (now_ts - self.last_pose_trigger_ts) <= pose_trigger_hold_sec
@@ -1116,8 +1077,6 @@ class CameraProcessRunner:
                         if self.source_is_file:
                             if self.active_event is not None:
                                 self.close_event("source_eof")
-                            else:
-                                self.close_event_chain()
 
                             if file_loop:
                                 self.open()
@@ -1147,22 +1106,16 @@ class CameraProcessRunner:
 
         if self.active_event is not None:
             self.close_event("shutdown")
-        else:
-            self.close_event_chain()
 
         try:
             self.motion.close()
         except Exception:
             pass
 
-        self.inference.close()
-
         self.report_status("camera", "stopped")
 
 
-def camera_process_main(config: dict, camera: dict, stage3_queue, report_queue, stop_event,
-                        inference_queues, result_channel, session_id: str,
-                        generation_id: str) -> None:
+def camera_process_main(config: dict, camera: dict, stage3_queue, report_queue, stop_event) -> None:
     runtime = config.get("runtime", {})
 
     configure_process_runtime(
@@ -1176,9 +1129,5 @@ def camera_process_main(config: dict, camera: dict, stage3_queue, report_queue, 
         stage3_queue=stage3_queue,
         report_queue=report_queue,
         stop_event=stop_event,
-        inference_queues=inference_queues,
-        result_channel=result_channel,
-        session_id=session_id,
-        generation_id=generation_id,
     )
     runner.run_loop()

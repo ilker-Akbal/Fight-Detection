@@ -15,7 +15,7 @@ from HizTespiti.motion.src.motion_gate import MotionGate
 from HizTespiti.motion.src.roi_mask import RoiMask
 
 from HizTespiti.yolo.src.simple_tracker import SimpleIoUTracker
-from shared_inference.protocol import InferenceClient
+from HizTespiti.yolo.src.vehicle_detector import VehicleDetector
 
 from HizTespiti.speed.src.calibration_loader import LoadedCalibration, load_calibration
 from HizTespiti.speed.src.evidence_writer import EvidenceWriter, FrameBuffer
@@ -293,10 +293,6 @@ def camera_process_main(
     camera_dict: dict[str, Any],
     mp_config_dict: dict[str, Any],
     report_queue,
-    inference_queue,
-    result_channel,
-    session_id: str,
-    generation_id: str,
 ) -> None:
     global _STOP
     _STOP = False
@@ -372,13 +368,7 @@ def camera_process_main(
             motion_detector = BackgroundMotionDetector(cfg.motion)
             motion_gate = MotionGate(cfg.motion)
 
-        inference = InferenceClient(
-            pipeline="speed", camera_id=cam.camera_id, session_id=session_id,
-            generation_id=generation_id, result_channel=result_channel,
-            job_queues={"vehicle_detection": inference_queue},
-            timeout_sec=float(mp_cfg.runtime.get("inference_request_timeout_sec", 2.0)),
-            max_inflight=int(mp_cfg.runtime.get("max_inflight_per_camera", 2)),
-        )
+        detector = VehicleDetector(cfg.yolo)
 
         tracker = SimpleIoUTracker(
             iou_threshold=cfg.tracker.iou_threshold,
@@ -498,9 +488,7 @@ def camera_process_main(
 
             if should_run_yolo:
                 yolo_ran = True
-                detections = inference.infer(
-                    "vehicle_detection", frame_idx, time.time_ns(), frame
-                ) or []
+                detections = detector.detect(frame)
                 last_tracks = tracker.update(detections, frame_idx)
             else:
                 if motion_active:
@@ -600,7 +588,6 @@ def camera_process_main(
                         tracks=len(last_tracks),
                         latest_speed_kmh=latest_speed_kmh,
                         latest_violation=latest_violation,
-                        inference_metrics=inference.status(),
                     ),
                 )
 
@@ -628,10 +615,6 @@ def camera_process_main(
         raise
 
     finally:
-        try:
-            inference.close()
-        except Exception:
-            pass
         try:
             if reader is not None:
                 reader.close()

@@ -43,15 +43,6 @@ class Stage3ResultMessage:
 
 
 @dataclass
-class IncidentLifecycleMessage:
-    camera_id: str
-    source: str
-    action: str
-    event_id: str = ""
-    created_at: float = field(default_factory=time.time)
-
-
-@dataclass
 class ActiveEvent:
     event_id: str
     camera_id: str

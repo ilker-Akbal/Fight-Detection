@@ -89,15 +89,6 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
         "stage3_queue_size",
         "incident_queue_size",
         "report_queue_size",
-        "person_worker_count",
-        "pose_worker_count",
-        "inference_queue_size",
-        "inference_result_queue_size",
-        "camera_result_queue_size",
-        "inference_max_batch_size",
-        "inference_max_batch_wait_ms",
-        "max_inflight_per_camera",
-        "inference_request_timeout_sec",
         "stage3_enqueue_timeout_sec",
         "camera_cv2_threads",
         "stage3_cv2_threads",
@@ -179,15 +170,6 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     runtime.setdefault("incident_queue_size", 256)
     runtime.setdefault("report_queue_size", 8192)
     runtime.setdefault("stage3_enqueue_timeout_sec", 0.15)
-    runtime.setdefault("person_worker_count", 1)
-    runtime.setdefault("pose_worker_count", 1)
-    runtime.setdefault("inference_queue_size", 64)
-    runtime.setdefault("inference_result_queue_size", 128)
-    runtime.setdefault("camera_result_queue_size", 4)
-    runtime.setdefault("inference_max_batch_size", 4)
-    runtime.setdefault("inference_max_batch_wait_ms", 5)
-    runtime.setdefault("max_inflight_per_camera", 2)
-    runtime.setdefault("inference_request_timeout_sec", 2.0)
 
     runtime.setdefault("camera_cv2_threads", 1)
     runtime.setdefault("stage3_cv2_threads", 1)

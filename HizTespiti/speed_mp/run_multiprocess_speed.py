@@ -7,7 +7,6 @@ import os
 import signal
 import sys
 import time
-import uuid
 from dataclasses import asdict
 from pathlib import Path
 
@@ -17,9 +16,6 @@ from .config import SpeedMpCamera, SpeedMpConfig, load_mp_config
 from .messages import status_message, stop_message
 from .process_camera import camera_process_main
 from .process_reporter import reporter_main
-from .inference_worker import vehicle_worker_main
-from shared_inference.protocol import RouteCommand
-from shared_inference.runtime import result_router_main
 
 
 _STOP = False
@@ -169,13 +165,6 @@ def main():
         ctx = mp
 
     report_queue = ctx.Queue(maxsize=4096)
-    stop_event = ctx.Event()
-    inference_queue = ctx.Queue(maxsize=int(cfg.runtime.get("inference_queue_size", 64)))
-    result_queue = ctx.Queue(maxsize=int(cfg.runtime.get("inference_result_queue_size", 128)))
-    route_commands = ctx.Queue(maxsize=max(32, len(cfg.cameras) * 4))
-    ready_queue = ctx.Queue(maxsize=16)
-    result_channels = {("speed", cam.camera_id): ctx.Queue(
-        maxsize=int(cfg.runtime.get("camera_result_queue_size", 4))) for cam in cfg.cameras}
 
     flush_interval = float(cfg.runtime.get("report_flush_interval_sec", 0.25) or 0.25)
 
@@ -191,27 +180,12 @@ def main():
     mp_cfg_dict = _mp_config_to_process_dict(cfg)
 
     camera_processes: list[mp.Process] = []
-    generations: dict[str, tuple[str, str]] = {}
-    router = ctx.Process(target=result_router_main, name="speed_inference_router",
-                         args=(result_queue, route_commands, stop_event, result_channels))
-    router.start()
-    inference_workers: list[mp.Process] = []
-    for idx in range(max(1, int(cfg.runtime.get("vehicle_worker_count", 1)))):
-        worker = ctx.Process(target=vehicle_worker_main, name=f"vehicle_inference_{idx}",
-                             args=(mp_cfg_dict, inference_queue, result_queue, stop_event, ready_queue))
-        worker.start()
-        inference_workers.append(worker)
 
     for cam in cfg.cameras:
-        session_id, generation_id = uuid.uuid4().hex, uuid.uuid4().hex
-        generations[cam.camera_id] = (session_id, generation_id)
-        route_commands.put(RouteCommand("register", "speed", cam.camera_id,
-                                        session_id, generation_id))
         proc = ctx.Process(
             target=camera_process_main,
             name=f"speed_cam_{cam.camera_id}",
-            args=(_camera_to_dict(cam), mp_cfg_dict, report_queue, inference_queue,
-                  result_channels[("speed", cam.camera_id)], session_id, generation_id),
+            args=(_camera_to_dict(cam), mp_cfg_dict, report_queue),
             daemon=False,
         )
 
@@ -233,23 +207,6 @@ def main():
 
     try:
         while not _STOP:
-            while True:
-                try:
-                    worker_status = ready_queue.get_nowait()
-                except Exception:
-                    break
-                try:
-                    report_queue.put_nowait(status_message(
-                        camera_id="__system__", stage="inference_worker",
-                        detail="ready" if worker_status.get("ready") else "model_load_failed",
-                        error=str(worker_status.get("error_code", "")),
-                    ))
-                except Exception:
-                    pass
-            if not router.is_alive() or any(not p.is_alive() for p in inference_workers):
-                exit_code = 2
-                _STOP = True
-                break
             alive_count = sum(1 for p in camera_processes if p.is_alive())
 
             for proc, cam in zip(camera_processes, cfg.cameras):
@@ -285,7 +242,6 @@ def main():
         _STOP = True
 
     finally:
-        stop_event.set()
         print("[ORCH] stopping camera processes...", flush=True)
 
         for proc in camera_processes:
@@ -296,21 +252,6 @@ def main():
                 proc.join(timeout=1.0)
             except Exception:
                 pass
-
-        for cam in cfg.cameras:
-            generation = generations.get(cam.camera_id)
-            if generation:
-                try: route_commands.put(RouteCommand("unregister", "speed", cam.camera_id,
-                                                       generation[0], generation[1]), timeout=.1)
-                except Exception: pass
-        for _ in inference_workers:
-            try: inference_queue.put(None, timeout=.1)
-            except Exception: pass
-        for worker in inference_workers:
-            _terminate_process(worker, timeout=8.0)
-        try: result_queue.put(None, timeout=.1)
-        except Exception: pass
-        _terminate_process(router, timeout=5.0)
 
         print("[ORCH] stopping reporter...", flush=True)
 

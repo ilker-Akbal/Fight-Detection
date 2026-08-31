@@ -21,7 +21,6 @@ class CameraStatusMessage:
     latest_speed_kmh: float | None = None
     latest_violation: bool = False
     error: str = ""
-    inference_metrics: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -60,7 +59,6 @@ def status_message(
     latest_speed_kmh: float | None = None,
     latest_violation: bool = False,
     error: str = "",
-    inference_metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return CameraStatusMessage(
         type="status",
@@ -77,7 +75,6 @@ def status_message(
         latest_speed_kmh=latest_speed_kmh,
         latest_violation=bool(latest_violation),
         error=str(error or ""),
-        inference_metrics=inference_metrics,
     ).to_dict()
 
 

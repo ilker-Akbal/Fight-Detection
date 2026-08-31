@@ -171,14 +171,6 @@ def build_run_config(run_name: str, run_dir: Path, cameras: list[dict[str, Any]]
             "report_flush_interval_sec": speed_defaults.get("report_flush_interval_sec", 0.25),
             "reconnect_sec": speed_defaults.get("reconnect_sec", 1.0),
             "cv2_threads": speed_defaults.get("cv2_threads", 1),
-            "vehicle_worker_count": speed_defaults.get("vehicle_worker_count", 1),
-            "inference_queue_size": speed_defaults.get("inference_queue_size", 64),
-            "inference_result_queue_size": speed_defaults.get("inference_result_queue_size", 128),
-            "camera_result_queue_size": speed_defaults.get("camera_result_queue_size", 4),
-            "inference_max_batch_size": speed_defaults.get("inference_max_batch_size", 4),
-            "inference_max_batch_wait_ms": speed_defaults.get("inference_max_batch_wait_ms", 5),
-            "max_inflight_per_camera": speed_defaults.get("max_inflight_per_camera", 2),
-            "inference_request_timeout_sec": speed_defaults.get("inference_request_timeout_sec", 2.0),
         },
 
         "motion": {
