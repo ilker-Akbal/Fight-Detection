@@ -45,18 +45,18 @@ class YoloAdapter:
         self.device = self.cfg.get("device", 0)
         self.verbose = bool(self.cfg.get("verbose", False))
 
-    def detect_persons(self, frame_bgr: np.ndarray):
-        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-
-        res = self.model.predict(
-            source=frame_rgb,
+    def _predict(self, source):
+        return self.model.predict(
+            source=source,
             imgsz=self.imgsz,
             conf=self.conf,
             iou=self.iou,
             device=self.device,
             verbose=self.verbose,
-        )[0]
+        )
 
+    @staticmethod
+    def _parse_person_result(frame_bgr: np.ndarray, res):
         out = []
         if res.boxes is None:
             return out
@@ -89,6 +89,47 @@ class YoloAdapter:
 
         out.sort(key=lambda x: x[0], reverse=True)
         return out
+
+    def detect_persons(self, frame_bgr: np.ndarray):
+        frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        res = self._predict(frame_rgb)[0]
+        return self._parse_person_result(frame_bgr, res)
+
+    def detect_persons_batch(self, frames_bgr: list[np.ndarray]):
+        frames = list(frames_bgr)
+        if not frames:
+            return []
+        if len(frames) == 1:
+            return [self.detect_persons(frames[0])]
+
+        # Ultralytics switches from minimal rectangular padding to square
+        # padding when differently-sized arrays share one batch. Shape groups
+        # preserve the single-request preprocessing semantics while still
+        # batching the common production case of equal camera resolutions.
+        groups: dict[tuple[int, ...], list[int]] = {}
+        for index, frame in enumerate(frames):
+            groups.setdefault(tuple(frame.shape), []).append(index)
+
+        outputs = [None] * len(frames)
+        for indices in groups.values():
+            if len(indices) == 1:
+                index = indices[0]
+                outputs[index] = self.detect_persons(frames[index])
+                continue
+
+            frames_rgb = [
+                cv2.cvtColor(frames[index], cv2.COLOR_BGR2RGB)
+                for index in indices
+            ]
+            results = list(self._predict(frames_rgb))
+            if len(results) != len(indices):
+                raise RuntimeError(
+                    f"Person batch output mismatch: inputs={len(indices)} outputs={len(results)}"
+                )
+            for index, result in zip(indices, results):
+                outputs[index] = self._parse_person_result(frames[index], result)
+
+        return outputs
 
 
 class PoseLiveAdapter:

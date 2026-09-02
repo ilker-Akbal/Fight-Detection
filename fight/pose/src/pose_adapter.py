@@ -198,10 +198,64 @@ class PoseAdapter:
         return self.evaluate(roi_bgr, hist_positive=hist_positive)
 
     def evaluate(self, roi_bgr: np.ndarray, hist_positive: int = 0) -> PoseResult:
+        return self._evaluate_prepared(roi_bgr, hist_positive=hist_positive)
+
+    def evaluate_batch(self, roi_bgr_list: list[np.ndarray]) -> list[PoseResult]:
+        rois = list(roi_bgr_list)
+        if not rois:
+            return []
+        if len(rois) == 1:
+            return [self.evaluate(rois[0])]
+
+        outputs: list[PoseResult | None] = [None] * len(rois)
+        valid = []
+        for index, roi_bgr in enumerate(rois):
+            if roi_bgr is None or roi_bgr.size == 0:
+                outputs[index] = self._empty(debug_frame=None)
+                continue
+            roi_resized = self._prepare_roi(roi_bgr)
+            valid.append(
+                (
+                    index,
+                    roi_bgr,
+                    roi_resized,
+                    cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB),
+                )
+            )
+
+        if valid:
+            results = list(
+                self.model.predict(
+                    source=[item[3] for item in valid],
+                    imgsz=self.imgsz,
+                    conf=self.conf,
+                    device=self.device,
+                    verbose=self.verbose,
+                )
+            )
+            if len(results) != len(valid):
+                raise RuntimeError(
+                    f"Pose batch output mismatch: inputs={len(valid)} outputs={len(results)}"
+                )
+            for (index, roi_bgr, roi_resized, _), result in zip(valid, results):
+                outputs[index] = self._evaluate_prepared(
+                    roi_bgr,
+                    hist_positive=0,
+                    inference={"resized_bgr": roi_resized, "result": result},
+                )
+
+        return [output if output is not None else self._empty() for output in outputs]
+
+    def _evaluate_prepared(
+        self,
+        roi_bgr: np.ndarray,
+        hist_positive: int = 0,
+        inference: Optional[Dict[str, Any]] = None,
+    ) -> PoseResult:
         if roi_bgr is None or roi_bgr.size == 0:
             return self._empty(debug_frame=None)
 
-        out = self.infer_roi(roi_bgr)
+        out = inference if inference is not None else self.infer_roi(roi_bgr)
         roi_vis = out["resized_bgr"].copy()
         res = out["result"]
 

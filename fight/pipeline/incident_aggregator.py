@@ -167,11 +167,13 @@ class IncidentAggregator:
         stale_finalize_sec: float = 8.0,
         temporal_iou_merge_thr: float = 0.30,
         sweep_interval_sec: float = 0.50,
+        run_id: str = "",
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         self.incidents_jsonl = self.out_dir.parent / "incidents.jsonl"
+        self.run_id = str(run_id or "")
 
         self.merge_gap_sec = float(merge_gap_sec)
         self.max_bridge_nonfight = int(max_bridge_nonfight)
@@ -600,6 +602,7 @@ class IncidentAggregator:
             )
 
         row = {
+            "run_id": self.run_id,
             "camera_id": st.camera_id,
             "source": st.source,
             "incident_id": st.incident_id,

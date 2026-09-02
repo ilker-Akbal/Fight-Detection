@@ -20,6 +20,11 @@ from django.views.decorators.csrf import csrf_protect
 from django.views.decorators.http import require_GET, require_POST
 
 from accounts.decorators import role_required
+from services.access_scope import (
+    get_user_accessible_cameras,
+    is_it_admin,
+    user_can_access_camera,
+)
 from services.speed_bridge.calibration_writer import (
     default_speed_calibration_path,
     is_speed_calibration_ready,
@@ -38,7 +43,7 @@ MAX_SPEED_HISTORY_RUNS = 10
 @never_cache
 @login_required
 def index(request):
-    report = _pipeline_report()
+    report = _pipeline_report(request.user)
 
     return render(
         request,
@@ -67,10 +72,10 @@ def _speed_run_dirs(limit: int = MAX_SPEED_HISTORY_RUNS) -> list[Path]:
     return dirs[:limit]
 
 
-def _active_speed_cameras() -> list[dict]:
+def _active_speed_cameras(user=None) -> list[dict]:
     qs = (
         SpeedCameraConfig.objects
-        .select_related("camera")
+        .select_related("camera", "camera__location")
         .filter(
             enabled=True,
             camera__is_active=True,
@@ -78,6 +83,14 @@ def _active_speed_cameras() -> list[dict]:
         )
         .order_by("camera__camera_id")
     )
+
+    if user is not None:
+        accessible = get_user_accessible_cameras(
+            user,
+            active_only=True,
+            speed_only=True,
+        ).order_by()
+        qs = qs.filter(camera__in=accessible)
 
     cameras = []
 
@@ -98,6 +111,8 @@ def _active_speed_cameras() -> list[dict]:
                 "source": cam.source,
                 "description": cam.description,
                 "faculty": cam.faculty or "",
+                "location_id": cam.location_id,
+                "location": cam.get_location_display(),
                 "speed_limit_kmh": item.speed_limit_kmh,
                 "tolerance_kmh": item.tolerance_kmh,
                 "calibration_path": str(calibration_path),
@@ -107,7 +122,11 @@ def _active_speed_cameras() -> list[dict]:
                 "roi_polygon": item.roi_polygon or [],
                 "save_snapshot": item.save_snapshot,
                 "save_clip": item.save_clip,
-                "admin_url": reverse("adminx:camera_edit", args=[cam.pk]),
+                "admin_url": (
+                    reverse("adminx:camera_edit", args=[cam.pk])
+                    if user is None or is_it_admin(user)
+                    else ""
+                ),
                 "stream_url": reverse("speed_detection:camera_stream", args=[cam.camera_id]),
             }
         )
@@ -148,8 +167,8 @@ def _speed_run_error_text(run_dir: Path) -> str:
     return ""
 
 
-def _empty_report() -> dict:
-    cameras = _active_speed_cameras()
+def _empty_report(user=None) -> dict:
+    cameras = _active_speed_cameras(user)
 
     return {
         "running": False,
@@ -385,14 +404,14 @@ def _merge_camera_config_fields(report_cameras: list[dict], config_cameras: list
     return merged
 
 
-def _pipeline_report() -> dict:
+def _pipeline_report(user=None) -> dict:
     active = speed_runtime.get()
 
     active_report = None
     active_run_dir = None
     active_return_code = None
 
-    config_cameras = _active_speed_cameras()
+    config_cameras = _active_speed_cameras(user)
 
     if active is not None:
         proc = active.process
@@ -435,7 +454,7 @@ def _pipeline_report() -> dict:
     elif history_reports:
         base = history_reports[0]
     else:
-        base = _empty_report()
+        base = _empty_report(user)
 
     merged = dict(base)
 
@@ -483,6 +502,27 @@ def _pipeline_report() -> dict:
 
     merged["events"] = deduped[:300]
 
+    if user is not None:
+        allowed_camera_ids = {
+            str(camera.get("camera_id"))
+            for camera in config_cameras
+            if camera.get("camera_id")
+        }
+        merged["cameras"] = [
+            row for row in merged.get("cameras", [])
+            if str(row.get("camera_id") or "") in allowed_camera_ids
+        ]
+        merged["events"] = [
+            row for row in merged.get("events", [])
+            if str(row.get("camera_id") or "") in allowed_camera_ids
+        ]
+        merged["recent_status"] = [
+            row for row in merged.get("recent_status", [])
+            if str(row.get("camera_id") or "") in allowed_camera_ids
+        ]
+        merged["camera_count"] = len(merged["cameras"])
+        merged["source_count"] = len(merged["cameras"])
+
     if active_report is None:
         merged["running"] = False
         merged["pid"] = None
@@ -496,9 +536,17 @@ def _pipeline_report() -> dict:
     return merged
 
 
-def _get_speed_config_by_camera_id(camera_id: str) -> SpeedCameraConfig:
+def _get_speed_config_by_camera_id(camera_id: str, user=None) -> SpeedCameraConfig:
+    queryset = SpeedCameraConfig.objects.select_related("camera", "camera__location")
+    if user is not None:
+        accessible = get_user_accessible_cameras(
+            user,
+            active_only=True,
+            speed_only=True,
+        ).order_by()
+        queryset = queryset.filter(camera__in=accessible, enabled=True)
     return get_object_or_404(
-        SpeedCameraConfig.objects.select_related("camera"),
+        queryset,
         camera__camera_id=camera_id,
     )
 
@@ -705,7 +753,7 @@ def _mjpeg_frame_generator(source: str) -> Iterator[bytes]:
 @login_required
 @require_GET
 def speed_camera_stream(request, camera_id):
-    item = _get_speed_config_by_camera_id(camera_id)
+    item = _get_speed_config_by_camera_id(camera_id, request.user)
 
     response = StreamingHttpResponse(
         _mjpeg_frame_generator(item.camera.source),
@@ -717,8 +765,8 @@ def speed_camera_stream(request, camera_id):
     response["X-Accel-Buffering"] = "no"
 
     return response
-def _payload() -> dict:
-    report = _pipeline_report()
+def _payload(user=None) -> dict:
+    report = _pipeline_report(user)
 
     return {
         "ok": True,
@@ -960,14 +1008,14 @@ def stop_speed_detection(request):
 @login_required
 @require_GET
 def speed_status(request):
-    return JsonResponse(_payload())
+    return JsonResponse(_payload(request.user))
 
 
 @never_cache
 @login_required
 @require_GET
 def speed_events(request):
-    payload = _payload()
+    payload = _payload(request.user)
 
     return JsonResponse(
         {
@@ -1011,10 +1059,41 @@ def _find_event_file_path(run_name: str, file_name: str, kind: str) -> Path:
     return path
 
 
+def _user_can_access_speed_event_file(user, run_name: str, file_name: str, kind: str) -> bool:
+    if is_it_admin(user):
+        return True
+
+    field_names = {
+        "snapshot": ("snapshot_path", "snapshot", "snapshot_file"),
+        "clip": ("clip_path", "clip", "clip_file"),
+    }.get(kind, ())
+    if not field_names:
+        return False
+
+    report = _pipeline_report(user)
+    for event in report.get("events", []):
+        event_run_name = str(event.get("run_name") or report.get("run_name") or "")
+        if event_run_name != str(run_name):
+            continue
+        for field_name in field_names:
+            value = event.get(field_name)
+            if value and Path(str(value)).name == file_name:
+                return True
+    return False
+
+
 @never_cache
 @login_required
 @require_GET
 def speed_snapshot(request, run_name, file_name):
+    file_name = _safe_url_part(file_name, "Dosya adı")
+    if not _user_can_access_speed_event_file(
+        request.user,
+        run_name,
+        file_name,
+        "snapshot",
+    ):
+        raise Http404("Dosya bulunamadı.")
     path = _find_event_file_path(run_name, file_name, "snapshot")
 
     response = FileResponse(open(path, "rb"), content_type="image/jpeg")
@@ -1030,6 +1109,8 @@ def speed_snapshot(request, run_name, file_name):
 @require_GET
 def speed_preview(request, run_name, camera_id):
     camera_id = _safe_url_part(camera_id, "Kamera ID")
+    if not user_can_access_camera(request.user, camera_id):
+        raise Http404("Dosya bulunamadı.")
     file_name = f"{camera_id}.jpg"
 
     path = _find_event_file_path(run_name, file_name, "preview")
@@ -1061,6 +1142,14 @@ def _file_chunk_iterator(path: Path, start: int, length: int, chunk_size: int = 
 @login_required
 @require_GET
 def speed_clip(request, run_name, file_name):
+    file_name = _safe_url_part(file_name, "Dosya adı")
+    if not _user_can_access_speed_event_file(
+        request.user,
+        run_name,
+        file_name,
+        "clip",
+    ):
+        raise Http404("Dosya bulunamadı.")
     path = _find_event_file_path(run_name, file_name, "clip")
 
     content_type, _ = mimetypes.guess_type(str(path))

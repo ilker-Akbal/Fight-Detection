@@ -2,12 +2,13 @@ from pathlib import Path
 
 from django import forms
 from django.contrib.auth.models import User
+from django.db.models import Q
 
 from accounts.models import UserProfile
 from streams.models import Camera
 from speed_detection.models import SpeedCameraConfig
 
-from .models import FacultyLocation
+from .models import FacultyLocation, Location
 
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -66,6 +67,14 @@ class CameraForm(forms.ModelForm):
         ),
     )
 
+    location = forms.ModelChoiceField(
+        label="Fiziksel Lokasyon",
+        required=False,
+        queryset=Location.objects.none(),
+        empty_label="Fiziksel lokasyon seçiniz",
+        help_text="Yeni yetkilendirme kapsamı bu lokasyon ağacı üzerinden hesaplanır.",
+    )
+
     uploaded_video = forms.FileField(
         label="Video Dosyası",
         required=False,
@@ -85,6 +94,7 @@ class CameraForm(forms.ModelForm):
             "source",
             "uploaded_video",
             "description",
+            "location",
             "faculty",
             "is_active",
             "use_fight_detection",
@@ -97,6 +107,7 @@ class CameraForm(forms.ModelForm):
             "source": "Kaynak",
             "uploaded_video": "Video Dosyası",
             "description": "Açıklama",
+            "location": "Fiziksel Lokasyon",
             "faculty": "Fakülte / Mevki",
             "is_active": "Aktif mi?",
             "use_fight_detection": "Kavga Tespiti",
@@ -142,6 +153,16 @@ class CameraForm(forms.ModelForm):
 
         self.fields["faculty"].choices = choices
         self.fields["faculty"].widget.choices = choices
+
+        location_filter = Q(active=True)
+        if self.instance and self.instance.pk and self.instance.location_id:
+            location_filter |= Q(pk=self.instance.location_id)
+        self.fields["location"].queryset = (
+            Location.objects
+            .filter(location_filter)
+            .select_related("parent")
+            .order_by("name")
+        )
 
         if self.instance and self.instance.pk and self.instance.uploaded_video:
             self.fields["source_mode"].initial = self.SOURCE_MODE_UPLOAD
@@ -233,6 +254,11 @@ class CameraForm(forms.ModelForm):
     def save(self, commit=True):
         source_mode = self.cleaned_data.get("source_mode")
         instance = super().save(commit=False)
+
+        if instance.location_id:
+            # Temporary write bridge for reports/templates that still read the
+            # legacy string field during the migration period.
+            instance.faculty = instance.location.code
 
         if source_mode == self.SOURCE_MODE_MANUAL:
             instance.source = (self.cleaned_data.get("source") or "").strip()

@@ -20,9 +20,10 @@ from django.views.decorators.http import require_GET, require_POST
 
 from accounts.decorators import role_required
 from accounts.models import LoginActivity, UserProfile
+from services.access_scope import get_user_accessible_cameras
 from services.email_service import EmailServiceError, send_email
 from services.pipeline_bridge.report_reader import build_dashboard_report
-from services.pipeline_bridge.runtime_state import runtime
+from services.pipeline_bridge.fight_runner import get_active_run, get_pipeline_status
 from services.speed_bridge.calibration_writer import (
     is_speed_calibration_ready,
     resolve_speed_calibration_path,
@@ -73,14 +74,20 @@ def dashboard(request):
     operator_user_count = UserProfile.objects.filter(role="operator").count()
     viewer_user_count = UserProfile.objects.filter(role="viewer").count()
 
-    active_run = runtime.get()
+    control_status = get_pipeline_status()
+    active_run = get_active_run() if control_status.get("available") else None
     pipeline_running = False
     pipeline_pid = None
     pipeline_run_dir = ""
 
-    if active_run is not None and getattr(active_run, "process", None) is not None:
-        pipeline_running = active_run.process.poll() is None
-        pipeline_pid = active_run.process.pid
+    if active_run is not None:
+        pipeline_running = active_run.runtime_state in {
+            "STARTING",
+            "RUNNING",
+            "STOPPING",
+            "BACKOFF",
+        }
+        pipeline_pid = active_run.runtime_pid
         pipeline_run_dir = str(active_run.run_dir)
 
     fight_incident_count = len(_admin_collect_incidents())
@@ -119,7 +126,7 @@ def dashboard(request):
 @role_required(["admin"])
 @require_GET
 def camera_preview_frame(request, pk):
-    camera = get_object_or_404(Camera, pk=pk)
+    camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
 
     source = str(camera.source or "").strip()
 
@@ -408,13 +415,14 @@ def user_update(request, pk):
 @login_required
 @role_required(["admin"])
 def camera_list(request):
-    for camera in Camera.objects.all():
+    manageable_cameras = get_user_accessible_cameras(request.user)
+
+    for camera in manageable_cameras:
         SpeedCameraConfig.objects.get_or_create(camera=camera)
 
     cameras = (
-        Camera.objects
+        manageable_cameras
         .select_related("speed_config")
-        .all()
         .order_by("name", "camera_id")
     )
 
@@ -527,7 +535,7 @@ def camera_create(request):
 @login_required
 @role_required(["admin"])
 def camera_edit(request, pk):
-    camera = get_object_or_404(Camera, pk=pk)
+    camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
     speed_config, _ = SpeedCameraConfig.objects.get_or_create(camera=camera)
 
     form = CameraForm(
@@ -579,7 +587,7 @@ def camera_edit(request, pk):
 @login_required
 @role_required(["admin"])
 def camera_delete(request, pk):
-    camera = get_object_or_404(Camera, pk=pk)
+    camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
 
     if request.method == "POST":
         camera_name = camera.name

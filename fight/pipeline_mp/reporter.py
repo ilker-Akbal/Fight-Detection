@@ -59,6 +59,7 @@ class BufferedCsvWriter:
 
 def reporter_process_main(config: dict, report_queue, stop_event) -> None:
     output_dir = Path(config["output_dir"])
+    run_id = str(config.get("run_id") or config.get("runtime", {}).get("run_id") or "")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     flush_interval = float(config.get("runtime", {}).get("report_flush_interval_sec", 0.25))
@@ -70,6 +71,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
     events_csv = BufferedCsvWriter(
         output_dir / "events.csv",
         [
+            "run_id",
             "camera_id",
             "ip",
             "event_id",
@@ -91,6 +93,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
     stage3_csv = BufferedCsvWriter(
         output_dir / "stage3_results.csv",
         [
+            "run_id",
             "camera_id",
             "ip",
             "event_id",
@@ -118,6 +121,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
 
         status_jsonl.write(
             {
+                "run_id": run_id,
                 "ts": now_str(),
                 "camera_id": "__system__",
                 "stage": "reporter",
@@ -126,7 +130,10 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
         )
         flush_all()
 
-        while not stop_event.is_set() or not report_queue.empty():
+        # The orchestrator sends an explicit sentinel after every producer has
+        # stopped. Waiting for it prevents final worker/camera summaries from
+        # being lost merely because the shared stop event was set first.
+        while True:
             try:
                 msg = report_queue.get(timeout=0.2)
             except queue.Empty:
@@ -141,12 +148,14 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
 
                 if isinstance(msg, ReportMessage):
                     kind = msg.kind
-                    row = msg.row
+                    row = dict(msg.row)
                 elif isinstance(msg, dict):
                     kind = msg.get("kind")
-                    row = msg.get("row", {})
+                    row = dict(msg.get("row", {}))
                 else:
                     continue
+
+                row.setdefault("run_id", run_id)
 
                 if kind == "status":
                     status_jsonl.write(row)
@@ -159,6 +168,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
                 else:
                     status_jsonl.write(
                         {
+                            "run_id": run_id,
                             "ts": now_str(),
                             "camera_id": "__system__",
                             "stage": "reporter",
@@ -170,6 +180,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
             except Exception as exc:
                 status_jsonl.write(
                     {
+                        "run_id": run_id,
                         "ts": now_str(),
                         "camera_id": "__system__",
                         "stage": "reporter",
@@ -192,6 +203,7 @@ def reporter_process_main(config: dict, report_queue, stop_event) -> None:
         try:
             status_jsonl.write(
                 {
+                    "run_id": run_id,
                     "ts": now_str(),
                     "camera_id": "__system__",
                     "stage": "reporter",

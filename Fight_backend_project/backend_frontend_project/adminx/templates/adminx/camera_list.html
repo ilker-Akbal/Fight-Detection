@@ -32,7 +32,7 @@
         <tr>
           <th>Ad</th>
           <th>Camera ID</th>
-          <th>Fakülte</th>
+          <th>Fiziksel Lokasyon</th>
           <th>Kaynak</th>
           <th>Durum</th>
           <th>Modüller</th>
@@ -46,7 +46,7 @@
         <tr>
           <td>{{ camera.name }}</td>
           <td>{{ camera.camera_id }}</td>
-          <td>{{ camera.get_faculty_display|default:"-" }}</td>
+          <td>{{ camera.get_location_display|default:"-" }}</td>
           <td class="source-cell">{{ camera.source }}</td>
 
           <td>

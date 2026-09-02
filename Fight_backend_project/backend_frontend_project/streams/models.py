@@ -53,6 +53,16 @@ class Camera(models.Model):
         verbose_name="Fakülte / Mevki",
     )
 
+    location = models.ForeignKey(
+        "adminx.Location",
+        on_delete=models.PROTECT,
+        related_name="cameras",
+        blank=True,
+        null=True,
+        verbose_name="Fiziksel Lokasyon",
+        help_text="Yetkilendirmede kullanılan fiziksel lokasyon. Eski faculty alanı geçiş için korunur.",
+    )
+
     is_active = models.BooleanField(
         default=True,
         verbose_name="Aktif mi?",
@@ -86,6 +96,12 @@ class Camera(models.Model):
         verbose_name_plural = "Kameralar"
 
     def get_faculty_display(self):
+        if self.location_id:
+            try:
+                return self.location.name
+            except Exception:
+                pass
+
         if not self.faculty:
             return "Fakülte / mevki belirtilmedi"
 
@@ -104,6 +120,15 @@ class Camera(models.Model):
     @property
     def faculty_label(self):
         return self.get_faculty_display()
+
+    def get_location_display(self):
+        if self.location_id:
+            return str(self.location)
+        return self.get_faculty_display()
+
+    @property
+    def location_label(self):
+        return self.get_location_display()
 
     def get_runtime_source(self):
         """

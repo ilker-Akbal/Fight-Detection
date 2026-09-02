@@ -215,6 +215,14 @@ USE_X_FORWARDED_HOST = True
 # ============================================================
 
 PIPELINE_OUTPUT_BASE = BASE_DIR / "media" / "pipeline_runs"
+RUNTIME_CONTROL_MODE = os.getenv("RUNTIME_CONTROL_MODE", "supervisor").strip().lower()
+RUNTIME_SUPERVISOR_URL = os.getenv(
+    "RUNTIME_SUPERVISOR_URL", "http://127.0.0.1:8765"
+).rstrip("/")
+RUNTIME_SUPERVISOR_TOKEN = os.getenv("RUNTIME_SUPERVISOR_TOKEN", "")
+RUNTIME_SUPERVISOR_TIMEOUT_SEC = float(
+    os.getenv("RUNTIME_SUPERVISOR_TIMEOUT_SEC", "3.0")
+)
 SPEED_PIPELINE_OUTPUT_BASE = BASE_DIR / "media" / "speed_runs"
 SPEED_CALIBRATION_OUTPUT_BASE = BASE_DIR / "media" / "speed_calibrations"
 
@@ -259,9 +267,49 @@ PIPELINE_DEFAULTS = {
     "report_queue_size": 8192,
     "stage3_enqueue_timeout_sec": 0.15,
 
+    "person_request_queue_size": 64,
+    "person_result_queue_size": 64,
+    "person_camera_result_queue_size": 2,
+    "person_request_enqueue_timeout_sec": 0.5,
+    "person_result_enqueue_timeout_sec": 1.0,
+    "person_route_timeout_sec": 0.5,
+    "person_inference_timeout_sec": 30.0,
+    "person_batch_enabled": False,
+    "person_batch_size": 1,
+    "person_batch_max_wait_ms": 0.0,
+
+    "pose_request_queue_size": 64,
+    "pose_result_queue_size": 64,
+    "pose_camera_result_queue_size": 2,
+    "pose_request_enqueue_timeout_sec": 0.5,
+    "pose_result_enqueue_timeout_sec": 1.0,
+    "pose_route_timeout_sec": 0.5,
+    "pose_inference_timeout_sec": 30.0,
+    "pose_batch_enabled": False,
+    "pose_batch_size": 1,
+    "pose_batch_max_wait_ms": 0.0,
+
+    "performance_metrics_enabled": False,
+    "performance_metrics_sample_every": 1,
+    "performance_metrics_max_samples": 2048,
+    "performance_metrics_warmup_requests": 2,
+
     "camera_cv2_threads": 1,
+    "person_worker_cv2_threads": 1,
+    "pose_worker_cv2_threads": 1,
     "stage3_cv2_threads": 1,
     "incident_cv2_threads": 1,
+
+    "camera_ingest_mode": "centralized",
+    "camera_ingest_fight_queue_size": 8,
+    "camera_ingest_preview_queue_size": 1,
+    "camera_ingest_publish_timeout_sec": 0.2,
+    "camera_ingest_file_fight_policy": "ordered",
+    "camera_ingest_cv2_threads": 1,
+    "camera_preview_cv2_threads": 1,
+    "camera_reconnect_enabled": True,
+    "camera_reconnect_initial_delay_sec": 0.5,
+    "camera_reconnect_max_delay_sec": 8.0,
 
     "restart_camera_processes": False,
     "camera_restart_backoff_sec": 3.0,

@@ -42,6 +42,9 @@ services:
       until nc -z db 5432; do echo 'PostgreSQL bekleniyor...'; sleep 1; done;
       python manage.py migrate &&
       python manage.py collectstatic --noinput || true;
+      python -m fight.runtime_supervisor.server &
+      RUNTIME_SUPERVISOR_PID=$$!;
+      trap 'kill -TERM $$RUNTIME_SUPERVISOR_PID 2>/dev/null || true' EXIT INT TERM;
       gunicorn backend_frontend_project.wsgi:application
       --bind 0.0.0.0:8000
       --workers 2

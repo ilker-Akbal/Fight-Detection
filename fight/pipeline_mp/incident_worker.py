@@ -41,6 +41,7 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
         clip_ready_wait_sec=float(runtime.get("incident_clip_ready_wait_sec", 8.0)),
         stale_finalize_sec=float(runtime.get("incident_stale_finalize_sec", 8.0)),
         temporal_iou_merge_thr=float(runtime.get("incident_temporal_iou_merge_thr", 0.30)),
+        run_id=str(config.get("run_id") or runtime.get("run_id") or ""),
     )
 
     _report(

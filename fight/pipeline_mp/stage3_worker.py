@@ -6,6 +6,7 @@ import time
 from fight.pipeline.adapters import Stage3Adapter
 from fight.pipeline_mp.common import configure_process_runtime, now_str, ts_to_str
 from fight.pipeline_mp.messages import ReportMessage, Stage3ResultMessage
+from fight.pipeline_mp.performance import make_timing_collectors, metrics_runtime_config
 
 
 def _report(report_queue, kind: str, row: dict) -> None:
@@ -26,6 +27,11 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
 
     fight_thr = float(runtime.get("fight_thr", 0.60))
     use_stage3 = bool(runtime.get("use_stage3", True))
+    metrics_enabled, _, _ = metrics_runtime_config(runtime)
+    timing = make_timing_collectors(runtime, ("queue_wait_ms", "inference_ms"))
+    jobs_received = 0
+    jobs_completed = 0
+    errors = 0
 
     _report(
         report_queue,
@@ -66,6 +72,14 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
             break
 
         try:
+            received_monotonic = time.perf_counter()
+            jobs_received += 1
+            if metrics_enabled:
+                created_monotonic = float(getattr(job, "created_monotonic", 0.0) or 0.0)
+                if created_monotonic > 0:
+                    timing["queue_wait_ms"].observe(
+                        (received_monotonic - created_monotonic) * 1000.0
+                    )
             _report(
                 report_queue,
                 "status",
@@ -86,7 +100,11 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                 prob = 0.0
                 label = "stage3_disabled"
             else:
+                inference_started = time.perf_counter()
                 prob = float(stage3.infer(job.frames))
+                inference_ms = (time.perf_counter() - inference_started) * 1000.0
+                if metrics_enabled:
+                    timing["inference_ms"].observe(inference_ms)
                 label = "fight" if prob >= fight_thr else "non_fight"
 
             row = {
@@ -158,8 +176,10 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                     "clip_path": job.clip_path,
                 },
             )
+            jobs_completed += 1
 
         except Exception as exc:
+            errors += 1
             _report(
                 report_queue,
                 "status",
@@ -181,6 +201,24 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                 stage3_queue.task_done()
             except Exception:
                 pass
+
+    _report(
+        report_queue,
+        "status",
+        {
+            "ts": now_str(),
+            "camera_id": "__system__",
+            "stage": "stage3",
+            "detail": "summary",
+            "metrics_enabled": metrics_enabled,
+            "jobs_received": jobs_received,
+            "jobs_completed": jobs_completed,
+            "errors": errors,
+            "queue_wait_ms": timing["queue_wait_ms"].summary(),
+            "queue_wait_definition": "worker receive - Stage3Job creation; includes queue put blocking",
+            "inference_ms": timing["inference_ms"].summary(),
+        },
+    )
 
     _report(
         report_queue,

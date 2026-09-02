@@ -19,10 +19,18 @@ from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_POST
 
 from accounts.decorators import role_required
-from accounts.models import UserProfile
-from services.pipeline_bridge.fight_runner import start_pipeline, stop_pipeline
+from services.access_scope import (
+    get_user_accessible_cameras,
+    is_it_admin,
+    user_can_access_camera,
+)
+from services.pipeline_bridge.fight_runner import (
+    get_active_run,
+    get_pipeline_status,
+    start_pipeline,
+    stop_pipeline,
+)
 from services.pipeline_bridge.report_reader import build_dashboard_report
-from services.pipeline_bridge.runtime_state import runtime
 from streams.models import Camera
 MAX_HISTORY_RUNS = 10
 MAX_HISTORY_STAGE3 = 200
@@ -48,37 +56,16 @@ def _get_system_notice():
     return cache.get(SYSTEM_NOTICE_CACHE_KEY)
 
 
-def _get_user_profile(user):
-    profile, _ = UserProfile.objects.get_or_create(user=user)
-    return profile
-
-
 def _is_admin_user(user) -> bool:
-    if not user or not user.is_authenticated:
-        return False
-
-    if user.is_superuser or user.is_staff:
-        return True
-
-    profile = _get_user_profile(user)
-    return profile.role == "admin"
+    return is_it_admin(user)
 
 
 def _camera_queryset_for_user(user, active_only=False):
-    qs = Camera.objects.all()
-
-    if active_only:
-        qs = qs.filter(is_active=True, use_fight_detection=True)
-
-    if _is_admin_user(user):
-        return qs.order_by("-created_at")
-
-    profile = _get_user_profile(user)
-
-    if not profile.faculty:
-        return qs.none()
-
-    return qs.filter(faculty=profile.faculty).order_by("-created_at")
+    return get_user_accessible_cameras(
+        user,
+        active_only=active_only,
+        fight_only=active_only,
+    )
 
 
 def _allowed_camera_ids_for_user(user) -> set[str]:
@@ -89,13 +76,7 @@ def _allowed_camera_ids_for_user(user) -> set[str]:
 
 
 def _user_can_access_camera_id(user, camera_id: str) -> bool:
-    if _is_admin_user(user):
-        return True
-
-    if not camera_id:
-        return False
-
-    return camera_id in _allowed_camera_ids_for_user(user)
+    return user_can_access_camera(user, camera_id)
 
 
 def _filter_rows_by_camera(rows, allowed_camera_ids):
@@ -159,7 +140,9 @@ def _serialize_camera(camera):
         "source": camera.source,
         "description": camera.description,
         "faculty": camera.faculty,
-        "faculty_label": camera.get_faculty_display() if camera.faculty else "-",
+        "faculty_label": camera.get_faculty_display(),
+        "location_id": camera.location_id,
+        "location": camera.get_location_display(),
         "is_active": camera.is_active,
     }
 
@@ -401,21 +384,22 @@ def _merge_history_reports(active_report: dict | None, history_reports: list[dic
 
 
 def _pipeline_report():
-    active = runtime.get()
+    control_status = get_pipeline_status()
+    active = get_active_run() if control_status.get("available") else None
 
     active_report = None
     active_run_dir = None
 
     if active is not None:
-        proc = active.process
         active_run_dir = Path(active.run_dir)
 
         active_report = _read_run_report(
             active_run_dir,
-            running=(proc.poll() is None),
-            pid=proc.pid,
+            running=active.runtime_state
+            in {"STARTING", "RUNNING", "STOPPING", "BACKOFF"},
+            pid=active.runtime_pid,
             started_at=active.started_at,
-            return_code=proc.poll(),
+            return_code=control_status.get("runtime_exit_code"),
         )
 
     history_reports = []
@@ -438,8 +422,16 @@ def _pipeline_report():
     merged = _merge_history_reports(active_report, history_reports)
 
     if active_report is None:
-        merged["running"] = False
+        merged["running"] = False if control_status.get("available") else None
         merged["pid"] = None
+
+    merged["supervisor_available"] = bool(control_status.get("available"))
+    merged["supervisor_state"] = control_status.get("supervisor_state", "UNKNOWN")
+    merged["runtime_state"] = control_status.get("runtime_state", "UNKNOWN")
+    merged["run_id"] = control_status.get("run_id")
+    merged["control_error"] = (
+        None if control_status.get("available") else "supervisor_unavailable"
+    )
 
     return merged
 
@@ -464,7 +456,9 @@ def _merge_camera_cards(cameras, pipeline_report):
                 "source": camera.source,
                 "description": camera.description,
                 "faculty": camera.faculty,
-                "faculty_label": camera.get_faculty_display() if camera.faculty else "-",
+                "faculty_label": camera.get_faculty_display(),
+                "location_id": camera.location_id,
+                "location": camera.get_location_display(),
                 "is_active": camera.is_active,
                 "stage": cam_pipe.get("stage", "-"),
                 "detail": cam_pipe.get("detail", "-"),
@@ -606,9 +600,14 @@ def status(request):
 def start_detection(request):
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
-    active = runtime.get()
+    active = get_active_run()
 
-    if active is not None and active.process.poll() is None:
+    if active is not None and active.runtime_state in {
+        "STARTING",
+        "RUNNING",
+        "STOPPING",
+        "BACKOFF",
+    }:
         message = "Kavga tespit sistemi zaten aktif durumda."
 
         _set_system_notice(
@@ -624,7 +623,7 @@ def start_detection(request):
                     "message": message,
                     "running": True,
                     "already_running": True,
-                    "pid": active.process.pid if getattr(active, "process", None) else None,
+                    "pid": active.runtime_pid,
                     "run_dir": str(active.run_dir) if getattr(active, "run_dir", None) else "",
                 },
                 status=200,
@@ -655,7 +654,6 @@ def start_detection(request):
 
     try:
         active_run = start_pipeline(sources)
-        runtime.set(active_run)
 
         message = "Kavga tespit sistemi başlatıldı. Aktif kameralar izleniyor."
 
@@ -672,9 +670,10 @@ def start_detection(request):
                     "message": message,
                     "running": True,
                     "camera_count": len(sources),
-                    "sources": sources,
-                    "pid": active_run.process.pid if getattr(active_run, "process", None) else None,
+                    "pid": active_run.runtime_pid,
                     "run_dir": str(active_run.run_dir) if getattr(active_run, "run_dir", None) else "",
+                    "run_id": active_run.run_id,
+                    "already_running": active_run.operation_result == "already_running",
                 },
                 status=200,
             )
@@ -685,15 +684,23 @@ def start_detection(request):
 
     except Exception as exc:
         message = f"Pipeline başlatılamadı: {exc}"
+        control_status = get_pipeline_status()
+        supervisor_unavailable = not control_status.get("available")
 
         if is_ajax:
             return JsonResponse(
                 {
                     "ok": False,
                     "message": message,
-                    "running": False,
+                    "running": None if supervisor_unavailable else False,
+                    "runtime_state": "UNKNOWN" if supervisor_unavailable else "FAILED",
+                    "error": (
+                        "supervisor_unavailable"
+                        if supervisor_unavailable
+                        else "start_failed"
+                    ),
                 },
-                status=500,
+                status=503 if supervisor_unavailable else 500,
             )
 
         messages.error(request, message)
@@ -708,7 +715,24 @@ def start_detection(request):
 def stop_detection(request):
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
-    active = runtime.get()
+    control_status = get_pipeline_status()
+    if not control_status.get("available"):
+        message = "Runtime supervisor ulaşılamıyor; pipeline durumu bilinmiyor."
+        if is_ajax:
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "message": message,
+                    "running": None,
+                    "runtime_state": "UNKNOWN",
+                    "error": "supervisor_unavailable",
+                },
+                status=503,
+            )
+        messages.error(request, message)
+        return redirect("adminx:dashboard")
+
+    active = get_active_run()
 
     if active is None:
         message = "Sistem zaten durdurulmuş."
@@ -736,7 +760,6 @@ def stop_detection(request):
 
     try:
         stop_pipeline(active)
-        runtime.set(None)
 
         message = "Kavga tespit sistemi durduruldu. Eski kayıtlar korunuyor."
 
@@ -909,6 +932,28 @@ def _mjpeg_generator(source: str):
         cap.release()
 
 
+def _preview_file_mjpeg_generator(preview_path: Path):
+    """Fan out the ingest-owned JPEG without opening the physical camera."""
+    last_signature = None
+    while True:
+        try:
+            stat = preview_path.stat()
+            signature = (stat.st_mtime_ns, stat.st_size)
+            if signature != last_signature:
+                frame_bytes = preview_path.read_bytes()
+                if frame_bytes:
+                    last_signature = signature
+                    yield (
+                        b"--frame\r\n"
+                        b"Content-Type: image/jpeg\r\n\r\n"
+                        + frame_bytes
+                        + b"\r\n"
+                    )
+        except (FileNotFoundError, OSError):
+            pass
+        time.sleep(0.03)
+
+
 @never_cache
 @login_required
 @require_GET
@@ -919,6 +964,13 @@ def stream(request, camera_id):
         _camera_queryset_for_user(request.user, active_only=True),
         camera_id=camera_id,
     )
+
+    preview_path = _find_preview_path(camera_id)
+    if preview_path is not None:
+        return StreamingHttpResponse(
+            _preview_file_mjpeg_generator(preview_path),
+            content_type="multipart/x-mixed-replace; boundary=frame",
+        )
 
     cap = _open_capture(camera.source)
 

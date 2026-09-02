@@ -184,10 +184,22 @@
       </div>
 
       <div class="field">
+        <label for="{{ form.location.id_for_label }}">Fiziksel Lokasyon</label>
+        {{ form.location }}
+        <small class="muted">
+          Güvenlik birimi kapsamı ve kamera erişim yetkisi bu ağaç üzerinden hesaplanır.
+        </small>
+
+        {% if form.location.errors %}
+        <div class="camera-field-errors">{{ form.location.errors }}</div>
+        {% endif %}
+      </div>
+
+      <div class="field">
         <label for="{{ form.faculty.id_for_label }}">Fakülte / Mevki</label>
         {{ form.faculty }}
         <small class="muted">
-          Bu kamera yalnızca seçilen fakülte/mevki ile ilişkilendirilir.
+          Eski kayıt uyumluluğu için korunur; yeni yetkilendirmede fiziksel lokasyon kullanılır.
         </small>
 
         {% if form.faculty.errors %}

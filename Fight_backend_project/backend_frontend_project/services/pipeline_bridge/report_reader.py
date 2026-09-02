@@ -74,9 +74,22 @@ def build_dashboard_report(
 ):
     run_dir = Path(run_dir)
 
+    run_id = ""
+    try:
+        effective = json.loads(
+            (run_dir / "run_config.effective.json").read_text(encoding="utf-8")
+        )
+        run_id = str(effective.get("run_id") or "")
+    except Exception:
+        pass
+
     status_rows = read_jsonl(run_dir / "camera_status.jsonl")
     stage3_rows = read_jsonl(run_dir / "stage3_results.jsonl")
     incident_rows = read_jsonl(run_dir / "incidents.jsonl")
+    if run_id:
+        status_rows = [row for row in status_rows if str(row.get("run_id") or "") == run_id]
+        stage3_rows = [row for row in stage3_rows if str(row.get("run_id") or "") == run_id]
+        incident_rows = [row for row in incident_rows if str(row.get("run_id") or "") == run_id]
 
     latest_status = {}
     for row in status_rows:
@@ -176,6 +189,7 @@ def build_dashboard_report(
         "started_at": started_at,
         "run_dir": str(run_dir),
         "run_name": run_dir.name,
+        "run_id": run_id,
         "source_count": len(sources),
         "camera_count": len(cameras),
         "sources": sources,

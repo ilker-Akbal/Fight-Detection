@@ -4,15 +4,20 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
 from django.conf import settings
+from fight.runtime_supervisor.client import (
+    RuntimeSupervisorClient,
+    SupervisorUnavailable,
+)
 
 
 @dataclass
 class ActiveRun:
-    process: subprocess.Popen
+    process: subprocess.Popen | None
     run_name: str
     run_dir: Path
     sources: list[dict]
@@ -20,6 +25,12 @@ class ActiveRun:
     stderr_path: Path
     started_at: float
     config_path: Path
+    runtime_pid: int | None = None
+    run_id: str = ""
+    runtime_state: str = "STOPPED"
+    supervisor_state: str = "UNKNOWN"
+    control_mode: str = "direct"
+    operation_result: str = ""
 
 
 def _tail_file(path: Path, max_chars: int = 6000) -> str:
@@ -90,9 +101,45 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
         "incident_queue_size",
         "report_queue_size",
         "stage3_enqueue_timeout_sec",
+        "person_request_queue_size",
+        "person_result_queue_size",
+        "person_camera_result_queue_size",
+        "person_request_enqueue_timeout_sec",
+        "person_result_enqueue_timeout_sec",
+        "person_route_timeout_sec",
+        "person_inference_timeout_sec",
+        "person_batch_enabled",
+        "person_batch_size",
+        "person_batch_max_wait_ms",
+        "pose_request_queue_size",
+        "pose_result_queue_size",
+        "pose_camera_result_queue_size",
+        "pose_request_enqueue_timeout_sec",
+        "pose_result_enqueue_timeout_sec",
+        "pose_route_timeout_sec",
+        "pose_inference_timeout_sec",
+        "pose_batch_enabled",
+        "pose_batch_size",
+        "pose_batch_max_wait_ms",
+        "performance_metrics_enabled",
+        "performance_metrics_sample_every",
+        "performance_metrics_max_samples",
+        "performance_metrics_warmup_requests",
         "camera_cv2_threads",
+        "person_worker_cv2_threads",
+        "pose_worker_cv2_threads",
         "stage3_cv2_threads",
         "incident_cv2_threads",
+        "camera_ingest_mode",
+        "camera_ingest_fight_queue_size",
+        "camera_ingest_preview_queue_size",
+        "camera_ingest_publish_timeout_sec",
+        "camera_ingest_file_fight_policy",
+        "camera_ingest_cv2_threads",
+        "camera_preview_cv2_threads",
+        "camera_reconnect_enabled",
+        "camera_reconnect_initial_delay_sec",
+        "camera_reconnect_max_delay_sec",
         "cv2_threads",
         "camera_cuda_tuning",
         "restart_camera_processes",
@@ -170,10 +217,47 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     runtime.setdefault("incident_queue_size", 256)
     runtime.setdefault("report_queue_size", 8192)
     runtime.setdefault("stage3_enqueue_timeout_sec", 0.15)
+    runtime.setdefault("person_request_queue_size", 64)
+    runtime.setdefault("person_result_queue_size", 64)
+    runtime.setdefault("person_camera_result_queue_size", 2)
+    runtime.setdefault("person_request_enqueue_timeout_sec", 0.5)
+    runtime.setdefault("person_result_enqueue_timeout_sec", 1.0)
+    runtime.setdefault("person_route_timeout_sec", 0.5)
+    runtime.setdefault("person_inference_timeout_sec", 30.0)
+    runtime.setdefault("person_batch_enabled", False)
+    runtime.setdefault("person_batch_size", 1)
+    runtime.setdefault("person_batch_max_wait_ms", 0.0)
+    runtime.setdefault("pose_request_queue_size", 64)
+    runtime.setdefault("pose_result_queue_size", 64)
+    runtime.setdefault("pose_camera_result_queue_size", 2)
+    runtime.setdefault("pose_request_enqueue_timeout_sec", 0.5)
+    runtime.setdefault("pose_result_enqueue_timeout_sec", 1.0)
+    runtime.setdefault("pose_route_timeout_sec", 0.5)
+    runtime.setdefault("pose_inference_timeout_sec", 30.0)
+    runtime.setdefault("pose_batch_enabled", False)
+    runtime.setdefault("pose_batch_size", 1)
+    runtime.setdefault("pose_batch_max_wait_ms", 0.0)
+    runtime.setdefault("performance_metrics_enabled", False)
+    runtime.setdefault("performance_metrics_sample_every", 1)
+    runtime.setdefault("performance_metrics_max_samples", 2048)
+    runtime.setdefault("performance_metrics_warmup_requests", 2)
 
     runtime.setdefault("camera_cv2_threads", 1)
+    runtime.setdefault("person_worker_cv2_threads", 1)
+    runtime.setdefault("pose_worker_cv2_threads", 1)
     runtime.setdefault("stage3_cv2_threads", 1)
     runtime.setdefault("incident_cv2_threads", 1)
+
+    runtime.setdefault("camera_ingest_mode", "centralized")
+    runtime.setdefault("camera_ingest_fight_queue_size", 8)
+    runtime.setdefault("camera_ingest_preview_queue_size", 1)
+    runtime.setdefault("camera_ingest_publish_timeout_sec", 0.2)
+    runtime.setdefault("camera_ingest_file_fight_policy", "ordered")
+    runtime.setdefault("camera_ingest_cv2_threads", 1)
+    runtime.setdefault("camera_preview_cv2_threads", 1)
+    runtime.setdefault("camera_reconnect_enabled", True)
+    runtime.setdefault("camera_reconnect_initial_delay_sec", 0.5)
+    runtime.setdefault("camera_reconnect_max_delay_sec", 8.0)
 
     runtime.setdefault("restart_camera_processes", True)
     runtime.setdefault("camera_restart_backoff_sec", 3.0)
@@ -184,6 +268,7 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
 
     return {
         "schema_version": 1,
+        "run_id": uuid.uuid4().hex,
         "run_name": run_name,
         "output_dir": str(run_dir),
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -232,8 +317,8 @@ def _write_command_debug(run_dir: Path, cmd: list[str], env: dict, config_path: 
         pass
 
 
-def start_pipeline(sources: list[dict]) -> ActiveRun:
-    run_name = time.strftime("ui_run_%Y%m%d_%H%M%S")
+def _prepare_run(sources: list[dict]) -> tuple[str, Path, Path, Path, Path, dict]:
+    run_name = f"{time.strftime('ui_run_%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     run_dir = Path(settings.PIPELINE_OUTPUT_BASE) / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -246,6 +331,13 @@ def start_pipeline(sources: list[dict]) -> ActiveRun:
 
     config = _build_run_config(sources=sources, run_name=run_name, run_dir=run_dir)
     config_path = _write_run_config(run_dir, config)
+    return run_name, run_dir, stdout_path, stderr_path, config_path, config
+
+
+def _start_pipeline_direct(sources: list[dict]) -> ActiveRun:
+    run_name, run_dir, stdout_path, stderr_path, config_path, config = _prepare_run(
+        sources
+    )
 
     cmd = build_command(config_path)
 
@@ -315,10 +407,15 @@ def start_pipeline(sources: list[dict]) -> ActiveRun:
         stderr_path=stderr_path,
         started_at=time.time(),
         config_path=config_path,
+        runtime_pid=process.pid,
+        run_id=str(config.get("run_id") or ""),
+        runtime_state="RUNNING",
+        supervisor_state="DIRECT",
+        control_mode="direct",
     )
 
 
-def stop_pipeline(active: ActiveRun | None) -> None:
+def _stop_pipeline_direct(active: ActiveRun | None) -> None:
     if active is None:
         return
 
@@ -338,3 +435,133 @@ def stop_pipeline(active: ActiveRun | None) -> None:
             process.kill()
         except Exception:
             pass
+
+
+def _control_mode() -> str:
+    return str(getattr(settings, "RUNTIME_CONTROL_MODE", "supervisor")).strip().lower()
+
+
+def _supervisor_client() -> RuntimeSupervisorClient:
+    return RuntimeSupervisorClient(
+        getattr(settings, "RUNTIME_SUPERVISOR_URL", "http://127.0.0.1:8765"),
+        getattr(settings, "RUNTIME_SUPERVISOR_TOKEN", ""),
+        timeout=float(getattr(settings, "RUNTIME_SUPERVISOR_TIMEOUT_SEC", 3.0)),
+    )
+
+
+def _parse_active_from_status(status: dict, fallback_sources=None) -> ActiveRun | None:
+    runtime_state = str(status.get("runtime_state") or "STOPPED")
+    config_value = status.get("config_path")
+    if not config_value:
+        return None
+    config_path = Path(config_value)
+    config = {}
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    run_dir = Path(config.get("output_dir") or config_path.parent)
+    sources = config.get("cameras") or list(fallback_sources or [])
+    return ActiveRun(
+        process=None,
+        run_name=str(config.get("run_name") or run_dir.name),
+        run_dir=run_dir,
+        sources=sources,
+        stdout_path=run_dir / "stdout.log",
+        stderr_path=run_dir / "stderr.log",
+        started_at=time.time(),
+        config_path=config_path,
+        runtime_pid=status.get("runtime_pid"),
+        run_id=str(status.get("run_id") or config.get("run_id") or ""),
+        runtime_state=runtime_state,
+        supervisor_state=str(status.get("supervisor_state") or "UNKNOWN"),
+        control_mode="supervisor",
+        operation_result=str(status.get("result") or ""),
+    )
+
+
+def get_pipeline_status() -> dict:
+    if _control_mode() == "direct":
+        from .runtime_state import runtime
+
+        active = runtime.get()
+        process = None if active is None else active.process
+        return {
+            "ok": True,
+            "available": True,
+            "supervisor_state": "DIRECT",
+            "runtime_state": (
+                "STOPPED"
+                if process is None
+                else ("RUNNING" if process.poll() is None else "FAILED")
+            ),
+            "runtime_pid": None if process is None else process.pid,
+            "runtime_exit_code": None if process is None else process.poll(),
+            "config_path": None if active is None else str(active.config_path),
+            "run_id": "" if active is None else active.run_id,
+        }
+    try:
+        status = _supervisor_client().status()
+        status["available"] = True
+        return status
+    except SupervisorUnavailable:
+        return {
+            "ok": False,
+            "available": False,
+            "supervisor_state": "UNAVAILABLE",
+            "runtime_state": "UNKNOWN",
+            "runtime_pid": None,
+            "runtime_exit_code": None,
+            "config_path": None,
+            "run_id": None,
+            "last_failure": "supervisor_unavailable",
+        }
+
+
+def get_active_run() -> ActiveRun | None:
+    if _control_mode() == "direct":
+        from .runtime_state import runtime
+
+        return runtime.get()
+    status = get_pipeline_status()
+    if not status.get("available"):
+        return None
+    return _parse_active_from_status(status)
+
+
+def start_pipeline(sources: list[dict]) -> ActiveRun:
+    if _control_mode() == "direct":
+        active = _start_pipeline_direct(sources)
+        from .runtime_state import runtime
+
+        runtime.set(active)
+        return active
+
+    _, _, _, _, config_path, _ = _prepare_run(sources)
+    status = _supervisor_client().start(str(config_path))
+    active = _parse_active_from_status(status, fallback_sources=sources)
+    if active is None:
+        raise RuntimeError("Supervisor runtime metadata döndürmedi")
+    return active
+
+
+def stop_pipeline(active: ActiveRun | None = None) -> dict:
+    if _control_mode() == "direct":
+        _stop_pipeline_direct(active)
+        from .runtime_state import runtime
+
+        runtime.set(None)
+        return {"ok": True, "result": "stopped", "runtime_state": "STOPPED"}
+    return _supervisor_client().stop()
+
+
+def restart_pipeline(config_path: str | Path | None = None) -> ActiveRun:
+    if _control_mode() == "direct":
+        raise RuntimeError("Direct rollback mode does not expose restart without sources")
+    status = _supervisor_client().restart(
+        None if config_path is None else str(config_path)
+    )
+    active = _parse_active_from_status(status)
+    if active is None:
+        raise RuntimeError("Supervisor runtime metadata döndürmedi")
+    return active

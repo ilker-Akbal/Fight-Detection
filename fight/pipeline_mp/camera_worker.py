@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import queue
 import time
 from collections import deque
 from datetime import datetime
@@ -9,7 +10,7 @@ from types import SimpleNamespace
 import cv2
 import yaml
 
-from fight.pipeline.adapters import MotionAdapter, YoloAdapter
+from fight.pipeline.adapters import MotionAdapter
 from fight.pipeline.clip_buffer import save_clip_mp4
 from fight.pipeline.pair_selector import LivePairRoiController
 from fight.pipeline.person_stabilizer import TemporalPersonStabilizer
@@ -19,10 +20,19 @@ from fight.pipeline_mp.common import (
     configure_process_runtime,
     is_file_source,
     now_str,
+    redact_source,
     ts_to_str,
 )
-from fight.pipeline_mp.messages import ActiveEvent, ReportMessage, Stage3Job
-from fight.pose.src.pose_adapter import PoseAdapter
+from fight.pipeline_mp.messages import (
+    ActiveEvent,
+    CameraFrame,
+    CameraIngestSignal,
+    ReportMessage,
+    Stage3Job,
+)
+from fight.pipeline_mp.performance import BoundedMetricCollector
+from fight.pipeline_mp.person_worker import PersonInferenceClient, should_request_person_inference
+from fight.pipeline_mp.pose_worker import PoseInferenceClient, should_request_pose_inference
 from fight.pose.src.pose_gate import PoseGate
 
 
@@ -165,28 +175,88 @@ class CameraProcessRunner:
     - Son karar X3D-M + incident aggregation tarafındadır.
     """
 
-    def __init__(self, config: dict, camera: dict, stage3_queue, report_queue, stop_event):
+    def __init__(
+        self,
+        config: dict,
+        camera: dict,
+        stage3_queue,
+        report_queue,
+        stop_event,
+        person_request_queue,
+        person_result_queue,
+        pose_request_queue,
+        pose_result_queue,
+        generation: int,
+        frame_queue=None,
+    ):
         self.config = config
         self.camera = camera
         self.stage3_queue = stage3_queue
         self.report_queue = report_queue
         self.stop_event = stop_event
+        self.generation = int(generation)
+        self.started_monotonic = time.perf_counter()
+        self.frame_queue = frame_queue
+        self.models = config.get("models", {})
+        self.runtime = config.get("runtime", {})
 
         self.camera_id = str(camera["camera_id"])
         self.source = str(camera["source"])
+        self.source_public = redact_source(self.source)
         self.source_is_file = is_file_source(self.source)
+        self.camera_ingest_mode = str(
+            self.runtime.get("camera_ingest_mode", "legacy")
+        ).strip().lower()
+        self.centralized_ingest = self.camera_ingest_mode == "centralized"
 
-        self.models = config.get("models", {})
-        self.runtime = config.get("runtime", {})
         self.paths = MpPaths.from_output_dir(config["output_dir"])
         self.paths.mkdirs()
 
         self.args = SimpleNamespace(**self.runtime)
         self.args.output_dir = str(self.paths.output_dir)
+        metrics_enabled = bool(self.runtime.get("performance_metrics_enabled", False))
+        metrics_sample_every = int(self.runtime.get("performance_metrics_sample_every", 1))
+        metrics_max_samples = int(self.runtime.get("performance_metrics_max_samples", 2048))
+        metrics_warmup_requests = int(
+            self.runtime.get("performance_metrics_warmup_requests", 2)
+        )
+        self.frame_age_ms = BoundedMetricCollector(
+            enabled=metrics_enabled,
+            sample_every=metrics_sample_every,
+            max_samples=metrics_max_samples,
+        )
 
         self.motion = MotionAdapter(self.models["motion_config"])
-        self.yolo = YoloAdapter(self.models["yolo_config"], self.models["yolo_weights"])
-        self.pose = PoseAdapter(self.models["pose_config"]) if bool(self.runtime.get("use_pose", True)) else None
+        self.pose_inference = None
+        if bool(self.runtime.get("use_pose", True)):
+            self.pose_inference = PoseInferenceClient(
+                camera_id=self.camera_id,
+                generation=self.generation,
+                request_queue=pose_request_queue,
+                result_queue=pose_result_queue,
+                report_queue=self.report_queue,
+                stop_event=self.stop_event,
+                inference_timeout_sec=float(self.runtime.get("pose_inference_timeout_sec", 30.0)),
+                enqueue_timeout_sec=float(self.runtime.get("pose_request_enqueue_timeout_sec", 0.5)),
+                performance_metrics_enabled=metrics_enabled,
+                performance_metrics_sample_every=metrics_sample_every,
+                performance_metrics_max_samples=metrics_max_samples,
+                performance_metrics_warmup_requests=metrics_warmup_requests,
+            )
+        self.person_inference = PersonInferenceClient(
+            camera_id=self.camera_id,
+            generation=self.generation,
+            request_queue=person_request_queue,
+            result_queue=person_result_queue,
+            report_queue=self.report_queue,
+            stop_event=self.stop_event,
+            inference_timeout_sec=float(self.runtime.get("person_inference_timeout_sec", 30.0)),
+            enqueue_timeout_sec=float(self.runtime.get("person_request_enqueue_timeout_sec", 0.5)),
+            performance_metrics_enabled=metrics_enabled,
+            performance_metrics_sample_every=metrics_sample_every,
+            performance_metrics_max_samples=metrics_max_samples,
+            performance_metrics_warmup_requests=metrics_warmup_requests,
+        )
 
         temporal_cfg = _load_pose_temporal(self.models["pose_config"])
         self.pose_gate = PoseGate(
@@ -219,6 +289,7 @@ class CameraProcessRunner:
         )
 
         self.cap = None
+        self.source_frame_count = 0
         self.frame_idx = -1
         self.event_counter = 0
         self.active_event: ActiveEvent | None = None
@@ -228,6 +299,7 @@ class CameraProcessRunner:
         self.capture_fps = self.default_clip_fps
         self.clip_write_fps = self.default_clip_fps
         self.source_timeline_base_ts = time.time()
+        self.last_ingest_frame_seq = 0
 
         # Event parçalanınca prebuffer tekrarını engellemek için tutulur.
         self.last_event_close_frame_idx = -10_000_000
@@ -257,12 +329,23 @@ class CameraProcessRunner:
 
         self.preview_path = self.paths.previews_dir / f"{self.camera_id}.jpg"
         self.last_preview_write_ts = 0.0
+        self.counters = {
+            "frames_read": 0,
+            "motion_pass_frames": 0,
+            "frames_with_enough_persons": 0,
+            "pair_candidates": 0,
+            "pair_activated": 0,
+            "pose_gate_positive_frames": 0,
+            "events_opened": 0,
+            "events_closed": 0,
+            "stage3_jobs_submitted": 0,
+        }
 
     def report_status(self, stage: str, detail: str, extra: dict | None = None) -> None:
         row = {
             "ts": now_str(),
             "camera_id": self.camera_id,
-            "ip": self.source,
+            "ip": self.source_public,
             "stage": stage,
             "detail": detail,
         }
@@ -271,11 +354,13 @@ class CameraProcessRunner:
         _report(self.report_queue, "status", row)
 
     def open(self) -> None:
+        if self.centralized_ingest:
+            raise RuntimeError("CameraProcessRunner cannot open a source in centralized mode")
         self.close_capture()
         self.cap = open_source(self.source)
 
         if self.cap is None or not self.cap.isOpened():
-            raise RuntimeError(f"Cannot open source: {self.source}")
+            raise RuntimeError(f"Cannot open source: {self.source_public}")
 
         try:
             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -286,6 +371,15 @@ class CameraProcessRunner:
             self.cap,
             default_fps=self.default_clip_fps,
         )
+
+        if self.source_is_file:
+            try:
+                self.source_frame_count = max(
+                    self.source_frame_count,
+                    max(0, int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))),
+                )
+            except Exception:
+                pass
 
         if self.source_is_file:
             self.clip_write_fps = self.capture_fps
@@ -299,6 +393,7 @@ class CameraProcessRunner:
             "opened",
             {
                 "source_is_file": int(self.source_is_file),
+                "generation": self.generation,
                 "capture_fps": round(float(self.capture_fps), 3),
                 "clip_write_fps": round(float(self.clip_write_fps), 3),
             },
@@ -361,22 +456,35 @@ class CameraProcessRunner:
             self.prebuffer.clear()
 
     def detect_persons(self, frame_bgr):
-        dets = self.yolo.detect_persons(frame_bgr)
+        dets = self.person_inference.infer(frame_bgr, self.frame_idx)
         person_conf = float(self.runtime.get("person_conf", 0.25))
         dets = [(c, box) for (c, box) in dets if float(c) >= person_conf]
         dets.sort(key=lambda x: x[0], reverse=True)
         return dets
 
+    def should_request_person_inference(self, motion_ok: bool) -> bool:
+        yolo_stride = max(1, int(self.runtime.get("yolo_stride", 2)))
+        return should_request_person_inference(motion_ok, self.frame_idx, yolo_stride)
+
     def pose_check(self, roi_bgr):
-        if self.pose is None:
+        if self.pose_inference is None:
             return None
 
-        raw = self.pose.evaluate(roi_bgr)
+        raw = self.pose_inference.infer(roi_bgr, self.frame_idx)
         dec = self.pose_gate.update(raw.score, raw.ok)
 
         raw.ok = dec.pose_ok
         raw.hist_positive = dec.hist_positive
         return raw
+
+    def should_request_pose_inference(self, roi_available: bool) -> bool:
+        pose_stride = max(1, int(self.runtime.get("pose_stride", 2)))
+        return should_request_pose_inference(
+            self.pose_inference is not None,
+            roi_available,
+            self.frame_idx,
+            pose_stride,
+        )
 
     def maybe_write_preview(
         self,
@@ -390,6 +498,8 @@ class CameraProcessRunner:
         pair_score: float = 0.0,
         roi_ok: int = 0,
     ) -> None:
+        if self.centralized_ingest:
+            return
         preview_every = max(1, int(self.runtime.get("preview_every_frames", 5)))
         interval = float(self.runtime.get("preview_write_interval_sec", 0.25))
         quality = int(self.runtime.get("preview_jpeg_quality", 75))
@@ -420,6 +530,7 @@ class CameraProcessRunner:
         self.last_preview_write_ts = now_ts
 
     def new_event(self, now_ts: float, seed_frames: list, pose_score: float, start_reason: str) -> None:
+        self.counters["events_opened"] += 1
         self.event_counter += 1
         event_id = f"{self.camera_id}_{self.event_counter:06d}"
 
@@ -456,7 +567,7 @@ class CameraProcessRunner:
         self.active_event = ActiveEvent(
             event_id=event_id,
             camera_id=self.camera_id,
-            source=self.source,
+            source=self.source_public,
             start_ts=event_start_ts,
             last_ts=now_ts,
             last_positive_frame_idx=self.frame_idx,
@@ -565,6 +676,7 @@ class CameraProcessRunner:
 
         if ev is None:
             return
+        self.counters["events_closed"] += 1
 
         event_end_ts = ev.last_ts
         duration = max(0.0, float(event_end_ts) - float(ev.start_ts))
@@ -614,7 +726,7 @@ class CameraProcessRunner:
             else:
                 job = Stage3Job(
                     camera_id=self.camera_id,
-                    source=self.source,
+                    source=self.source_public,
                     event_id=ev.event_id,
                     event_start_ts=ev.start_ts,
                     event_end_ts=event_end_ts,
@@ -631,6 +743,7 @@ class CameraProcessRunner:
                         job,
                         timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
                     )
+                    self.counters["stage3_jobs_submitted"] += 1
                     queue_status = "queued"
                     queue_reason = "stage3_queue"
                 except Exception:
@@ -642,7 +755,7 @@ class CameraProcessRunner:
 
         row = {
             "camera_id": self.camera_id,
-            "ip": self.source,
+            "ip": self.source_public,
             "event_id": ev.event_id,
             "event_start": ts_to_str(ev.start_ts),
             "event_end": ts_to_str(event_end_ts),
@@ -864,8 +977,9 @@ class CameraProcessRunner:
                 )
             return
 
-        yolo_stride = max(1, int(self.runtime.get("yolo_stride", 2)))
-        if self.frame_idx % yolo_stride == 0:
+        self.counters["motion_pass_frames"] += 1
+
+        if self.should_request_person_inference(bool(motion_ok)):
             dets = self.detect_persons(motion_frame)
             stable_persons = self.person_stabilizer.update(dets)
         else:
@@ -900,11 +1014,17 @@ class CameraProcessRunner:
                 )
             return
 
+        self.counters["frames_with_enough_persons"] += 1
+
         self.last_yolo_hit_idx = self.frame_idx
 
         pair_state = self.pair_roi.update(stable_persons, motion_frame.shape)
         pair_ok = int(pair_state.get("pair_ok", 0))
         pair_score = float(pair_state.get("pair_score", 0.0))
+        if pair_score > 0.0:
+            self.counters["pair_candidates"] += 1
+        if pair_ok:
+            self.counters["pair_activated"] += 1
 
         roi_info = self._update_roi_state(
             active=bool(motion_ok),
@@ -942,7 +1062,11 @@ class CameraProcessRunner:
         raw_pose_ready = False
 
         if self.frame_idx % pose_stride == 0:
-            pose_out = self.pose_check(view_s3)
+            pose_out = (
+                self.pose_check(view_s3)
+                if self.should_request_pose_inference(roi_available)
+                else None
+            )
 
             if pose_out is None:
                 pose_positive = True
@@ -950,6 +1074,8 @@ class CameraProcessRunner:
             else:
                 pose_score = float(getattr(pose_out, "score", 0.0))
                 pose_positive = bool(getattr(pose_out, "ok", False))
+                if pose_positive:
+                    self.counters["pose_gate_positive_frames"] += 1
 
             self.last_pose_score = pose_score
             self.last_pose_ok = bool(pose_positive)
@@ -979,7 +1105,7 @@ class CameraProcessRunner:
 
         pose_trigger_hold_sec = float(self.runtime.get("pose_trigger_hold_sec", 2.4))
         pose_capture_active = (
-            self.pose is None
+            self.pose_inference is None
             or (
                 self.last_pose_trigger_ts > 0
                 and (now_ts - self.last_pose_trigger_ts) <= pose_trigger_hold_sec
@@ -1063,6 +1189,10 @@ class CameraProcessRunner:
             )
 
     def run_loop(self) -> None:
+        if self.centralized_ingest:
+            self.run_centralized_loop()
+            return
+
         reconnect_sec = float(self.runtime.get("reconnect_sec", 2.0))
         file_loop = bool(self.runtime.get("loop_file_sources", False))
 
@@ -1089,6 +1219,7 @@ class CameraProcessRunner:
                         time.sleep(reconnect_sec)
                         break
 
+                    self.counters["frames_read"] += 1
                     self.process_frame(frame)
 
             except Exception as exc:
@@ -1114,8 +1245,172 @@ class CameraProcessRunner:
 
         self.report_status("camera", "stopped")
 
+    def run_centralized_loop(self) -> None:
+        if self.frame_queue is None:
+            raise RuntimeError("Centralized camera consumer requires a frame channel")
 
-def camera_process_main(config: dict, camera: dict, stage3_queue, report_queue, stop_event) -> None:
+        self.report_status(
+            "camera",
+            "centralized_consumer_started",
+            {"generation": self.generation},
+        )
+        while not self.stop_event.is_set():
+            try:
+                message = self.frame_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+
+            if isinstance(message, CameraIngestSignal):
+                if message.camera_id != self.camera_id:
+                    continue
+                if int(message.generation) != self.generation:
+                    continue
+                if message.detail == "eof":
+                    if self.active_event is not None:
+                        self.close_event("source_eof")
+                    self.report_status(
+                        "camera",
+                        "eof",
+                        {"frame_seq": int(message.frame_seq)},
+                    )
+                    return
+                if message.detail == "fatal_error":
+                    raise RuntimeError(message.error or "camera ingest fatal error")
+                if message.detail == "stopping":
+                    break
+                continue
+
+            if not isinstance(message, CameraFrame):
+                continue
+            if message.camera_id != self.camera_id:
+                self.report_status("camera", "wrong_ingest_camera_id")
+                continue
+            if int(message.generation) != self.generation:
+                self.report_status(
+                    "camera",
+                    "stale_ingest_generation",
+                    {"frame_generation": int(message.generation)},
+                )
+                continue
+            if int(message.frame_seq) <= self.last_ingest_frame_seq:
+                self.report_status(
+                    "camera",
+                    "non_monotonic_frame_seq",
+                    {"frame_seq": int(message.frame_seq)},
+                )
+                continue
+
+            self.last_ingest_frame_seq = int(message.frame_seq)
+            self.capture_fps = float(message.source_fps or self.capture_fps)
+            if self.source_is_file:
+                self.clip_write_fps = self.capture_fps
+            self.source_frame_count = max(
+                self.source_frame_count,
+                int(message.source_frame_count or 0),
+            )
+            if self.source_is_file and self.capture_fps > 0 and self.counters["frames_read"] == 0:
+                self.source_timeline_base_ts = float(message.captured_wall_time) - (
+                    max(0, int(message.frame_seq) - 1) / self.capture_fps
+                )
+            if self.frame_age_ms.enabled:
+                self.frame_age_ms.observe(
+                    max(
+                        0.0,
+                        (time.perf_counter() - float(message.captured_monotonic))
+                        * 1000.0,
+                    )
+                )
+
+            self.frame_idx = int(message.frame_seq) - 2
+            self.counters["frames_read"] += 1
+            self.process_frame(message.frame)
+
+        if self.active_event is not None:
+            self.close_event("shutdown")
+        try:
+            self.motion.close()
+        except Exception:
+            pass
+        self.report_status("camera", "stopped")
+
+    def report_performance_summary(self) -> None:
+        elapsed_sec = max(0.0, time.perf_counter() - self.started_monotonic)
+        frame_age_summary = (
+            self.frame_age_ms.summary()
+            if hasattr(self, "frame_age_ms")
+            else {"samples": 0, "mean": 0.0, "p50": 0.0, "p95": 0.0, "max": 0.0}
+        )
+        source_duration_sec = 0.0
+        if self.source_is_file and self.capture_fps > 0:
+            source_frames = self.source_frame_count or self.counters["frames_read"]
+            source_duration_sec = float(source_frames) / float(self.capture_fps)
+
+        person = self.person_inference.performance_summary()
+        pose = (
+            self.pose_inference.performance_summary()
+            if self.pose_inference is not None
+            else {
+                "requests": 0,
+                "results": 0,
+                "timeouts": 0,
+                "queue_full": 0,
+                "result_drops": 0,
+                "metrics_enabled": False,
+                "queue_depth_high_water_best_effort": -1,
+                "timings": {},
+                "_samples": {},
+            }
+        )
+        row = {
+            "ts": now_str(),
+            "camera_id": self.camera_id,
+            "source": getattr(self, "source_public", self.source),
+            "generation": self.generation,
+            "camera_ingest_mode": getattr(self, "camera_ingest_mode", "legacy"),
+            "last_ingest_frame_seq": int(getattr(self, "last_ingest_frame_seq", 0)),
+            "frame_age_ms_at_fight_consumer": frame_age_summary,
+            "stage": "camera_summary",
+            "detail": "completed",
+            **self.counters,
+            "person_requests": int(person["requests"]),
+            "person_results": int(person["results"]),
+            "person_timeouts": int(person["timeouts"]),
+            "person_queue_full": int(person["queue_full"]),
+            "pose_requests": int(pose["requests"]),
+            "pose_results": int(pose["results"]),
+            "pose_timeouts": int(pose["timeouts"]),
+            "pose_queue_full": int(pose["queue_full"]),
+            "camera_elapsed_sec": round(elapsed_sec, 6),
+            "camera_processing_fps": round(
+                self.counters["frames_read"] / elapsed_sec,
+                6,
+            ) if elapsed_sec > 0 else 0.0,
+            "source_fps": round(float(self.capture_fps), 6),
+            "source_frame_count": int(self.source_frame_count),
+            "source_duration_sec": round(source_duration_sec, 6),
+            "camera_source_to_processing_ratio": round(
+                source_duration_sec / elapsed_sec,
+                6,
+            ) if elapsed_sec > 0 else 0.0,
+            "person": person,
+            "pose": pose,
+        }
+        _report(self.report_queue, "status", row, block=True)
+
+
+def camera_process_main(
+    config: dict,
+    camera: dict,
+    stage3_queue,
+    report_queue,
+    stop_event,
+    person_request_queue,
+    person_result_queue,
+    pose_request_queue,
+    pose_result_queue,
+    generation: int,
+    frame_queue=None,
+) -> None:
     runtime = config.get("runtime", {})
 
     configure_process_runtime(
@@ -1129,5 +1424,14 @@ def camera_process_main(config: dict, camera: dict, stage3_queue, report_queue, 
         stage3_queue=stage3_queue,
         report_queue=report_queue,
         stop_event=stop_event,
+        person_request_queue=person_request_queue,
+        person_result_queue=person_result_queue,
+        pose_request_queue=pose_request_queue,
+        pose_result_queue=pose_result_queue,
+        generation=generation,
+        frame_queue=frame_queue,
     )
-    runner.run_loop()
+    try:
+        runner.run_loop()
+    finally:
+        runner.report_performance_summary()

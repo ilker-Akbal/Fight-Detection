@@ -11,6 +11,11 @@ def role_required(allowed_roles=None):
             if not request.user.is_authenticated:
                 return HttpResponseForbidden("Giriş yapmalısınız.")
 
+            # Django's trusted operational admins keep the same global bypass
+            # used by the centralized camera authorization service.
+            if request.user.is_superuser or request.user.is_staff:
+                return view_func(request, *args, **kwargs)
+
             profile = getattr(request.user, "profile", None)
             if profile is None:
                 return HttpResponseForbidden("Kullanıcı profili bulunamadı.")

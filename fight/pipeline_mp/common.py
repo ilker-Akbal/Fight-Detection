@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import time
+from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +42,24 @@ def is_file_source(source: str) -> bool:
     if low.startswith(("rtsp://", "rtmp://", "http://", "https://", "udp://", "tcp://")):
         return False
     return Path(s).exists()
+
+
+def redact_source(source: str) -> str:
+    """Remove URL user-info before a camera source reaches telemetry."""
+    value = str(source or "").strip()
+    try:
+        parsed = urlsplit(value)
+    except Exception:
+        return value
+    if not parsed.scheme or "@" not in parsed.netloc:
+        return value
+    hostname = parsed.hostname or ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    return urlunsplit(
+        (parsed.scheme, f"***:***@{hostname}{port}", parsed.path, parsed.query, parsed.fragment)
+    )
 
 
 def configure_process_runtime(cv2_threads: int = 1, enable_cuda_tuning: bool = False) -> None:

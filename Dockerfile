@@ -51,4 +51,4 @@ WORKDIR /app/Fight_backend_project/backend_frontend_project
 
 EXPOSE 8000
 
-CMD ["bash", "-lc", "python manage.py migrate && python manage.py collectstatic --noinput || true && gunicorn backend_frontend_project.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 180"]
+CMD ["bash", "-lc", "python manage.py migrate && python manage.py collectstatic --noinput || true; python -m fight.runtime_supervisor.server & RUNTIME_SUPERVISOR_PID=$!; trap 'kill -TERM $RUNTIME_SUPERVISOR_PID 2>/dev/null || true' EXIT INT TERM; gunicorn backend_frontend_project.wsgi:application --bind 0.0.0.0:8000 --workers 2 --timeout 180"]
