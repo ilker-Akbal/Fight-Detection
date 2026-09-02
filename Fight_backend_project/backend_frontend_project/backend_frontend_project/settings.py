@@ -64,8 +64,8 @@ INSTALLED_APPS = [
     "accounts",
     "guvenlik",
     "adminx",
+    "incidents.apps.IncidentsConfig",
 ]
-
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
@@ -168,6 +168,9 @@ STORAGES = {
 
 MEDIA_URL = f"{URL_PREFIX}/media/" if URL_PREFIX else "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
+
+INCIDENT_OUTBOX_PATH = MEDIA_ROOT / "runtime_spool" / "incidents_outbox.jsonl"
+INCIDENT_EVIDENCE_ROOTS = [MEDIA_ROOT / "pipeline_runs"]
 
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"

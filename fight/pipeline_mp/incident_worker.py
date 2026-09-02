@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+from pathlib import Path
 
 from fight.pipeline.incident_aggregator import IncidentAggregator, Stage3Result
 from fight.pipeline_mp.common import configure_process_runtime, now_str
@@ -17,6 +18,15 @@ def _report(report_queue, kind: str, row: dict) -> None:
 def incident_process_main(config: dict, incident_queue, report_queue, stop_event) -> None:
     runtime = config.get("runtime", {})
     output_dir = config["output_dir"]
+    output_path = Path(output_dir)
+    default_spool_root = (
+        output_path.parent.parent
+        if output_path.parent.name == "pipeline_runs"
+        else output_path.parent
+    )
+    outbox_path = runtime.get("incident_outbox_path") or str(
+        default_spool_root / "runtime_spool" / "incidents_outbox.jsonl"
+    )
 
     configure_process_runtime(
         cv2_threads=int(runtime.get("incident_cv2_threads", 1)),
@@ -24,7 +34,7 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
     )
 
     agg = IncidentAggregator(
-        out_dir=str(__import__("pathlib").Path(output_dir) / "incidents"),
+        out_dir=str(output_path / "incidents"),
         merge_gap_sec=float(runtime.get("incident_merge_gap_sec", 20.0)),
         max_bridge_nonfight=int(runtime.get("incident_max_bridge_nonfight", 1)),
         enter_thr=float(runtime.get("incident_enter_thr", 0.52)),
@@ -42,6 +52,7 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
         stale_finalize_sec=float(runtime.get("incident_stale_finalize_sec", 8.0)),
         temporal_iou_merge_thr=float(runtime.get("incident_temporal_iou_merge_thr", 0.30)),
         run_id=str(config.get("run_id") or runtime.get("run_id") or ""),
+        outbox_path=outbox_path,
     )
 
     _report(

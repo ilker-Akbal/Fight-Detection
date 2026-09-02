@@ -12,8 +12,10 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.http import FileResponse, Http404, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils.timezone import now
 from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_POST
@@ -21,8 +23,16 @@ from django.views.decorators.http import require_GET, require_POST
 from accounts.decorators import role_required
 from services.access_scope import (
     get_user_accessible_cameras,
+    get_user_security_units,
     is_it_admin,
     user_can_access_camera,
+)
+from incidents.models import Incident
+from incidents.services.actions import acknowledge_incident, resolve_incident
+from incidents.services.evidence import resolve_incident_evidence_path
+from services.incident_access import (
+    get_user_incident_inbox,
+    user_can_view_incident,
 )
 from services.pipeline_bridge.fight_runner import (
     get_active_run,
@@ -479,6 +489,71 @@ def _merge_camera_cards(cameras, pipeline_report):
     return merged
 
 
+def _operational_inbox_payload(user, limit=100):
+    routes = list(get_user_incident_inbox(user)[:limit])
+    admin_bypass = is_it_admin(user)
+    unit_ids = (
+        set()
+        if admin_bypass
+        else set(get_user_security_units(user).values_list("pk", flat=True))
+    )
+    current_time = now()
+    payload = []
+    for route in routes:
+        incident = route.incident
+        can_resolve = incident.status == Incident.STATUS_ACKNOWLEDGED and (
+            admin_bypass
+            or incident.acknowledged_unit_id in unit_ids
+            or (route.security_unit.is_central and route.security_unit_id in unit_ids)
+        )
+        payload.append(
+            {
+                "route_id": route.pk,
+                "incident_id": incident.pk,
+                "external_incident_id": incident.external_incident_id,
+                "incident_type": incident.incident_type,
+                "camera_id": incident.camera.camera_id,
+                "camera_name": incident.camera.name,
+                "location": incident.camera.get_location_display(),
+                "detected_at": incident.detected_at.isoformat(),
+                "finalized_at": incident.finalized_at.isoformat(),
+                "status": incident.status,
+                "routing_state": incident.routing_state,
+                "route_status": route.status,
+                "security_unit": route.security_unit.name,
+                "security_unit_id": route.security_unit_id,
+                "routing_stage": route.routing_stage,
+                "decision_score": incident.decision_score,
+                "part_count": incident.part_count,
+                "elapsed_sec": max(0, int((current_time - incident.detected_at).total_seconds())),
+                "acknowledged_by": (
+                    incident.acknowledged_by.username
+                    if incident.acknowledged_by_id
+                    else ""
+                ),
+                "acknowledged_at": (
+                    incident.acknowledged_at.isoformat()
+                    if incident.acknowledged_at
+                    else ""
+                ),
+                "resolved_at": incident.resolved_at.isoformat() if incident.resolved_at else "",
+                "can_ack": (
+                    incident.status == Incident.STATUS_OPEN
+                    and route.status == route.STATUS_PENDING
+                ),
+                "can_resolve": can_resolve,
+                "ack_url": reverse("dashboard:incident_ack", args=[incident.pk]),
+                "resolve_url": reverse("dashboard:incident_resolve", args=[incident.pk]),
+                "evidence_url": (
+                    reverse("dashboard:incident_evidence", args=[incident.pk])
+                    if incident.evidence_valid
+                    else ""
+                ),
+            }
+        )
+    return payload
+
+
 def _report_payload(request):
     report = _pipeline_report()
     report = _filter_report_for_user(report, request.user)
@@ -489,6 +564,7 @@ def _report_payload(request):
         "events": [],
         "stage3": report["recent_stage3"],
         "incidents": report.get("recent_incidents", []),
+        "operational_incidents": _operational_inbox_payload(request.user),
         "cameras": report["cameras"],
         "run_name": report.get("run_name", ""),
         "pid": report.get("pid"),
@@ -528,6 +604,17 @@ def _report_signature(payload: dict) -> str:
                 x.get("clip_name"),
             )
             for x in payload.get("incidents", [])
+        ],
+        "operational_incidents": [
+            (
+                x.get("route_id"),
+                x.get("incident_id"),
+                x.get("status"),
+                x.get("route_status"),
+                x.get("acknowledged_at"),
+                x.get("resolved_at"),
+            )
+            for x in payload.get("operational_incidents", [])
         ],
         "cameras": [
             (
@@ -570,6 +657,7 @@ def index(request):
             "cameras": cameras,
             "camera_cards": camera_cards,
             "pipeline": pipeline,
+            "operational_inbox": _operational_inbox_payload(request.user),
         },
     )
 
@@ -1094,6 +1182,80 @@ def _range_file_response(request, file_path: Path, content_type: str):
     response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
     response["Accept-Ranges"] = "bytes"
     response["Cache-Control"] = "no-cache"
+    return response
+
+
+def _incident_action_response(request, result: dict, success_message: str):
+    incident = result["incident"]
+    payload = {
+        "ok": True,
+        "result": result["result"],
+        "incident_id": incident.pk,
+        "status": incident.status,
+        "acknowledged_at": (
+            incident.acknowledged_at.isoformat() if incident.acknowledged_at else ""
+        ),
+        "resolved_at": incident.resolved_at.isoformat() if incident.resolved_at else "",
+    }
+    if request.headers.get("x-requested-with") == "XMLHttpRequest":
+        return JsonResponse(payload)
+    messages.success(request, success_message)
+    return redirect("dashboard:index")
+
+
+@never_cache
+@login_required
+@require_POST
+def incident_ack(request, pk):
+    incident = get_object_or_404(Incident, pk=pk)
+    unit_id = request.POST.get("security_unit_id") or None
+    try:
+        unit_id = int(unit_id) if unit_id is not None else None
+        result = acknowledge_incident(request.user, incident, unit_id)
+    except (PermissionDenied, ValueError):
+        return HttpResponse("Bu olayı kabul etme yetkiniz yok.", status=403)
+    return _incident_action_response(request, result, "Olay görevi kabul edildi.")
+
+
+@never_cache
+@login_required
+@require_POST
+def incident_resolve(request, pk):
+    incident = get_object_or_404(Incident, pk=pk)
+    try:
+        result = resolve_incident(
+            request.user,
+            incident,
+            request.POST.get("resolution_note", ""),
+        )
+    except PermissionDenied:
+        return HttpResponse("Bu olayı çözümleme yetkiniz yok.", status=403)
+    except ValidationError as exc:
+        if request.headers.get("x-requested-with") == "XMLHttpRequest":
+            return JsonResponse({"ok": False, "error": exc.message}, status=400)
+        messages.error(request, exc.message)
+        return redirect("dashboard:index")
+    return _incident_action_response(request, result, "Olay çözümlendi.")
+
+
+@never_cache
+@login_required
+@require_GET
+def incident_evidence(request, pk):
+    incident = get_object_or_404(
+        Incident.objects.select_related("camera", "camera__location"),
+        pk=pk,
+    )
+    if not user_can_view_incident(request.user, incident):
+        raise Http404("Kanıt bulunamadı")
+    evidence_path = resolve_incident_evidence_path(incident)
+    if evidence_path is None:
+        raise Http404("Kanıt bulunamadı")
+    content_type, _ = mimetypes.guess_type(str(evidence_path))
+    response = FileResponse(open(evidence_path, "rb"), content_type=content_type or "video/mp4")
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", evidence_path.name)
+    response["Content-Disposition"] = f'inline; filename="{safe_name}"'
+    response["Cache-Control"] = "private, no-store"
     return response
 
 

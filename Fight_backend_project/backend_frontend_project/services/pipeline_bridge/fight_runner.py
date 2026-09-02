@@ -265,6 +265,9 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     runtime.setdefault("roi_pad_value", 114)
     runtime.setdefault("loop_file_sources", False)
     runtime.setdefault("stop_when_file_camera_done", False)
+    runtime["incident_outbox_path"] = str(
+        Path(settings.MEDIA_ROOT) / "runtime_spool" / "incidents_outbox.jsonl"
+    )
 
     return {
         "schema_version": 1,

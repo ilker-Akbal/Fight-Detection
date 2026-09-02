@@ -8,6 +8,7 @@ const dashboardConfig = {
   eventsStreamUrl: dashboardRoot?.dataset.eventsStreamUrl || "",
   incidentVideoTemplate: dashboardRoot?.dataset.incidentVideoTemplate || "",
   logoUrl: dashboardRoot?.dataset.logoUrl || "",
+  csrfToken: dashboardRoot?.dataset.csrfToken || "",
 };
 
 const shownFightAlerts = new Set(
@@ -347,6 +348,53 @@ function syncIncidents(rows) {
   });
 }
 
+function syncOperationalInbox(rows) {
+  const body = document.getElementById("operational-inbox-body");
+  if (!body) return;
+
+  if (!rows || rows.length === 0) {
+    body.innerHTML = `<tr><td colspan="8" class="muted">Aktif route edilmiş olay bulunmuyor.</td></tr>`;
+    return;
+  }
+
+  body.innerHTML = rows.map((item) => {
+    let actionHtml = "-";
+    if (item.can_ack) {
+      actionHtml = `
+        <form method="post" action="${escapeHtml(item.ack_url)}">
+          <input type="hidden" name="csrfmiddlewaretoken" value="${escapeHtml(dashboardConfig.csrfToken)}" />
+          <input type="hidden" name="security_unit_id" value="${escapeHtml(item.security_unit_id)}" />
+          <button type="submit" class="btn">Kabul Et</button>
+        </form>`;
+    } else if (item.can_resolve) {
+      actionHtml = `
+        <form method="post" action="${escapeHtml(item.resolve_url)}">
+          <input type="hidden" name="csrfmiddlewaretoken" value="${escapeHtml(dashboardConfig.csrfToken)}" />
+          <input type="text" name="resolution_note" maxlength="4000" placeholder="Çözüm notu" required />
+          <button type="submit" class="btn">Çözümle</button>
+        </form>`;
+    }
+
+    const evidenceHtml = item.evidence_url
+      ? `<a href="${escapeHtml(item.evidence_url)}" target="_blank" rel="noopener">Kanıtı Aç</a>`
+      : "-";
+
+    return `
+      <tr data-operational-route-id="${escapeHtml(item.route_id)}">
+        <td><strong>${escapeHtml(item.incident_type)} #${escapeHtml(item.external_incident_id)}</strong><br />
+          <small>${escapeHtml(item.camera_name)} / ${escapeHtml(item.camera_id)}</small></td>
+        <td>${escapeHtml(item.location)}</td>
+        <td>${escapeHtml(item.security_unit)}</td>
+        <td>${escapeHtml(item.routing_stage)}</td>
+        <td><span class="status-badge status-other">${escapeHtml(item.status)}</span><br />
+          <small>${escapeHtml(item.acknowledged_by || "")}</small></td>
+        <td>${escapeHtml(Number(item.decision_score || 0).toFixed(3))}</td>
+        <td>${evidenceHtml}</td>
+        <td>${actionHtml}</td>
+      </tr>`;
+  }).join("");
+}
+
 let lastDashboardNoticeId = sessionStorage.getItem("lastDashboardNoticeId") || "";
 
 function showDashboardNoticeModal(notice) {
@@ -438,6 +486,7 @@ function applyDashboardData(data) {
   });
 
   syncIncidents(data.incidents || []);
+  syncOperationalInbox(data.operational_incidents || []);
   checkFightAlerts(data.incidents || []);
 }
 

@@ -31,6 +31,7 @@ from services.speed_bridge.calibration_writer import (
 )
 from speed_detection.models import SpeedCameraConfig
 from streams.models import Camera
+from incidents.models import Incident
 
 from .forms import CameraForm, FacultyLocationForm, SpeedCameraConfigForm, UserEditForm
 from .models import FacultyLocation
@@ -843,7 +844,7 @@ def _admin_faculty_location_label(value):
     return str(value)
 
 
-def _admin_collect_incidents():
+def _admin_collect_legacy_incidents():
     camera_map = {
         cam.camera_id: cam
         for cam in Camera.objects.all()
@@ -912,6 +913,47 @@ def _admin_collect_incidents():
     )
 
     return rows[:MAX_ADMIN_INCIDENT_ROWS]
+
+
+def _admin_collect_incidents():
+    operational = list(
+        Incident.objects
+        .select_related("camera", "camera__location", "acknowledged_by", "acknowledged_unit")
+        .order_by("-detected_at", "-pk")[:MAX_ADMIN_INCIDENT_ROWS]
+    )
+    if not operational:
+        return _admin_collect_legacy_incidents()
+
+    faculty_users = _admin_faculty_users_map()
+    rows = []
+    for incident in operational:
+        camera = incident.camera
+        faculty_value = camera.faculty or ""
+        rows.append(
+            {
+                "run_name": incident.run_id,
+                "camera_id": camera.camera_id,
+                "camera_name": camera.name,
+                "camera_source": camera.source,
+                "faculty": faculty_value,
+                "faculty_label": camera.get_location_display(),
+                "faculty_users": faculty_users.get(faculty_value, []),
+                "incident_id": incident.external_incident_id,
+                "start_ts": _admin_format_ts(incident.detected_at.isoformat()),
+                "end_ts": _admin_format_ts(incident.finalized_at.isoformat()),
+                "final_label": incident.label or incident.incident_type,
+                "clip_path": "",
+                "clip_url": (
+                    reverse("dashboard:incident_evidence", args=[incident.pk])
+                    if incident.evidence_valid
+                    else ""
+                ),
+                "part_count": incident.part_count,
+                "status": incident.status,
+                "routing_state": incident.routing_state,
+            }
+        )
+    return rows
 
 
 def _filter_admin_incidents(incidents, selected_faculty, selected_camera, search_query):

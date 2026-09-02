@@ -15,6 +15,12 @@ from typing import Deque, Dict, List, Optional
 
 import cv2
 
+from fight.pipeline.incident_outbox import (
+    IncidentOutboxEnvelope,
+    append_envelope_durable,
+    utc_iso_from_epoch,
+)
+
 from fight.pipeline_mp.clip_overlay import draw_ai_clip_overlay
 
 
@@ -168,12 +174,14 @@ class IncidentAggregator:
         temporal_iou_merge_thr: float = 0.30,
         sweep_interval_sec: float = 0.50,
         run_id: str = "",
+        outbox_path: str | Path | None = None,
     ):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
         self.incidents_jsonl = self.out_dir.parent / "incidents.jsonl"
         self.run_id = str(run_id or "")
+        self.outbox_path = Path(outbox_path) if outbox_path else self.out_dir.parent / "incidents_outbox.jsonl"
 
         self.merge_gap_sec = float(merge_gap_sec)
         self.max_bridge_nonfight = int(max_bridge_nonfight)
@@ -645,6 +653,27 @@ class IncidentAggregator:
             "created_at": self._fmt_ts(time.time()),
         }
 
+        finalized_wall_time = time.time()
+        envelope = IncidentOutboxEnvelope.create(
+            run_id=self.run_id,
+            external_incident_id=st.incident_id,
+            camera_id=st.camera_id,
+            incident_type="FIGHT",
+            detected_at=utc_iso_from_epoch(st.start_ts),
+            finalized_at=utc_iso_from_epoch(finalized_wall_time),
+            label=final_label,
+            decision_score=round(float(st.decision_score), 6),
+            max_score=round(float(st.max_prob), 6),
+            mean_score=round(float(st.mean_prob), 6),
+            confidence=round(float(st.decision_score), 6),
+            part_count=int(st.part_count),
+            evidence_path=str(out_path),
+            created_wall_time=finalized_wall_time,
+        )
+
+        # The application boundary is written durably before the compatibility
+        # JSONL row.  Django is never imported or contacted by the runtime.
+        append_envelope_durable(self.outbox_path, envelope)
         self._append_jsonl(self.incidents_jsonl, row)
 
         print(

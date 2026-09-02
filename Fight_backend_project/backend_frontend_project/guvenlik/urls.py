@@ -12,6 +12,9 @@ from .views import (
     events_stream,
     preview_image,
     incident_video,
+    incident_ack,
+    incident_resolve,
+    incident_evidence,
 )
 
 app_name = "dashboard"
@@ -26,6 +29,9 @@ urlpatterns = [
     path("stream/<str:camera_id>/", stream, name="stream"),
     path("preview/<str:camera_id>/", preview_image, name="preview_image"),
     path("incident-video/<str:run_name>/<path:clip_name>/", incident_video, name="incident_video"),
+    path("incidents/<int:pk>/ack/", incident_ack, name="incident_ack"),
+    path("incidents/<int:pk>/resolve/", incident_resolve, name="incident_resolve"),
+    path("incidents/<int:pk>/evidence/", incident_evidence, name="incident_evidence"),
 ]
 
 urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)

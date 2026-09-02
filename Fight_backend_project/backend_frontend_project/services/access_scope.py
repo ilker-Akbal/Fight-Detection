@@ -144,6 +144,69 @@ def get_user_location_scope(user) -> QuerySet:
     return Location.objects.filter(pk__in=ids).select_related("parent")
 
 
+def resolve_camera_location(camera: Camera):
+    """Resolve the authoritative active Location for routing.
+
+    A populated FK is authoritative.  The legacy faculty code is used only for
+    cameras that have not yet been linked and only when it resolves exactly.
+    """
+
+    if camera.location_id:
+        location = camera.location
+        return location if location.is_effectively_active() else None
+    if not camera.faculty:
+        return None
+    location = Location.objects.filter(code=camera.faculty, active=True).first()
+    if location is None or not location.is_effectively_active():
+        return None
+    return location
+
+
+def get_security_units_covering_location(location) -> QuerySet:
+    """Active units whose active coverage includes this effective location."""
+
+    if location is None or location.pk is None:
+        return SecurityUnit.objects.none()
+
+    unit_ids = build_location_security_unit_index([location.pk]).get(location.pk, set())
+    return SecurityUnit.objects.filter(pk__in=unit_ids).select_related("location")
+
+
+def build_location_security_unit_index(location_ids) -> dict[int, set[int]]:
+    """Bulk form of coverage resolution, shared by access and routing services."""
+
+    requested_ids = {int(value) for value in location_ids if value is not None}
+    result = {location_id: set() for location_id in requested_ids}
+    if not requested_ids:
+        return result
+
+    rows = list(Location.objects.values_list("pk", "parent_id", "active"))
+    effectively_active = _effectively_active_location_ids(rows)
+    parent_by_id = {location_id: parent_id for location_id, parent_id, _ in rows}
+    coverages = list(
+        SecurityUnitCoverage.objects
+        .filter(active=True, security_unit__active=True)
+        .values_list("security_unit_id", "location_id", "include_descendants")
+    )
+
+    for location_id in requested_ids:
+        if location_id not in effectively_active:
+            continue
+        ancestor_ids = {location_id}
+        current_id = parent_by_id.get(location_id)
+        while current_id is not None and current_id not in ancestor_ids:
+            ancestor_ids.add(current_id)
+            current_id = parent_by_id.get(current_id)
+
+        for unit_id, coverage_location_id, include_descendants in coverages:
+            if coverage_location_id == location_id or (
+                include_descendants and coverage_location_id in ancestor_ids
+            ):
+                result[location_id].add(unit_id)
+
+    return result
+
+
 def _legacy_faculty_codes(user, location_ids) -> set[str]:
     codes = set(
         Location.objects
@@ -220,4 +283,3 @@ def user_can_manage_camera(user, camera=None) -> bool:
     if isinstance(camera, int):
         return Camera.objects.filter(pk=camera).exists()
     return Camera.objects.filter(camera_id=str(camera or "")).exists()
-

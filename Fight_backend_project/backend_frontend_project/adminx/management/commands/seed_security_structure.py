@@ -2,6 +2,7 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from adminx.models import Location, SecurityUnit, SecurityUnitCoverage
+from incidents.models import Incident, IncidentRoutingRule
 
 
 class Command(BaseCommand):
@@ -65,13 +66,27 @@ class Command(BaseCommand):
                 "is_central": False,
             },
         )
+        block, _ = SecurityUnit.objects.update_or_create(
+            code="engineering-block-a-security",
+            defaults={
+                "name": "A Block Security",
+                "unit_type": SecurityUnit.TYPE_LOCAL,
+                "location": block_a,
+                "active": True,
+                "is_central": False,
+            },
+        )
 
         self._coverage(central, campus)
         self._coverage(faculty, engineering)
+        self._coverage(block, block_a)
+        self._routing_rule("A Block Fight Stage 0", block, 0, 0, 10)
+        self._routing_rule("Engineering Fight Stage 1", faculty, 1, 30, 20)
+        self._routing_rule("Central Fight Stage 2", central, 2, 60, 30)
 
         self.stdout.write(
             self.style.SUCCESS(
-                "Demo güvenlik yapısı hazır: 6 lokasyon, 2 birim, 2 alt-ağaç kapsamı."
+                "Demo güvenlik yapısı hazır: 6 lokasyon, 3 birim, 3 kapsam, 3 FIGHT routing kuralı."
             )
         )
 
@@ -106,3 +121,18 @@ class Command(BaseCommand):
             include_descendants=True,
             active=True,
         )
+
+    @staticmethod
+    def _routing_rule(name, unit, stage, delay_sec, priority):
+        rule, _ = IncidentRoutingRule.objects.update_or_create(
+            security_unit=unit,
+            incident_type=Incident.TYPE_FIGHT,
+            routing_stage=stage,
+            active=True,
+            defaults={
+                "name": name,
+                "delay_sec": delay_sec,
+                "priority": priority,
+            },
+        )
+        return rule

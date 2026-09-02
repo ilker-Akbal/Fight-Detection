@@ -32,6 +32,7 @@
   data-events-stream-url="{% url 'dashboard:events_stream' %}"
   data-incident-video-template="{% url 'dashboard:incident_video' '__RUN__' '__CLIP__' %}"
   data-logo-url="{% static 'images/togu-logo.png' %}"
+  data-csrf-token="{{ csrf_token }}"
 >
   <section class="panel right-panel">
     <div class="panel__header">
@@ -131,6 +132,70 @@
           <img id="camera-modal-img" src="" alt="Büyütülmüş kamera görüntüsü" />
         </div>
       </div>
+    </div>
+
+    <div class="panel__header panel__header--spaced" id="operational-inbox-section">
+      <div>
+        <h2>Operasyonel Olay Kutusu</h2>
+        <p>Yalnızca aktif güvenlik birimlerinize route edilmiş açık görevler.</p>
+      </div>
+    </div>
+
+    <div class="incident-table-shell">
+      <table class="incident-table">
+        <thead>
+          <tr>
+            <th>Olay / Kamera</th>
+            <th>Lokasyon</th>
+            <th>Güvenlik Birimi</th>
+            <th>Aşama</th>
+            <th>Durum</th>
+            <th>Skor</th>
+            <th>Kanıt</th>
+            <th>İşlem</th>
+          </tr>
+        </thead>
+        <tbody id="operational-inbox-body">
+          {% for item in operational_inbox %}
+          <tr data-operational-route-id="{{ item.route_id }}">
+            <td>
+              <strong>{{ item.incident_type }} #{{ item.external_incident_id }}</strong><br />
+              <small>{{ item.camera_name }} / {{ item.camera_id }}</small>
+            </td>
+            <td>{{ item.location }}</td>
+            <td>{{ item.security_unit }}</td>
+            <td>{{ item.routing_stage }}</td>
+            <td>
+              <span class="status-badge status-other">{{ item.status }}</span><br />
+              {% if item.acknowledged_by %}<small>{{ item.acknowledged_by }}</small>{% endif %}
+            </td>
+            <td>{{ item.decision_score|floatformat:3 }}</td>
+            <td>
+              {% if item.evidence_url %}
+              <a href="{{ item.evidence_url }}" target="_blank" rel="noopener">Kanıtı Aç</a>
+              {% else %}-{% endif %}
+            </td>
+            <td>
+              {% if item.can_ack %}
+              <form method="post" action="{{ item.ack_url }}">
+                {% csrf_token %}
+                <input type="hidden" name="security_unit_id" value="{{ item.security_unit_id }}" />
+                <button type="submit" class="btn">Kabul Et</button>
+              </form>
+              {% elif item.can_resolve %}
+              <form method="post" action="{{ item.resolve_url }}">
+                {% csrf_token %}
+                <input type="text" name="resolution_note" maxlength="4000" placeholder="Çözüm notu" required />
+                <button type="submit" class="btn">Çözümle</button>
+              </form>
+              {% else %}-{% endif %}
+            </td>
+          </tr>
+          {% empty %}
+          <tr><td colspan="8" class="muted">Aktif route edilmiş olay bulunmuyor.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
     </div>
 
     <div class="panel__header panel__header--spaced" id="incident-section">
