@@ -1,23 +1,90 @@
 from __future__ import annotations
 
 import json
+import threading
+from collections import OrderedDict
 from pathlib import Path
 
 
-def read_jsonl(path: Path) -> list[dict]:
-    if not path.exists():
+JSONL_MAX_ROWS = 1000
+JSONL_MAX_BYTES = 2 * 1024 * 1024
+JSONL_CACHE_MAX_ENTRIES = 64
+_JSONL_CACHE: OrderedDict[tuple, tuple[dict, ...]] = OrderedDict()
+_JSONL_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: tuple) -> list[dict] | None:
+    with _JSONL_CACHE_LOCK:
+        rows = _JSONL_CACHE.get(key)
+        if rows is None:
+            return None
+        _JSONL_CACHE.move_to_end(key)
+        return [dict(row) for row in rows]
+
+
+def _cache_put(key: tuple, rows: list[dict]) -> None:
+    with _JSONL_CACHE_LOCK:
+        _JSONL_CACHE[key] = tuple(dict(row) for row in rows)
+        _JSONL_CACHE.move_to_end(key)
+        while len(_JSONL_CACHE) > JSONL_CACHE_MAX_ENTRIES:
+            _JSONL_CACHE.popitem(last=False)
+
+
+def read_jsonl(
+    path: Path,
+    *,
+    max_rows: int = JSONL_MAX_ROWS,
+    max_bytes: int = JSONL_MAX_BYTES,
+) -> list[dict]:
+    """Read only a bounded, complete tail of a JSONL file and cache by file stat."""
+    path = Path(path)
+    try:
+        stat = path.stat()
+    except OSError:
         return []
 
-    rows = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
+    max_rows = max(1, int(max_rows))
+    max_bytes = max(1024, int(max_bytes))
+    key = (
+        str(path.resolve()),
+        stat.st_mtime_ns,
+        stat.st_size,
+        max_rows,
+        max_bytes,
+    )
+    cached = _cache_get(key)
+    if cached is not None:
+        return cached
+
+    start = max(0, stat.st_size - max_bytes)
+    try:
+        with path.open("rb") as handle:
+            handle.seek(start)
+            data = handle.read(max_bytes)
+    except OSError:
+        return []
+
+    if start:
+        newline = data.find(b"\n")
+        data = b"" if newline < 0 else data[newline + 1 :]
+    lines = data.splitlines()
+    if data and not data.endswith((b"\n", b"\r")):
+        lines = lines[:-1]
+
+    rows_reversed = []
+    for raw_line in reversed(lines):
+        if not raw_line.strip():
+            continue
+        try:
+            row = json.loads(raw_line.decode("utf-8"))
+        except Exception:
+            continue
+        if isinstance(row, dict):
+            rows_reversed.append(row)
+        if len(rows_reversed) >= max_rows:
+            break
+    rows = list(reversed(rows_reversed))
+    _cache_put(key, rows)
     return rows
 
 

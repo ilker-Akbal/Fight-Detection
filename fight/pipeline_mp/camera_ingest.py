@@ -141,6 +141,8 @@ def run_camera_ingest_loop(
     file_fight_ordered = source_is_file and str(
         runtime.get("camera_ingest_file_fight_policy", "ordered")
     ).lower() == "ordered"
+    fight_policy = "ordered" if file_fight_ordered else "latest"
+    preview_policy = "latest"
 
     started = time.perf_counter()
     capture = None
@@ -163,6 +165,8 @@ def run_camera_ingest_loop(
         generation=int(generation),
         source=safe_source,
         source_is_file=int(source_is_file),
+        fight_policy=fight_policy,
+        preview_policy=preview_policy,
     )
 
     try:
@@ -183,6 +187,8 @@ def run_camera_ingest_loop(
                     generation=int(generation),
                     source=safe_source,
                     source_is_file=int(source_is_file),
+                    fight_policy=fight_policy,
+                    preview_policy=preview_policy,
                     source_fps=round(source_fps, 6),
                     source_frame_count=source_frame_count,
                 )
@@ -422,6 +428,9 @@ def run_camera_ingest_loop(
             frames_published_preview=frames_published_preview,
             frames_dropped_preview=frames_dropped_preview,
             reconnect_count=reconnect_count,
+            source_is_file=int(source_is_file),
+            fight_policy=fight_policy,
+            preview_policy=preview_policy,
             last_frame_seq=frame_seq,
             elapsed_sec=round(elapsed, 6),
             ingest_decode_fps=round(frames_decoded / elapsed, 6) if elapsed > 0 else 0.0,

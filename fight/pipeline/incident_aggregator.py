@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import os
 import json
 import shutil
-import subprocess
 import tempfile
 import threading
 import time
@@ -19,6 +17,12 @@ from fight.pipeline.incident_outbox import (
     IncidentOutboxEnvelope,
     append_envelope_durable,
     utc_iso_from_epoch,
+)
+from fight.pipeline.media_encoding import (
+    encode_h264_with_ffmpeg,
+    ffmpeg_path,
+    is_h264_video,
+    open_opencv_writer,
 )
 
 from fight.pipeline_mp.clip_overlay import draw_ai_clip_overlay
@@ -732,153 +736,95 @@ class IncidentAggregator:
             return False
 
         tmp_path = clip_path.with_name(f"{clip_path.stem}__ai_overlay_tmp.mp4")
-
         cap = None
         writer = None
+        temp_dir = None
 
         try:
-            cap = cv2.VideoCapture(str(clip_path))
-
-            if not cap.isOpened():
+            use_ffmpeg = ffmpeg_path() is not None
+            if not use_ffmpeg and is_h264_video(clip_path):
+                print(
+                    "[INCIDENT][WARN] ffmpeg unavailable; preserving existing H264 "
+                    f"incident without rewriting overlay clip={clip_path}",
+                    flush=True,
+                )
                 return False
 
+            cap = cv2.VideoCapture(str(clip_path))
+            if not cap.isOpened():
+                return False
             fps = cap.get(cv2.CAP_PROP_FPS)
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
             if not fps or fps <= 1:
                 fps = 16.0
-
             if width <= 0 or height <= 0:
                 return False
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(
-                str(tmp_path),
-                fourcc,
+            if use_ffmpeg:
+                temp_dir = tempfile.TemporaryDirectory()
+                render_path = Path(temp_dir.name) / "incident_overlay.avi"
+                codecs = ("MJPG", "XVID")
+            else:
+                render_path = tmp_path
+                codecs = ("avc1", "H264", "X264", "mp4v")
+
+            writer, selected_codec = open_opencv_writer(
+                render_path,
                 float(fps),
                 (width, height),
+                codecs,
             )
-
-            if not writer.isOpened():
+            if writer is None:
                 return False
 
-            pose_model = None
-            pose_model_loaded = False
-
-            try:
-                from ultralytics import YOLO
-
-                pose_model_path = os.getenv(
-                    "INCIDENT_POSE_MODEL",
-                    str(Path(__file__).resolve().parents[2] / "yolov8n-pose.pt"),
-                )
-
-                pose_model_file = Path(pose_model_path)
-
-                if pose_model_file.exists():
-                    pose_model = YOLO(str(pose_model_file))
-                    pose_model_loaded = True
-                    print(
-                        f"[INCIDENT][POSE] loaded pose model={pose_model_file}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[INCIDENT][WARN] pose model not found path={pose_model_file}",
-                        flush=True,
-                    )
-
-            except Exception as exc:
-                print(
-                    f"[INCIDENT][WARN] pose model load failed err={exc}",
-                    flush=True,
-                )
-                pose_model = None
-
             wrote_any = False
-            frame_index = 0
-
             while True:
                 ok, frame = cap.read()
-
                 if not ok or frame is None:
                     break
-
-                if pose_model is not None:
-                    try:
-                        pose_results = pose_model.predict(
-                            source=frame,
-                            conf=float(os.getenv("INCIDENT_POSE_CONF", "0.20")),
-                            iou=float(os.getenv("INCIDENT_POSE_IOU", "0.45")),
-                            imgsz=int(os.getenv("INCIDENT_POSE_IMGSZ", "640")),
-                            max_det=int(os.getenv("INCIDENT_POSE_MAX_DET", "8")),
-                            verbose=False,
-                        )
-
-                        if pose_results and pose_results[0] is not None:
-                            plotted = pose_results[0].plot()
-
-                            if plotted is not None:
-                                if plotted.shape[:2] != frame.shape[:2]:
-                                    plotted = cv2.resize(plotted, (frame.shape[1], frame.shape[0]))
-
-                                frame = plotted
-
-                    except Exception as exc:
-                        if frame_index == 0:
-                            print(
-                                f"[INCIDENT][WARN] pose draw failed err={exc}",
-                                flush=True,
-                            )
-
                 frame = draw_ai_clip_overlay(frame, meta)
                 writer.write(frame)
                 wrote_any = True
-                frame_index += 1
-
             cap.release()
             cap = None
-
             writer.release()
             writer = None
-
             if not wrote_any:
                 tmp_path.unlink(missing_ok=True)
                 return False
 
-            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+            if use_ffmpeg and not encode_h264_with_ffmpeg(
+                ["-i", str(render_path)],
+                tmp_path,
+            ):
                 tmp_path.unlink(missing_ok=True)
                 return False
-
+            if not use_ffmpeg and selected_codec.lower() not in {"avc1", "h264", "x264"}:
+                print(
+                    "[INCIDENT][WARN] ffmpeg unavailable; overlay uses "
+                    f"{selected_codec} with degraded browser compatibility",
+                    flush=True,
+                )
+            if not tmp_path.exists() or tmp_path.stat().st_size <= 0:
+                return False
             tmp_path.replace(clip_path)
-
             return clip_path.exists() and clip_path.stat().st_size > 0
-
         except Exception as exc:
             print(
                 f"[INCIDENT][WARN] ai overlay exception clip={clip_path} err={exc}",
                 flush=True,
             )
-
-            try:
-                if cap is not None:
-                    cap.release()
-            except Exception:
-                pass
-
-            try:
-                if writer is not None:
-                    writer.release()
-            except Exception:
-                pass
-
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-
             return False
+        finally:
+            if cap is not None:
+                cap.release()
+            if writer is not None:
+                writer.release()
+            if temp_dir is not None:
+                temp_dir.cleanup()
+            if tmp_path.exists() and tmp_path != clip_path:
+                tmp_path.unlink(missing_ok=True)
 
     def _concat_mp4s(self, clip_paths: List[str], out_path: Path) -> bool:
         valid = [str(Path(p)) for p in clip_paths if Path(p).exists()]
@@ -887,73 +833,38 @@ class IncidentAggregator:
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if len(valid) == 1:
-            try:
-                src = Path(valid[0])
-                if src.resolve() != out_path.resolve():
-                    shutil.copy2(src, out_path)
-                return out_path.exists() and out_path.stat().st_size > 0
-            except Exception:
-                pass
-
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg:
+        if ffmpeg_path():
             with tempfile.TemporaryDirectory() as td:
                 lst = Path(td) / "inputs.txt"
-
                 with open(lst, "w", encoding="utf-8") as f:
                     for p in valid:
                         safe_p = str(Path(p).resolve()).replace("'", r"'\''")
                         f.write(f"file '{safe_p}'\n")
-
-                cmd_copy = [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(lst),
-                    "-c",
-                    "copy",
-                    str(out_path),
-                ]
-                res = subprocess.run(
-                    cmd_copy,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
-                )
-                if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
+                if encode_h264_with_ffmpeg(
+                    [
+                        "-f",
+                        "concat",
+                        "-safe",
+                        "0",
+                        "-i",
+                        str(lst),
+                    ],
+                    out_path,
+                ):
                     return True
 
-                cmd_reencode = [
-                    ffmpeg,
-                    "-y",
-                    "-f",
-                    "concat",
-                    "-safe",
-                    "0",
-                    "-i",
-                    str(lst),
-                    "-c:v",
-                    "libx264",
-                    "-pix_fmt",
-                    "yuv420p",
-                    "-movflags",
-                    "+faststart",
-                    "-an",
-                    str(out_path),
-                ]
-                res = subprocess.run(
-                    cmd_reencode,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    check=False,
+        if len(valid) == 1 and is_h264_video(valid[0]):
+            try:
+                src = Path(valid[0])
+                if src.resolve() != out_path.resolve():
+                    shutil.copy2(src, out_path)
+                print(
+                    "[INCIDENT][WARN] ffmpeg unavailable; preserving existing H264 final clip",
+                    flush=True,
                 )
-                if res.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0:
-                    return True
+                return out_path.exists() and out_path.stat().st_size > 0
+            except OSError:
+                pass
 
         return self._concat_with_opencv(valid, out_path)
 
@@ -989,9 +900,13 @@ class IncidentAggregator:
             if target_fps is None:
                 target_fps = 16.0
 
-            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-            writer = cv2.VideoWriter(str(out_path), fourcc, float(target_fps), target_size)
-            if not writer.isOpened():
+            writer, selected_codec = open_opencv_writer(
+                out_path,
+                float(target_fps),
+                target_size,
+                ("avc1", "H264", "X264", "mp4v"),
+            )
+            if writer is None:
                 return False
 
             wrote_any = False
@@ -1016,6 +931,13 @@ class IncidentAggregator:
 
             writer.release()
             writer = None
+
+            if selected_codec.lower() not in {"avc1", "h264", "x264"}:
+                print(
+                    "[INCIDENT][WARN] ffmpeg unavailable; final incident uses "
+                    f"{selected_codec} with degraded browser compatibility",
+                    flush=True,
+                )
 
             return wrote_any and out_path.exists() and out_path.stat().st_size > 0
 

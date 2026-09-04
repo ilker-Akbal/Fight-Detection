@@ -6,12 +6,13 @@ import uuid
 from datetime import timedelta
 from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.management import call_command
-from django.db import close_old_connections
+from django.db import OperationalError, close_old_connections
 from django.test import Client, TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
@@ -305,6 +306,31 @@ class IncidentIngestTests(Phase8FixtureMixin, TestCase):
         dispatcher_tick(self.outbox)
         self.assertEqual(IncidentRoute.objects.filter(incident=incident, security_unit=self.block_unit).count(), 1)
 
+    def test_18b_transient_database_error_does_not_advance_cursor(self):
+        envelope = self.envelope()
+        self.append(envelope)
+        with patch(
+            "incidents.services.ingest.ingest_envelope",
+            side_effect=OperationalError("database unavailable"),
+        ):
+            result = consume_outbox(self.outbox)
+        cursor = IncidentIngestCursor.objects.get()
+        self.assertEqual(cursor.byte_offset, 0)
+        self.assertEqual(result["deferred"], 1)
+        self.assertEqual(result["invalid"], 0)
+        self.assertFalse(IncidentIngestRecord.objects.exists())
+
+    def test_18c_unexpected_failure_does_not_advance_cursor(self):
+        self.append(self.envelope())
+        with patch(
+            "incidents.services.ingest.ingest_envelope",
+            side_effect=ValueError("unexpected application failure"),
+        ):
+            result = consume_outbox(self.outbox)
+        self.assertEqual(IncidentIngestCursor.objects.get().byte_offset, 0)
+        self.assertEqual(result["deferred"], 1)
+        self.assertEqual(result["invalid"], 0)
+
 
 class IncidentRoutingTests(Phase8FixtureMixin, TestCase):
     def test_19_stage0_routes_to_block_unit(self):
@@ -596,6 +622,28 @@ class IncidentViewTests(Phase8FixtureMixin, TestCase):
         response = self.client.get(reverse("dashboard:incident_evidence", args=[incident.pk]))
         self.assertEqual(response.status_code, 200)
         self.assertIn("no-store", response["Cache-Control"])
+
+    def test_56b_authorized_evidence_supports_bounded_range(self):
+        incident = self.ingest()
+        self.client.force_login(self.block_user)
+        response = self.client.get(
+            reverse("dashboard:incident_evidence", args=[incident.pk]),
+            HTTP_RANGE="bytes=2-5",
+        )
+        self.assertEqual(response.status_code, 206)
+        self.assertEqual(response["Content-Range"], "bytes 2-5/8")
+        self.assertEqual(response["Content-Length"], "4")
+        self.assertEqual(b"".join(response.streaming_content), b"iden")
+
+    def test_56c_unsatisfiable_evidence_range_returns_416(self):
+        incident = self.ingest()
+        self.client.force_login(self.block_user)
+        response = self.client.get(
+            reverse("dashboard:incident_evidence", args=[incident.pk]),
+            HTTP_RANGE="bytes=80-90",
+        )
+        self.assertEqual(response.status_code, 416)
+        self.assertEqual(response["Content-Range"], "bytes */8")
 
     def test_57_superuser_evidence_bypass(self):
         incident = self.ingest()

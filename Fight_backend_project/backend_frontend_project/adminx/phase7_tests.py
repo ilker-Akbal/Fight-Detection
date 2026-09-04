@@ -1,4 +1,8 @@
 from io import StringIO
+import shutil
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.conf import settings
@@ -7,7 +11,8 @@ from django.core.management import call_command
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, connection, transaction
 from django.db.models.deletion import ProtectedError
-from django.test import Client, TestCase, override_settings
+from django.http import Http404
+from django.test import Client, RequestFactory, TestCase, override_settings
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
@@ -438,3 +443,124 @@ class CompatibilityAndSeedTests(TestCase):
         SecurityUnit.objects.create(name="HQ Unit", code="hq-unit", location=location)
         with self.assertRaises(ProtectedError):
             location.delete()
+
+
+class CentralizedFightPreviewTests(TestCase):
+    def setUp(self):
+        self.temp_dir = Path(tempfile.mkdtemp(prefix="preview-tests-"))
+        self.media_root = self.temp_dir / "media"
+        self.run_dir = self.media_root / "pipeline_runs" / "active-run"
+        self.preview = self.run_dir / "previews" / "cam-preview.jpg"
+        self.preview.parent.mkdir(parents=True)
+        self.preview.write_bytes(b"jpeg-frame")
+        self.settings_override = self.settings(
+            MEDIA_ROOT=self.media_root,
+            PIPELINE_OUTPUT_BASE=self.media_root / "pipeline_runs",
+        )
+        self.settings_override.enable()
+        self.addCleanup(self.settings_override.disable)
+        self.addCleanup(shutil.rmtree, self.temp_dir, True)
+        self.user = User.objects.create_superuser(
+            username="preview-admin",
+            password="test-pass",
+            email="preview@example.test",
+        )
+        self.camera = Camera.objects.create(
+            name="Preview",
+            camera_id="cam-preview",
+            source="rtsp://physical-camera/live",
+        )
+        self.client.force_login(self.user)
+
+    def active(self, run_id="run-1", run_dir=None, runtime_state="RUNNING"):
+        return SimpleNamespace(
+            run_id=run_id,
+            run_dir=run_dir or self.run_dir,
+            runtime_state=runtime_state,
+            process=None,
+            runtime_pid=1234,
+            started_at=1.0,
+        )
+
+    def test_49_no_active_run_never_returns_historical_preview(self):
+        from guvenlik.views import _find_preview_path
+
+        with patch("guvenlik.views.get_active_run", return_value=None):
+            self.assertIsNone(_find_preview_path(self.camera.camera_id))
+
+    def test_50_active_preview_resolves_only_from_that_run(self):
+        with patch("guvenlik.views.get_active_run", return_value=self.active()):
+            from guvenlik.views import _find_preview_path
+
+            self.assertEqual(_find_preview_path(self.camera.camera_id), self.preview.resolve())
+
+    def test_51_stream_generator_terminates_when_runtime_stops(self):
+        from guvenlik.views import _preview_file_mjpeg_generator
+
+        active = self.active()
+        with patch(
+            "guvenlik.views.get_active_run",
+            side_effect=[active, None],
+        ), patch("guvenlik.views.PREVIEW_RUNTIME_CHECK_INTERVAL_SEC", 0.0):
+            generator = _preview_file_mjpeg_generator(
+                self.camera.camera_id,
+                (active.run_id, str(self.run_dir.resolve())),
+                self.preview.resolve(),
+            )
+            self.assertIn(b"jpeg-frame", next(generator))
+            with self.assertRaises(StopIteration):
+                next(generator)
+
+    def test_52_stream_generator_terminates_when_active_run_changes(self):
+        from guvenlik.views import _preview_file_mjpeg_generator
+
+        active = self.active()
+        changed = self.active(run_id="run-2", run_dir=self.run_dir.parent / "other-run")
+        with patch(
+            "guvenlik.views.get_active_run",
+            side_effect=[active, changed],
+        ), patch("guvenlik.views.PREVIEW_RUNTIME_CHECK_INTERVAL_SEC", 0.0):
+            generator = _preview_file_mjpeg_generator(
+                self.camera.camera_id,
+                (active.run_id, str(self.run_dir.resolve())),
+                self.preview.resolve(),
+            )
+            next(generator)
+            with self.assertRaises(StopIteration):
+                next(generator)
+
+    def test_53_django_stream_never_opens_physical_camera(self):
+        from guvenlik.views import stream
+
+        request = RequestFactory().get(
+            reverse("dashboard:stream", args=[self.camera.camera_id])
+        )
+        request.user = self.user
+        with patch("guvenlik.views.get_active_run", return_value=None), patch(
+            "cv2.VideoCapture"
+        ) as video_capture:
+            with self.assertRaises(Http404):
+                stream(request, self.camera.camera_id)
+        video_capture.assert_not_called()
+
+    def test_54_live_report_does_not_scan_historical_runs(self):
+        from guvenlik.views import _empty_report, _pipeline_report
+
+        active = self.active()
+        active_report = _empty_report()
+        active_report.update({"running": True, "run_name": "active-run"})
+        with patch(
+            "guvenlik.views.get_pipeline_status",
+            return_value={
+                "available": True,
+                "runtime_state": "RUNNING",
+                "supervisor_state": "RUNNING",
+                "run_id": active.run_id,
+                "runtime_exit_code": None,
+            },
+        ), patch("guvenlik.views.get_active_run", return_value=active), patch(
+            "guvenlik.views._read_run_report", return_value=active_report
+        ), patch("guvenlik.views._run_dirs") as run_dirs:
+            report = _pipeline_report()
+        run_dirs.assert_not_called()
+        self.assertTrue(report["running"])

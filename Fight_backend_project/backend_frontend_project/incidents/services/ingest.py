@@ -213,16 +213,34 @@ def retry_failed_records(limit: int = 100) -> int:
             if incident is not None and status == IncidentIngestRecord.STATUS_IMPORTED:
                 imported += 1
         except Exception as exc:
-            record.attempts += 1
-            record.error_code = "retry_failed"
-            record.error_message = str(exc)[:500]
-            record.save(update_fields=["attempts", "error_code", "error_message", "updated_at"])
+            try:
+                record.attempts += 1
+                record.error_code = "retry_failed"
+                record.error_message = str(exc)[:500]
+                record.save(
+                    update_fields=[
+                        "attempts",
+                        "error_code",
+                        "error_message",
+                        "updated_at",
+                    ]
+                )
+            except Exception:
+                # Infrastructure may still be unavailable. Preserve RETRYABLE
+                # and let a later dispatcher tick try the record again.
+                pass
     return imported
 
 
 def consume_outbox(path: str | Path, *, max_records: int = 500) -> dict:
     source = Path(path).resolve()
-    result = {"consumed": 0, "imported": 0, "invalid": 0, "retryable": 0}
+    result = {
+        "consumed": 0,
+        "imported": 0,
+        "invalid": 0,
+        "retryable": 0,
+        "deferred": 0,
+    }
     if not source.exists() or not source.is_file():
         return result
 
@@ -252,32 +270,52 @@ def consume_outbox(path: str | Path, *, max_records: int = 500) -> dict:
             next_offset = handle.tell()
 
             event_id = ""
+            permanent_invalid = False
             try:
                 envelope = json.loads(line.decode("utf-8"))
-                incident, status = ingest_envelope(
-                    envelope,
-                    source_identifier=source_identifier,
-                    byte_offset=line_offset,
-                )
+                _validate_envelope(envelope)
+                _parse_timestamp(envelope["detected_at"], "detected_at")
+                _parse_timestamp(envelope["finalized_at"], "finalized_at")
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+                try:
+                    _record_malformed(source_identifier, line_offset, line, str(exc))
+                except Exception:
+                    result["deferred"] += 1
+                    break
+                permanent_invalid = True
+                result["invalid"] += 1
+            else:
+                try:
+                    incident, status = ingest_envelope(
+                        envelope,
+                        source_identifier=source_identifier,
+                        byte_offset=line_offset,
+                    )
+                except Exception:
+                    # Database/infrastructure and unexpected application failures
+                    # must leave the cursor on this record for a later tick.
+                    result["deferred"] += 1
+                    break
                 event_id = str(envelope.get("event_id") or "")
                 if incident is not None:
                     result["imported"] += 1
                 elif status == IncidentIngestRecord.STATUS_RETRYABLE:
                     result["retryable"] += 1
-            except Exception as exc:
-                _record_malformed(source_identifier, line_offset, line, str(exc))
-                result["invalid"] += 1
 
-            with transaction.atomic():
-                cursor = IncidentIngestCursor.objects.select_for_update().get(
-                    source_identifier=source_identifier
-                )
-                if cursor.byte_offset != line_offset:
-                    break
-                cursor.byte_offset = next_offset
-                cursor.last_event_id = event_id[:100]
-                cursor.file_identity = identity
-                cursor.save()
+            try:
+                with transaction.atomic():
+                    cursor = IncidentIngestCursor.objects.select_for_update().get(
+                        source_identifier=source_identifier
+                    )
+                    if cursor.byte_offset != line_offset:
+                        break
+                    cursor.byte_offset = next_offset
+                    cursor.last_event_id = "" if permanent_invalid else event_id[:100]
+                    cursor.file_identity = identity
+                    cursor.save()
+            except Exception:
+                result["deferred"] += 1
+                break
             result["consumed"] += 1
     return result
 

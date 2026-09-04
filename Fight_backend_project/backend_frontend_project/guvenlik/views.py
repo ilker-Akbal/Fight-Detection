@@ -7,7 +7,6 @@ import re
 import time
 from pathlib import Path
 
-import cv2
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -34,6 +33,7 @@ from services.incident_access import (
     get_user_incident_inbox,
     user_can_view_incident,
 )
+from services.http_range import range_file_response
 from services.pipeline_bridge.fight_runner import (
     get_active_run,
     get_pipeline_status,
@@ -48,6 +48,8 @@ MAX_HISTORY_INCIDENTS = 200
 
 SYSTEM_NOTICE_CACHE_KEY = "dashboard_system_notice"
 SYSTEM_NOTICE_TTL_SECONDS = 30
+PREVIEW_ACTIVE_RUNTIME_STATES = {"STARTING", "RUNNING", "STOPPING", "BACKOFF"}
+PREVIEW_RUNTIME_CHECK_INTERVAL_SEC = 0.25
 
 
 def _set_system_notice(kind: str, title: str, message: str):
@@ -395,18 +397,21 @@ def _merge_history_reports(active_report: dict | None, history_reports: list[dic
 
 def _pipeline_report():
     control_status = get_pipeline_status()
-    active = get_active_run() if control_status.get("available") else None
+    active = get_active_run(control_status) if control_status.get("available") else None
 
     active_report = None
     active_run_dir = None
+    active_is_live = False
 
     if active is not None:
         active_run_dir = Path(active.run_dir)
+        active_is_live = active.runtime_state in PREVIEW_ACTIVE_RUNTIME_STATES
+        if active.process is not None and active.process.poll() is not None:
+            active_is_live = False
 
         active_report = _read_run_report(
             active_run_dir,
-            running=active.runtime_state
-            in {"STARTING", "RUNNING", "STOPPING", "BACKOFF"},
+            running=active_is_live,
             pid=active.runtime_pid,
             started_at=active.started_at,
             return_code=control_status.get("runtime_exit_code"),
@@ -414,20 +419,21 @@ def _pipeline_report():
 
     history_reports = []
 
-    for run_dir in _run_dirs():
-        if active_run_dir is not None and run_dir.resolve() == active_run_dir.resolve():
-            continue
+    if not active_is_live:
+        for run_dir in _run_dirs():
+            if active_run_dir is not None and run_dir.resolve() == active_run_dir.resolve():
+                continue
 
-        rep = _read_run_report(
-            run_dir,
-            running=False,
-            pid=None,
-            started_at=None,
-            return_code=None,
-        )
+            rep = _read_run_report(
+                run_dir,
+                running=False,
+                pid=None,
+                started_at=None,
+                return_code=None,
+            )
 
-        if rep:
-            history_reports.append(rep)
+            if rep:
+                history_reports.append(rep)
 
     merged = _merge_history_reports(active_report, history_reports)
 
@@ -942,88 +948,47 @@ def events_stream(request):
     return response
 
 
-def _is_file_source(source: str) -> bool:
-    s = str(source).strip()
-
-    if not s:
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
         return False
 
-    if s.isdigit():
-        return False
 
-    low = s.lower()
-
-    if low.startswith(("rtsp://", "rtmp://", "http://", "https://", "udp://", "tcp://")):
-        return False
-
-    return Path(s).exists()
-
-
-def _open_capture(source: str):
-    if source is None:
+def _active_preview_context(camera_id: str):
+    active = get_active_run()
+    if active is None or active.runtime_state not in PREVIEW_ACTIVE_RUNTIME_STATES:
+        return None
+    if active.process is not None and active.process.poll() is not None:
         return None
 
-    source = str(source).strip()
+    runs_root = Path(
+        getattr(settings, "PIPELINE_OUTPUT_BASE", _pipeline_runs_root())
+    ).resolve()
+    run_dir = Path(active.run_dir).resolve()
+    if not _path_is_within(run_dir, runs_root):
+        return None
+    preview_root = (run_dir / "previews").resolve()
+    preview_path = (preview_root / f"{camera_id}.jpg").resolve()
+    if not _path_is_within(preview_path, preview_root):
+        return None
 
-    if source.isdigit():
-        cap = cv2.VideoCapture(int(source), cv2.CAP_DSHOW)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        return cap
-
-    cap = cv2.VideoCapture(source)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-    return cap
-
-
-def _mjpeg_generator(source: str):
-    cap = _open_capture(source)
-
-    if cap is None or not cap.isOpened():
-        return
-
-    is_file = _is_file_source(source)
-
-    try:
-        while True:
-            ok, frame = cap.read()
-
-            if not ok or frame is None:
-                if is_file:
-                    break
-
-                time.sleep(0.05)
-                continue
-
-            ok, buffer = cv2.imencode(".jpg", frame)
-
-            if not ok:
-                if is_file:
-                    break
-
-                time.sleep(0.05)
-                continue
-
-            frame_bytes = buffer.tobytes()
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame_bytes
-                + b"\r\n"
-            )
-
-            time.sleep(0.03)
-
-    finally:
-        cap.release()
+    token = (str(active.run_id or ""), str(run_dir))
+    return token, preview_path
 
 
-def _preview_file_mjpeg_generator(preview_path: Path):
+def _preview_file_mjpeg_generator(camera_id: str, run_token, preview_path: Path):
     """Fan out the ingest-owned JPEG without opening the physical camera."""
     last_signature = None
+    next_runtime_check = 0.0
     while True:
+        monotonic_now = time.monotonic()
+        if monotonic_now >= next_runtime_check:
+            current = _active_preview_context(camera_id)
+            if current is None or current[0] != run_token:
+                return
+            next_runtime_check = monotonic_now + PREVIEW_RUNTIME_CHECK_INTERVAL_SEC
         try:
             stat = preview_path.stat()
             signature = (stat.st_mtime_ns, stat.st_size)
@@ -1048,42 +1013,27 @@ def _preview_file_mjpeg_generator(preview_path: Path):
 def stream(request, camera_id):
     _make_session_readonly(request)
 
-    camera = get_object_or_404(
+    get_object_or_404(
         _camera_queryset_for_user(request.user, active_only=True),
         camera_id=camera_id,
     )
 
-    preview_path = _find_preview_path(camera_id)
-    if preview_path is not None:
-        return StreamingHttpResponse(
-            _preview_file_mjpeg_generator(preview_path),
-            content_type="multipart/x-mixed-replace; boundary=frame",
-        )
-
-    cap = _open_capture(camera.source)
-
-    if cap is None or not cap.isOpened():
-        if cap is not None:
-            cap.release()
-
-        raise Http404("Kamera akışı açılamadı")
-
-    cap.release()
-
+    context = _active_preview_context(camera_id)
+    if context is None or not context[1].is_file():
+        raise Http404("Aktif kamera preview bulunamadı")
+    run_token, preview_path = context
     return StreamingHttpResponse(
-        _mjpeg_generator(camera.source),
+        _preview_file_mjpeg_generator(camera_id, run_token, preview_path),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
 def _find_preview_path(camera_id: str) -> Path | None:
-    for run_dir in _run_dirs(limit=20):
-        preview_path = run_dir / "previews" / f"{camera_id}.jpg"
-
-        if preview_path.exists() and preview_path.is_file():
-            return preview_path
-
-    return None
+    context = _active_preview_context(camera_id)
+    if context is None:
+        return None
+    preview_path = context[1]
+    return preview_path if preview_path.is_file() else None
 
 
 @never_cache
@@ -1135,54 +1085,6 @@ def _can_access_incident_clip(user, run_name, clip_name) -> bool:
             return True
 
     return False
-
-
-def _range_file_response(request, file_path: Path, content_type: str):
-    """
-    HTML5 video player için Range request desteği.
-    Chrome/Edge/Safari video preload ve seek sırasında Range ister.
-    """
-    file_size = file_path.stat().st_size
-    range_header = request.headers.get("Range", "").strip()
-
-    if not range_header:
-        response = FileResponse(open(file_path, "rb"), content_type=content_type)
-        response["Content-Length"] = str(file_size)
-        response["Accept-Ranges"] = "bytes"
-        response["Cache-Control"] = "no-cache"
-        return response
-
-    match = re.match(r"bytes=(\d+)-(\d*)", range_header)
-
-    if not match:
-        response = FileResponse(open(file_path, "rb"), content_type=content_type)
-        response["Content-Length"] = str(file_size)
-        response["Accept-Ranges"] = "bytes"
-        response["Cache-Control"] = "no-cache"
-        return response
-
-    start = int(match.group(1))
-    end_raw = match.group(2)
-    end = int(end_raw) if end_raw else file_size - 1
-
-    if start >= file_size:
-        response = HttpResponse(status=416)
-        response["Content-Range"] = f"bytes */{file_size}"
-        return response
-
-    end = min(end, file_size - 1)
-    length = end - start + 1
-
-    with open(file_path, "rb") as f:
-        f.seek(start)
-        data = f.read(length)
-
-    response = HttpResponse(data, status=206, content_type=content_type)
-    response["Content-Length"] = str(length)
-    response["Content-Range"] = f"bytes {start}-{end}/{file_size}"
-    response["Accept-Ranges"] = "bytes"
-    response["Cache-Control"] = "no-cache"
-    return response
 
 
 def _incident_action_response(request, result: dict, success_message: str):
@@ -1252,11 +1154,14 @@ def incident_evidence(request, pk):
     if evidence_path is None:
         raise Http404("Kanıt bulunamadı")
     content_type, _ = mimetypes.guess_type(str(evidence_path))
-    response = FileResponse(open(evidence_path, "rb"), content_type=content_type or "video/mp4")
     safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", evidence_path.name)
-    response["Content-Disposition"] = f'inline; filename="{safe_name}"'
-    response["Cache-Control"] = "private, no-store"
-    return response
+    return range_file_response(
+        request,
+        evidence_path,
+        content_type or "video/mp4",
+        cache_control="private, no-store",
+        content_disposition=f'inline; filename="{safe_name}"',
+    )
 
 
 @never_cache
@@ -1273,15 +1178,20 @@ def incident_video(request, run_name, clip_name):
     if not _can_access_incident_clip(request.user, run_name, safe_clip_name):
         raise Http404("Incident clip bulunamadı")
 
+    runs_root = (Path(settings.MEDIA_ROOT) / "pipeline_runs").resolve()
     clip_path = (
         Path(settings.MEDIA_ROOT)
         / "pipeline_runs"
         / str(run_name)
         / "incidents"
         / safe_clip_name
-    )
+    ).resolve()
 
-    if not clip_path.exists() or not clip_path.is_file():
+    if (
+        not _path_is_within(clip_path, runs_root)
+        or not clip_path.exists()
+        or not clip_path.is_file()
+    ):
         raise Http404("Incident clip bulunamadı")
 
     content_type, _ = mimetypes.guess_type(str(clip_path))
@@ -1289,7 +1199,7 @@ def incident_video(request, run_name, clip_name):
     if not content_type:
         content_type = "video/mp4"
 
-    return _range_file_response(request, clip_path, content_type)
+    return range_file_response(request, clip_path, content_type)
 
 def _make_session_readonly(request):
     try:

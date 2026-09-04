@@ -521,12 +521,12 @@ def get_pipeline_status() -> dict:
         }
 
 
-def get_active_run() -> ActiveRun | None:
+def get_active_run(status: dict | None = None) -> ActiveRun | None:
     if _control_mode() == "direct":
         from .runtime_state import runtime
 
         return runtime.get()
-    status = get_pipeline_status()
+    status = status or get_pipeline_status()
     if not status.get("available"):
         return None
     return _parse_active_from_status(status)
