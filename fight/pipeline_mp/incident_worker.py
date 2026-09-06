@@ -86,6 +86,7 @@ def incident_process_main(
 
     try:
         while not stop_event.is_set() or not incident_queue.empty():
+            agg.raise_if_failed()
             try:
                 msg = incident_queue.get(timeout=0.5)
             except queue.Empty:
@@ -160,6 +161,9 @@ def incident_process_main(
                         "error": str(exc),
                     },
                 )
+                if isinstance(exc, OSError):
+                    health.emit("process_error", force=True, detail="incident_persistence_failed")
+                    raise
 
             finally:
                 try:
@@ -168,10 +172,7 @@ def incident_process_main(
                     pass
 
     finally:
-        try:
-            agg.close_all()
-        except Exception:
-            pass
+        agg.close_all()
 
         _report(
             report_queue,

@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import Callable
 
 from .camera_state import DesiredCameraStateStore
+from .locking import SingletonLock
+from fight.operations import atomic_json, DiskMonitor, read_small_json
 
 
 STOPPED = "STOPPED"
@@ -73,6 +75,8 @@ class SupervisorConfig:
     restart_backoff_sec: float = 3.0
     monitor_interval_sec: float = 0.25
     health_snapshot_stale_sec: float = 10.0
+    event_log_max_bytes: int = 8 * 1024**2
+    event_log_backups: int = 3
 
     @classmethod
     def from_env(cls) -> "SupervisorConfig":
@@ -93,6 +97,8 @@ class SupervisorConfig:
         )
         return cls(
             repo_root=repo_root,
+            event_log_max_bytes=max(1024, int(os.getenv("SUPERVISOR_EVENT_LOG_MAX_BYTES", str(8 * 1024**2)))),
+            event_log_backups=max(1, min(20, int(os.getenv("SUPERVISOR_EVENT_LOG_BACKUPS", "3")))),
             state_dir=state_dir,
             allowed_config_dirs=allowed,
             stop_grace_sec=float(os.getenv("SUPERVISOR_STOP_GRACE_SEC", "8")),
@@ -134,6 +140,11 @@ class RuntimeSupervisor:
         self._pid_exists = pid_exists
         self._platform_name = platform_name or os.name
         self._lock = threading.RLock()
+        self._disk_monitor = DiskMonitor({
+            "disk_warning_bytes": os.getenv("DISK_WARNING_BYTES", str(5 * 1024**3)),
+            "disk_critical_bytes": os.getenv("DISK_CRITICAL_BYTES", str(1024**3)),
+            "disk_check_interval_sec": os.getenv("DISK_CHECK_INTERVAL_SEC", "30"),
+        })
         self._child = None
         self._stdout_handle = None
         self._stderr_handle = None
@@ -183,12 +194,7 @@ class RuntimeSupervisor:
 
     def _persist(self) -> None:
         payload = dict(self._state)
-        temporary = self.state_path.with_suffix(".json.tmp")
-        temporary.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.state_path)
+        atomic_json(self.state_path, payload)
 
     def _record(self, detail: str, **extra) -> None:
         row = {
@@ -199,8 +205,18 @@ class RuntimeSupervisor:
             "run_id": self._state.get("run_id"),
         }
         row.update(extra)
-        with open(self.telemetry_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        try:
+            if self.telemetry_path.exists() and self.telemetry_path.stat().st_size >= self.config.event_log_max_bytes:
+                for index in range(self.config.event_log_backups, 0, -1):
+                    source = (self.telemetry_path if index == 1 else
+                              self.telemetry_path.with_suffix(f".jsonl.{index - 1}"))
+                    target = self.telemetry_path.with_suffix(f".jsonl.{index}")
+                    if source.exists():
+                        source.replace(target)
+            with open(self.telemetry_path, "a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            self._state["operational_error"] = {"reason": "supervisor_log_write_failed", "errno": exc.errno}
 
     def _reconcile_persisted_state(self) -> None:
         if not self.state_path.exists():
@@ -308,12 +324,7 @@ class RuntimeSupervisor:
         launch_path = requested_path.with_name(
             f"{requested_path.stem}.supervisor-{run_id}{requested_path.suffix}"
         )
-        temporary = launch_path.with_suffix(launch_path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(launch_payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(launch_path)
+        atomic_json(launch_path, launch_payload)
         try:
             launch_path.chmod(0o600)
         except OSError:
@@ -340,6 +351,10 @@ class RuntimeSupervisor:
                 setattr(self, attr, None)
 
     def _launch_locked(self, config_path: str | Path, *, is_restart: bool) -> dict:
+        with SingletonLock(self.config.state_dir / "maintenance.lock"):
+            return self._launch_under_maintenance_lock(config_path, is_restart=is_restart)
+
+    def _launch_under_maintenance_lock(self, config_path: str | Path, *, is_restart: bool) -> dict:
         requested_path, payload = self._validate_config_path(config_path)
         run_id = uuid.uuid4().hex
         launch_path = self._make_launch_config(requested_path, payload, run_id)
@@ -619,9 +634,18 @@ class RuntimeSupervisor:
 
     def _monitor_loop(self) -> None:
         while not self._monitor_stop.wait(self.config.monitor_interval_sec):
-            with self._lock:
-                if self._state["runtime_state"] != STOPPING:
-                    self._refresh_child_locked()
+            try:
+                with self._lock:
+                    if self._state["runtime_state"] != STOPPING:
+                        self._refresh_child_locked()
+                    if self._state.get("operational_error"):
+                        self._persist()
+                        self._state.pop("operational_error", None)
+            except OSError as exc:
+                with self._lock:
+                    self._state["operational_error"] = {"reason": "supervisor_write_failed", "errno": exc.errno}
+                if self._monitor_stop.wait(5.0):
+                    return
 
     def _health_snapshot_locked(self) -> dict:
         runtime_state = str(self._state.get("runtime_state") or STOPPED)
@@ -732,6 +756,7 @@ class RuntimeSupervisor:
                 "snapshot_age_sec": round(age, 3) if age != float("inf") else None,
                 "runtime_health": runtime_health,
                 "snapshot_runtime_health": reported_health,
+                "disk": payload.get("disk", {}),
                 "reason": "health_snapshot_stale" if stale else str(payload.get("reason") or ""),
                 "updated_at": payload.get("updated_at"),
                 "camera_count": len(cameras),
@@ -764,6 +789,14 @@ class RuntimeSupervisor:
             if self._state["runtime_state"] != STOPPING:
                 self._refresh_child_locked()
             result = dict(self._state)
+            result["disk"] = self._disk_monitor.sample({"supervisor": self.config.state_dir})
+            try:
+                cleanup = read_small_json(self.config.state_dir / "cleanup_status.json")
+                result["cleanup"] = {key: cleanup[key] for key in (
+                    "checked_at", "scanned", "removed", "bytes", "protected", "errors",
+                    "scan_limited", "delete_limited", "evidence_enabled") if key in cleanup}
+            except (OSError, ValueError):
+                result["cleanup"] = {"available": False}
             try:
                 desired = DesiredCameraStateStore(self.desired_camera_path).load()
                 result["desired_camera_revision"] = desired["revision"]

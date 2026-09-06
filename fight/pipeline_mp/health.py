@@ -241,6 +241,7 @@ class HealthRegistry:
         self.transitions = deque(maxlen=max(1, int(transition_limit)))
         self.runtime_health = STARTING
         self.runtime_reason = "startup_grace"
+        self.disk = {}
 
     def register_worker(self, component: str) -> None:
         now = self.monotonic()
@@ -579,6 +580,8 @@ class HealthRegistry:
             aggregate, aggregate_reason = DEGRADED, "component_degraded"
         else:
             aggregate, aggregate_reason = HEALTHY, "critical_components_healthy"
+        if aggregate == HEALTHY and self.disk.get("state") in {"WARNING", "CRITICAL", "UNKNOWN"}:
+            aggregate, aggregate_reason = DEGRADED, "disk_pressure"
         if (self.runtime_health, self.runtime_reason) != (aggregate, aggregate_reason):
             self.transitions.append(
                 {
@@ -661,6 +664,7 @@ class HealthRegistry:
             "schema_version": 1,
             "run_id": str(run_id),
             "runtime_health": self.runtime_health,
+            "disk": self.disk,
             "reason": self.runtime_reason,
             "updated_at": utc_now(),
             "written_wall_time": time.time(),

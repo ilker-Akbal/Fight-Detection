@@ -7,6 +7,12 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from fight.operations import fsync_directory
+from fight.runtime_supervisor.locking import SingletonLock, SingletonLockError
+
+
+class DurableWriteError(OSError):
+    """Incident persistence did not complete; callers must not report success."""
 
 
 OUTBOX_SCHEMA_VERSION = 1
@@ -50,10 +56,39 @@ def append_envelope_durable(path: str | Path, envelope: IncidentOutboxEnvelope) 
     """Append one complete JSONL record and force it to stable storage."""
 
     target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     payload = (json.dumps(envelope.as_dict(), ensure_ascii=False) + "\n").encode("utf-8")
 
-    with target.open("ab", buffering=0) as handle:
-        handle.write(payload)
-        handle.flush()
-        os.fsync(handle.fileno())
+    lock = SingletonLock(target.with_suffix(target.suffix + ".writer.lock"))
+    deadline = time.monotonic() + 5.0
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        while True:
+            try:
+                lock.acquire()
+                break
+            except SingletonLockError:
+                if time.monotonic() >= deadline:
+                    raise DurableWriteError("outbox_writer_busy")
+                time.sleep(0.05)
+        with target.open("a+b", buffering=0) as handle:
+            # Preserve all bytes/offsets after a crash. Separate a partial tail
+            # from the new envelope; the dispatcher records malformed lines
+            # using its existing cursor and invalid-record semantics.
+            handle.seek(0, os.SEEK_END)
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    payload = b"\n" + payload
+            remaining = memoryview(payload)
+            while remaining:
+                written = handle.write(remaining)
+                if not written:
+                    raise DurableWriteError("outbox_short_write")
+                remaining = remaining[written:]
+            handle.flush()
+            os.fsync(handle.fileno())
+        fsync_directory(target.parent)
+    except OSError as exc:
+        raise DurableWriteError(exc.errno, "outbox_persistence_failed") from exc
+    finally:
+        lock.release()

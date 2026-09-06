@@ -1137,6 +1137,8 @@ def _run_dynamic(config: dict) -> int:
     if use_pose:
         shared_health_processes["pose"] = pose_worker
         shared_health_processes["pose_router"] = pose_result_router
+    from fight.operations import DiskMonitor
+    disk_monitor = DiskMonitor(runtime)
     health_registry = HealthRegistry(max_cameras=slot_count) if health_enabled else None
     watchdog = None
     snapshot_store = None
@@ -1232,6 +1234,10 @@ def _run_dynamic(config: dict) -> int:
                 now_monotonic = time.monotonic()
                 if now_monotonic - last_watchdog >= watchdog_interval:
                     last_watchdog = now_monotonic
+                    health_registry.disk = disk_monitor.sample({
+                        "runs": output_dir,
+                        "outbox": runtime.get("incident_outbox_path") or output_dir,
+                    })
                     for stage, admission in (("person", person_request_queue),
                                              ("pose", pose_request_queue),
                                              ("stage3", stage3_queue)):
@@ -1385,9 +1391,22 @@ def _run_dynamic(config: dict) -> int:
 
 
 def run(config: dict) -> int:
-    if bool(config.get("runtime", {}).get("dynamic_camera_lifecycle_enabled", False)):
-        return _run_dynamic(config)
-    return _run_static(config)
+    from fight.operations import atomic_json, run_lock_path
+    from fight.runtime_supervisor.locking import SingletonLock
+
+    output = Path(config["output_dir"]).resolve()
+    with SingletonLock(run_lock_path(output)):
+        marker = output / ".run_state.json"
+        run_id = str(config.get("run_id") or config.get("runtime", {}).get("run_id") or "")
+        atomic_json(marker, {"state": "RUNNING", "pid": os.getpid(), "run_id": run_id})
+        if bool(config.get("runtime", {}).get("dynamic_camera_lifecycle_enabled", False)):
+            code = _run_dynamic(config)
+        else:
+            code = _run_static(config)
+        # An exception/abnormal exit leaves RUNNING: cleanup fails closed.
+        atomic_json(marker, {"state": "COMPLETED" if code == 0 else "FAILED",
+                             "exit_code": code, "run_id": run_id, "finished_at": time.time()})
+        return code
 
 
 def parse_args():

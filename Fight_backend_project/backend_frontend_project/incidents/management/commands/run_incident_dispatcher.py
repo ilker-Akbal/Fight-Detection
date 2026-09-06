@@ -1,9 +1,11 @@
 import json
-import time
 from pathlib import Path
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import close_old_connections
+from fight.service_loop import run_service
+from fight.runtime_supervisor.locking import SingletonLockError
 
 from incidents.services.ingest import dispatcher_tick
 
@@ -26,15 +28,16 @@ class Command(BaseCommand):
             raise CommandError("--poll-interval en az 0.1 saniye olmalıdır.")
         outbox = Path(options["outbox"]).resolve()
 
-        self.stdout.write(f"Incident dispatcher başladı: outbox={outbox}")
-        while True:
-            result = dispatcher_tick(outbox)
-            if any(result.values()):
-                self.stdout.write(json.dumps(result, ensure_ascii=False, sort_keys=True))
-            if options["once"]:
-                return
+        def tick():
+            close_old_connections()
             try:
-                time.sleep(poll_interval)
-            except KeyboardInterrupt:
-                self.stdout.write("Incident dispatcher durduruldu.")
-                return
+                return dispatcher_tick(outbox)
+            finally:
+                close_old_connections()
+
+        try:
+            run_service(tick, settings.OPERATIONAL_SERVICE_DIR / "dispatcher.lock",
+                        once=options["once"], interval=poll_interval,
+                        report=lambda row: self.stdout.write(json.dumps(row, sort_keys=True)))
+        except SingletonLockError as exc:
+            raise CommandError("Incident dispatcher is already running") from exc

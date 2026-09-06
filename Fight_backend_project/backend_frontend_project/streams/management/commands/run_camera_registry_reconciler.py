@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import time
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandError
+from django.db import close_old_connections
+from fight.service_loop import run_service
+from fight.runtime_supervisor.locking import SingletonLockError
 
-from fight.runtime_supervisor.client import SupervisorRequestError, SupervisorUnavailable
 from services.pipeline_bridge.camera_registry import CameraRegistryReconciler
 
 
@@ -27,17 +28,17 @@ class Command(BaseCommand):
             raise CommandError("--poll-interval must be at least 0.5 seconds")
         reconciler = CameraRegistryReconciler()
         self.stdout.write("Camera registry reconciler started")
-        while True:
+        def tick():
+            close_old_connections()
             try:
                 result = reconciler.tick()
-                if result["changed"] or options["once"]:
-                    self.stdout.write(json.dumps(result, sort_keys=True))
-            except (SupervisorUnavailable, SupervisorRequestError) as exc:
-                self.stderr.write(f"Supervisor unavailable: {type(exc).__name__}")
-            if options["once"]:
-                return
-            try:
-                time.sleep(poll_interval)
-            except KeyboardInterrupt:
-                self.stdout.write("Camera registry reconciler stopped")
-                return
+                return result if result["changed"] or options["once"] else {}
+            finally:
+                close_old_connections()
+
+        try:
+            run_service(tick, settings.OPERATIONAL_SERVICE_DIR / "reconciler.lock",
+                        once=options["once"], interval=poll_interval,
+                        report=lambda row: self.stdout.write(json.dumps(row, sort_keys=True)))
+        except SingletonLockError as exc:
+            raise CommandError("Camera registry reconciler is already running") from exc

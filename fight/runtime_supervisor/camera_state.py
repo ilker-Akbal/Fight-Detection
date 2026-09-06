@@ -110,13 +110,8 @@ class DesiredCameraStateStore:
             raise InvalidDesiredCameraState("desired camera state is unreadable") from exc
 
     def _write(self, state: dict) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        from fight.operations import atomic_json
+        atomic_json(self.path, state)
         try:
             self.path.chmod(0o600)
         except OSError:

@@ -208,9 +208,74 @@ statistics even when periodic health snapshots are disabled.
 
 These are fairness and bounded-memory guarantees, not a GPU throughput claim.
 Decoding, frame/ROI serialization, Stage3 clip payloads, per-camera processes,
-Windows queue handles and GPU service time remain real scale costs. Phase 12
+Windows queue handles and GPU service time remain real scale costs. A later phase
 should measure end-to-end latency, CPU/RAM/VRAM and sustained load on target
 hardware before choosing shared-memory transport or multi-GPU partitioning.
+
+## Phase 12: operational durability and retention
+
+Run cleanup at the Django service boundary (from the backend directory):
+
+```powershell
+python manage.py run_operational_cleanup --once --dry-run
+python manage.py run_operational_cleanup --once
+# Optional long-running service, default interval 3600 seconds:
+python manage.py run_operational_cleanup
+```
+
+Defaults: transient metrics/health/previews 7 days, stale owned `.tmp` files
+1 day, completed run configs/directories 30 days, closed Supervisor run logs
+14 days. Each pass examines at most 10,000 entries and removes at most 500
+files. These limits and ages use `RETENTION_*` in `.env.example`; zero days
+disables that category. Cleanup is opt-in: no scheduler or external service
+is installed automatically. No runtime code uses Django/ORM.
+
+Run leases plus a Supervisor launch/maintenance lock exclude active writers.
+The current run is retained even after stopping. Only runs with a Phase-12
+`COMPLETED` marker are eligible; unknown, failed, pre-Phase-12 and abnormal
+termination runs stay untouched for operator recovery. Symlinks/junctions,
+unknown artifacts, recovery state, lock files and durable JSONL history are
+never deleted. Old empty directories are removed without recursive deletion.
+Closed run markers are kept until their Supervisor stdout/stderr logs expire.
+Supervisor event telemetry rotates at 8 MiB with 3 backups; it is operational
+telemetry, not incident history.
+
+Incident-referenced files are protected regardless of incident state or
+`evidence_valid`. Evidence (including video temp segments) is retained
+indefinitely by default. Opting into `RETENTION_EVIDENCE_DAYS` has a minimum
+180-day age and additionally requires stopped runtime, stopped dispatcher,
+exclusive outbox writer lock, matching fully consumed cursor/file identity,
+no partial trailing record and no retryable ingest records. Referenced
+evidence is still never removed. Durable outbox/legacy history is neither
+deleted nor compacted, and dispatcher cursor semantics are unchanged.
+
+Disk checks are cached for 30 seconds, warn below 5 GiB and become critical
+below 1 GiB (`DISK_*`, or corresponding lowercase runtime keys). Existing
+runtime health exposes `disk`, degrading aggregate health only; disk pressure
+does not produce worker/camera restart actions. Supervisor status exposes its
+own volume status plus compact cleanup counters. `scan_limited` or
+`delete_limited` indicate incomplete passes; review limits if repeatedly set.
+No file paths/source credentials are included in these operational statuses.
+
+Outbox appends serialize writers, handle short writes, retain partial tail
+bytes with a newline boundary, and fsync before legacy output. Evidence is
+fsynced before publication. Failed persistence is fatal/explicit, including
+aggregator background failures, rather than a successful incident. Atomic
+Supervisor state and desired-camera writes flush/fsync before replacement
+(directory fsync on POSIX). Stale atomic-write temps can be overwritten on
+the next owned write; a failed replacement leaves prior state intact.
+
+Dispatcher, registry reconciler and cleanup commands have local cross-platform
+singleton locks, SIGINT/SIGTERM handling and interruptible bounded retry
+backoff. Use the same service/state directories for every instance on this
+host. Filesystem locks are local-host coordination, not distributed locking.
+Abnormal shutdown releases OS locks; it never deletes a lock inode.
+
+Remaining operational work: review legacy/aborted runs manually; archive
+durable incident history through a cursor-aware design; size storage for
+active run streams (never deleted by retention) and referenced evidence;
+monitor cleanup limits on very large directories. Network-filesystem/power-loss
+durability and GPU/scale sizing require deployment-specific validation.
 
 ## Deferred work
 
@@ -223,4 +288,4 @@ The following work belongs to dedicated later phases:
 - production media offload/Nginx;
 - Speed integration;
 - PostgreSQL migration;
-- production-scale capacity measurement and deployment sizing (Phase 12).
+- production-scale capacity measurement and deployment sizing.

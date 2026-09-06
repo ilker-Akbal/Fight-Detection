@@ -170,6 +170,17 @@ MEDIA_URL = f"{URL_PREFIX}/media/" if URL_PREFIX else "/media/"
 MEDIA_ROOT = BASE_DIR / "media"
 
 INCIDENT_OUTBOX_PATH = MEDIA_ROOT / "runtime_spool" / "incidents_outbox.jsonl"
+OPERATIONAL_SERVICE_DIR = MEDIA_ROOT / "runtime_spool" / "services"
+OPERATIONAL_RETENTION = {
+    "transient_days": float(os.getenv("RETENTION_TRANSIENT_DAYS", "7")),
+    "run_days": float(os.getenv("RETENTION_RUN_DAYS", "30")),
+    "temp_days": float(os.getenv("RETENTION_TEMP_DAYS", "1")),
+    "log_days": float(os.getenv("RETENTION_LOG_DAYS", "14")),
+    # Zero means keep evidence indefinitely. Nonzero is clamped to >=180 days.
+    "evidence_days": float(os.getenv("RETENTION_EVIDENCE_DAYS", "0")),
+    "max_files": int(os.getenv("RETENTION_MAX_FILES", "500")),
+    "max_scan": int(os.getenv("RETENTION_MAX_SCAN", "10000")),
+}
 INCIDENT_EVIDENCE_ROOTS = [MEDIA_ROOT / "pipeline_runs"]
 
 
@@ -326,6 +337,9 @@ PIPELINE_DEFAULTS = {
     "live_frame_max_age_sec": float(os.getenv("LIVE_FRAME_MAX_AGE_SEC", "2.0")),
     "live_inference_max_age_sec": float(os.getenv("LIVE_INFERENCE_MAX_AGE_SEC", "2.0")),
     "capacity_overload_ratio": float(os.getenv("CAPACITY_OVERLOAD_RATIO", "0.9")),
+    "disk_warning_bytes": int(os.getenv("DISK_WARNING_BYTES", str(5 * 1024**3))),
+    "disk_critical_bytes": int(os.getenv("DISK_CRITICAL_BYTES", str(1024**3))),
+    "disk_check_interval_sec": float(os.getenv("DISK_CHECK_INTERVAL_SEC", "30")),
     "dynamic_camera_reconcile_interval_sec": float(
         os.getenv("DYNAMIC_CAMERA_RECONCILE_INTERVAL_SEC", "0.5")
     ),

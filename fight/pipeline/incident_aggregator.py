@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import errno
+import os
 import shutil
 import tempfile
 import threading
@@ -14,6 +16,7 @@ from typing import Deque, Dict, List, Optional
 import cv2
 
 from fight.pipeline.incident_outbox import (
+    DurableWriteError,
     IncidentOutboxEnvelope,
     append_envelope_durable,
     utc_iso_from_epoch,
@@ -26,6 +29,7 @@ from fight.pipeline.media_encoding import (
 )
 
 from fight.pipeline_mp.clip_overlay import draw_ai_clip_overlay
+from fight.operations import fsync_directory
 
 
 @dataclass
@@ -215,6 +219,7 @@ class IncidentAggregator:
         self.counter: Dict[str, int] = {}
 
         self._stop_event = threading.Event()
+        self._fatal_error = None
         self._sweeper = threading.Thread(
             target=self._sweeper_loop,
             name="incident_sweeper",
@@ -236,6 +241,7 @@ class IncidentAggregator:
         )
 
     def submit(self, result: Stage3Result) -> None:
+        self.raise_if_failed()
         with self.lock:
             result = self._normalize_result(result)
             camera_id = result.camera_id
@@ -324,6 +330,7 @@ class IncidentAggregator:
             pass
 
         with self.lock:
+            self.raise_if_failed()
             for camera_id in list(self.by_camera.keys()):
                 st = self.by_camera.get(camera_id)
                 force = bool(st and st.state == "confirmed")
@@ -354,10 +361,19 @@ class IncidentAggregator:
 
                     finalize_items.append((camera_id, st.state == "confirmed"))
 
-            for camera_id, force in finalize_items:
-                self.finalize(camera_id, force=force)
+            try:
+                for camera_id, force in finalize_items:
+                    self.finalize(camera_id, force=force)
+            except Exception as exc:
+                self._fatal_error = exc
+                self._stop_event.set()
+                return
 
-            time.sleep(self.sweep_interval_sec)
+            self._stop_event.wait(max(0.1, self.sweep_interval_sec))
+
+    def raise_if_failed(self):
+        if self._fatal_error is not None:
+            raise DurableWriteError("incident_finalization_failed") from self._fatal_error
 
     def _normalize_result(self, result: Stage3Result) -> Stage3Result:
         start_ts = float(result.event_start_ts)
@@ -586,13 +602,7 @@ class IncidentAggregator:
         ok = self._concat_mp4s(clip_paths, out_path)
 
         if not ok:
-            print(
-                f"[INCIDENT][WARN] concat failed camera={st.camera_id} "
-                f"incident={st.incident_id}",
-                flush=True,
-            )
-            self.by_camera.pop(camera_id, None)
-            return
+            raise DurableWriteError("incident_evidence_write_failed")
 
         overlay_meta = {
             "camera_id": st.camera_id,
@@ -677,8 +687,15 @@ class IncidentAggregator:
 
         # The application boundary is written durably before the compatibility
         # JSONL row.  Django is never imported or contacted by the runtime.
-        append_envelope_durable(self.outbox_path, envelope)
-        self._append_jsonl(self.incidents_jsonl, row)
+        try:
+            # Windows _commit/fsync requires a writable descriptor.
+            with out_path.open("r+b") as evidence:
+                os.fsync(evidence.fileno())
+            fsync_directory(out_path.parent)
+            append_envelope_durable(self.outbox_path, envelope)
+            self._append_jsonl(self.incidents_jsonl, row)
+        except OSError as exc:
+            raise DurableWriteError(exc.errno, "incident_persistence_failed") from exc
 
         print(
             f"[INCIDENT] camera={st.camera_id} incident={st.incident_id} "
@@ -811,6 +828,9 @@ class IncidentAggregator:
             tmp_path.replace(clip_path)
             return clip_path.exists() and clip_path.stat().st_size > 0
         except Exception as exc:
+            if isinstance(exc, OSError) and (exc.errno in {errno.ENOSPC, errno.EDQUOT, errno.EIO}
+                                             or getattr(exc, "winerror", None) in {39, 112}):
+                raise DurableWriteError(exc.errno, "incident_evidence_write_failed") from exc
             print(
                 f"[INCIDENT][WARN] ai overlay exception clip={clip_path} err={exc}",
                 flush=True,
@@ -863,8 +883,8 @@ class IncidentAggregator:
                     flush=True,
                 )
                 return out_path.exists() and out_path.stat().st_size > 0
-            except OSError:
-                pass
+            except OSError as exc:
+                raise DurableWriteError(exc.errno, "incident_evidence_write_failed") from exc
 
         return self._concat_with_opencv(valid, out_path)
 
