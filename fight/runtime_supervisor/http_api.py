@@ -5,6 +5,11 @@ import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
+from .camera_state import (
+    DesiredCameraRevisionConflict,
+    InvalidDesiredCameraState,
+    StaleDesiredCameraRevision,
+)
 from .core import InvalidRuntimeConfig
 
 
@@ -67,7 +72,39 @@ def create_http_server(supervisor, *, host: str, port: int, token: str):
             if path == "/status":
                 self._send(200, supervisor.status())
                 return
+            if path == "/runtime/cameras":
+                if not self._authorized():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
+                self._send(200, supervisor.desired_cameras())
+                return
+            if path == "/runtime/health":
+                if not self._authorized():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
+                self._send(200, supervisor.runtime_health())
+                return
             self._send(404, {"ok": False, "error": "not_found"})
+
+        def do_PUT(self):
+            path = urlsplit(self.path).path
+            if path != "/runtime/cameras":
+                self._send(404, {"ok": False, "error": "not_found"})
+                return
+            if not self._authorized():
+                self._send(401, {"ok": False, "error": "unauthorized"})
+                return
+            try:
+                self._send(200, supervisor.update_desired_cameras(self._body()))
+            except (StaleDesiredCameraRevision, DesiredCameraRevisionConflict) as exc:
+                self._send(409, {"ok": False, "error": str(exc)})
+            except (InvalidDesiredCameraState, ValueError, json.JSONDecodeError) as exc:
+                self._send(400, {"ok": False, "error": str(exc)})
+            except Exception as exc:
+                self._send(
+                    500,
+                    {"ok": False, "error": f"supervisor_operation_failed: {type(exc).__name__}"},
+                )
 
         def do_POST(self):
             path = urlsplit(self.path).path
@@ -86,7 +123,12 @@ def create_http_server(supervisor, *, host: str, port: int, token: str):
                 else:
                     result = supervisor.restart(body.get("config_path"))
                 self._send(200, result)
-            except (InvalidRuntimeConfig, ValueError, json.JSONDecodeError) as exc:
+            except (
+                InvalidRuntimeConfig,
+                InvalidDesiredCameraState,
+                ValueError,
+                json.JSONDecodeError,
+            ) as exc:
                 self._send(400, {"ok": False, "error": str(exc)})
             except Exception as exc:
                 self._send(

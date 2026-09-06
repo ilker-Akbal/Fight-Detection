@@ -8,6 +8,7 @@ import cv2
 
 from fight.pipeline_mp.common import MpPaths, configure_process_runtime, now_str
 from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal, ReportMessage
+from fight.pipeline_mp.health import HealthEmitter
 
 
 def _report(report_queue, camera_id: str, detail: str, **extra) -> None:
@@ -51,6 +52,8 @@ def run_preview_consumer_loop(
     report_queue,
     stop_event,
     generation: int,
+    health_queue=None,
+    slot_id: int = -1,
 ) -> None:
     runtime = config.get("runtime", {})
     camera_id = str(camera["camera_id"])
@@ -61,12 +64,23 @@ def run_preview_consumer_loop(
     frames_received = 0
     frames_written = 0
     last_frame_seq = 0
+    health = HealthEmitter(
+        health_queue,
+        component="camera_preview",
+        component_type="camera",
+        camera_id=camera_id,
+        slot_id=slot_id,
+        generation=generation,
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
 
     _report(report_queue, camera_id, "started", generation=int(generation))
     while stop_event is None or not stop_event.is_set():
         try:
             message = preview_channel.get(timeout=0.25)
         except queue.Empty:
+            health.heartbeat(progress=frames_received, secondary_progress=frames_written)
             continue
 
         if isinstance(message, CameraIngestSignal):
@@ -86,6 +100,11 @@ def run_preview_consumer_loop(
         if write_preview_atomic(preview_path, message.frame, quality):
             frames_written += 1
             last_write = now
+            health.emit(
+                "preview_published",
+                progress=frames_received,
+                secondary_progress=frames_written,
+            )
 
     _report(
         report_queue,
@@ -97,6 +116,12 @@ def run_preview_consumer_loop(
         last_frame_seq=last_frame_seq,
     )
     _report(report_queue, camera_id, "stopped", generation=int(generation))
+    health.emit(
+        "process_stopping",
+        force=True,
+        progress=frames_received,
+        secondary_progress=frames_written,
+    )
 
 
 def camera_preview_process_main(
@@ -106,6 +131,8 @@ def camera_preview_process_main(
     report_queue,
     stop_event,
     generation: int,
+    health_queue=None,
+    slot_id: int = -1,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -121,4 +148,6 @@ def camera_preview_process_main(
         report_queue,
         stop_event,
         generation,
+        health_queue,
+        slot_id,
     )

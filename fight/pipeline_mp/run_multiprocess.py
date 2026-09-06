@@ -12,6 +12,7 @@ from typing import Any
 from fight.pipeline_mp.camera_ingest import camera_ingest_process_main
 from fight.pipeline_mp.camera_preview import camera_preview_process_main
 from fight.pipeline_mp.camera_worker import camera_process_main
+from fight.pipeline_mp.camera_lifecycle import CameraRuntimeManager
 from fight.pipeline_mp.common import (
     MpPaths,
     install_signal_handlers,
@@ -22,6 +23,12 @@ from fight.pipeline_mp.common import (
     write_json,
 )
 from fight.pipeline_mp.incident_worker import incident_process_main
+from fight.pipeline_mp.health import (
+    HealthPolicy,
+    HealthRegistry,
+    HealthSnapshotStore,
+    RuntimeWatchdog,
+)
 from fight.pipeline_mp.messages import ReportMessage
 from fight.pipeline_mp.person_worker import (
     person_inference_process_main,
@@ -33,7 +40,12 @@ from fight.pipeline_mp.pose_worker import (
     pose_result_router_main,
 )
 from fight.pipeline_mp.reporter import reporter_process_main
+from fight.pipeline_mp.scheduling import FairRequestQueue
 from fight.pipeline_mp.stage3_worker import stage3_process_main
+from fight.runtime_supervisor.camera_state import (
+    DesiredCameraStateStore,
+    InvalidDesiredCameraState,
+)
 
 
 def _put_status(report_queue, row: dict) -> None:
@@ -309,7 +321,7 @@ def _start_camera(
     )
 
 
-def run(config: dict) -> int:
+def _run_static(config: dict) -> int:
     run_started_monotonic = time.perf_counter()
     run_id = str(config.get("run_id") or uuid.uuid4().hex)
     config["run_id"] = run_id
@@ -922,6 +934,460 @@ def run(config: dict) -> int:
         _close_queue(report_queue)
 
     return int(exit_code)
+
+
+def _run_dynamic(config: dict) -> int:
+    """Run shared inference services once and reconcile camera process trios in-place."""
+    run_started_monotonic = time.perf_counter()
+    run_id = str(config.get("run_id") or uuid.uuid4().hex)
+    config["run_id"] = run_id
+    output_dir = Path(config["output_dir"])
+    paths = MpPaths.from_output_dir(output_dir)
+    paths.mkdirs()
+    status_path = output_dir / "camera_status.jsonl"
+    status_start_offset = status_path.stat().st_size if status_path.exists() else 0
+
+    runtime = config.setdefault("runtime", {})
+    runtime["run_id"] = run_id
+    runtime["camera_ingest_mode"] = "centralized"
+    initial_cameras = list(config.get("cameras") or [])
+    ctx = mp.get_context("spawn")
+    slot_count = max(
+        len(initial_cameras), int(runtime.get("dynamic_camera_slot_count", 32)), 1
+    )
+    use_pose = bool(runtime.get("use_pose", True))
+    stop_event = ctx.Event()
+    install_signal_handlers(stop_event)
+
+    stage3_queue = ctx.JoinableQueue(maxsize=max(1, int(runtime.get("stage3_queue_size", 64))))
+    incident_queue = ctx.JoinableQueue(
+        maxsize=max(1, int(runtime.get("incident_queue_size", 256)))
+    )
+    report_queue = ctx.JoinableQueue(
+        maxsize=max(1, int(runtime.get("report_queue_size", 8192)))
+    )
+    health_enabled = bool(runtime.get("health_enabled", True))
+    health_queue = (
+        ctx.Queue(maxsize=max(64, int(runtime.get("health_queue_size", 4096))))
+        if health_enabled
+        else None
+    )
+    person_request_queue = ctx.JoinableQueue(
+        maxsize=max(1, int(runtime.get("person_request_queue_size", slot_count)))
+    )
+    person_result_queue = ctx.JoinableQueue(
+        maxsize=max(1, int(runtime.get("person_result_queue_size", slot_count)))
+    )
+    person_channel_size = max(
+        1, int(runtime.get("person_camera_result_queue_size", 2))
+    )
+    person_result_channels = {
+        slot_id: ctx.Queue(maxsize=person_channel_size) for slot_id in range(slot_count)
+    }
+    pose_request_queue = None
+    pose_result_queue = None
+    pose_result_channels = {}
+    if use_pose:
+        pose_request_queue = ctx.JoinableQueue(
+            maxsize=max(1, int(runtime.get("pose_request_queue_size", slot_count)))
+        )
+        pose_result_queue = ctx.JoinableQueue(
+            maxsize=max(1, int(runtime.get("pose_result_queue_size", slot_count)))
+        )
+        pose_channel_size = max(
+            1, int(runtime.get("pose_camera_result_queue_size", 2))
+        )
+        pose_result_channels = {
+            slot_id: ctx.Queue(maxsize=pose_channel_size) for slot_id in range(slot_count)
+        }
+    slot_generations = ctx.Array("q", slot_count, lock=True)
+    # Stable-slot reservations prevent a hot camera from taking another
+    # camera's admission budget. Consumer-side RR also feeds microbatching.
+    if bool(runtime.get("fair_scheduling_enabled", True)):
+        for old_queue in (stage3_queue, person_request_queue, pose_request_queue):
+            if old_queue is not None:
+                _close_queue(old_queue)
+        person_request_queue = FairRequestQueue(ctx, slot_count, 1)
+        stage3_queue = FairRequestQueue(
+            ctx, slot_count, max(1, int(runtime.get("stage3_pending_per_camera", 1)))
+        )
+        if use_pose:
+            pose_request_queue = FairRequestQueue(ctx, slot_count, 1)
+    config["cameras"] = initial_cameras
+    write_json(output_dir / "run_config.effective.json", config)
+
+    reporter = _start_process("reporter", reporter_process_main, (config, report_queue, stop_event))
+    incident = _start_process(
+        "incident",
+        incident_process_main,
+        (
+            config,
+            incident_queue,
+            report_queue,
+            stop_event,
+            slot_generations,
+            health_queue,
+        ),
+    )
+    stage3 = _start_process(
+        "stage3",
+        stage3_process_main,
+        (
+            config,
+            stage3_queue,
+            incident_queue,
+            report_queue,
+            stop_event,
+            slot_generations,
+            health_queue,
+        ),
+    )
+    person_result_router = _start_process(
+        "person_result_router",
+        person_result_router_main,
+        (
+            config,
+            person_result_queue,
+            person_result_channels,
+            report_queue,
+            stop_event,
+            slot_generations,
+            health_queue,
+        ),
+    )
+    person_worker = _start_process(
+        "person_inference",
+        person_inference_process_main,
+        (
+            config,
+            person_request_queue,
+            person_result_queue,
+            report_queue,
+            stop_event,
+            slot_generations,
+            health_queue,
+        ),
+    )
+    pose_result_router = None
+    pose_worker = None
+    if use_pose:
+        pose_result_router = _start_process(
+            "pose_result_router",
+            pose_result_router_main,
+            (
+                config,
+                pose_result_queue,
+                pose_result_channels,
+                report_queue,
+                stop_event,
+                slot_generations,
+                health_queue,
+            ),
+        )
+        pose_worker = _start_process(
+            "pose_inference",
+            pose_inference_process_main,
+            (
+                config,
+                pose_request_queue,
+                pose_result_queue,
+                report_queue,
+                stop_event,
+                slot_generations,
+                health_queue,
+            ),
+        )
+
+    manager = CameraRuntimeManager(
+        ctx=ctx,
+        config=config,
+        stage3_queue=stage3_queue,
+        report_queue=report_queue,
+        person_request_queue=person_request_queue,
+        person_result_channels=person_result_channels,
+        pose_request_queue=pose_request_queue,
+        pose_result_channels=pose_result_channels,
+        slot_generations=slot_generations,
+        health_queue=health_queue,
+        terminate_process=_terminate_process,
+        close_queue=_close_queue,
+    )
+    desired_path = str(runtime.get("desired_camera_state_path") or "").strip()
+    desired_store = DesiredCameraStateStore(desired_path) if desired_path else None
+    desired_revision = -1
+    poll_interval = max(
+        0.1, float(runtime.get("dynamic_camera_reconcile_interval_sec", 0.5))
+    )
+    shared_processes = {
+        "stage3": (stage3, 2),
+        "incident": (incident, 3),
+        "person_inference": (person_worker, 4),
+        "person_result_router": (person_result_router, 5),
+        "reporter": (reporter, 8),
+    }
+    if use_pose:
+        shared_processes["pose_inference"] = (pose_worker, 6)
+        shared_processes["pose_result_router"] = (pose_result_router, 7)
+    shared_health_processes = {
+        "person": person_worker,
+        "person_router": person_result_router,
+        "stage3": stage3,
+        "incident": incident,
+    }
+    if use_pose:
+        shared_health_processes["pose"] = pose_worker
+        shared_health_processes["pose_router"] = pose_result_router
+    health_registry = HealthRegistry(max_cameras=slot_count) if health_enabled else None
+    watchdog = None
+    snapshot_store = None
+    health_snapshot_path = Path(
+        runtime.get("health_snapshot_path") or (output_dir / "runtime_health.json")
+    )
+    if health_registry is not None:
+        for component in shared_health_processes:
+            health_registry.register_worker(component)
+        watchdog = RuntimeWatchdog(
+            health_registry,
+            HealthPolicy.from_runtime(runtime),
+            report_queue,
+        )
+        snapshot_store = HealthSnapshotStore(health_snapshot_path)
+    watchdog_interval = max(0.25, float(runtime.get("health_watchdog_interval_sec", 1.0)))
+    health_drain_limit = max(64, int(runtime.get("health_event_drain_limit", 2048)))
+    last_watchdog = -1e30
+    health_snapshot_write_failed = False
+    exit_code = 0
+    graceful_file_finish = False
+
+    _put_status(
+        report_queue,
+        {
+            "ts": now_str(),
+            "camera_id": "__system__",
+            "stage": "orchestrator",
+            "detail": "dynamic_runtime_started",
+            "pid": os.getpid(),
+            "slot_count": slot_count,
+            "desired_camera_state_path": bool(desired_path),
+            "health_enabled": int(health_enabled),
+            "health_snapshot_path": str(health_snapshot_path) if health_enabled else "",
+        },
+    )
+
+    try:
+        manager.reconcile(initial_cameras, revision=desired_revision)
+        while not stop_event.is_set():
+            for name, (process, failure_code) in shared_processes.items():
+                if process is not None and not process.is_alive():
+                    _put_status(
+                        report_queue,
+                        {
+                            "ts": now_str(),
+                            "camera_id": "__system__",
+                            "stage": "orchestrator",
+                            "detail": f"{name}_process_dead",
+                            "exitcode": process.exitcode,
+                        },
+                    )
+                    exit_code = failure_code
+                    stop_event.set()
+                    break
+            if stop_event.is_set():
+                break
+
+            if desired_store is not None:
+                try:
+                    desired = desired_store.load()
+                    revision = int(desired["revision"])
+                    if revision > desired_revision:
+                        manager.reconcile(desired["cameras"], revision=revision)
+                        desired_revision = revision
+                except InvalidDesiredCameraState:
+                    _put_status(
+                        report_queue,
+                        {
+                            "ts": now_str(),
+                            "camera_id": "__system__",
+                            "stage": "camera_reconciler",
+                            "detail": "desired_state_invalid_ignored",
+                        },
+                    )
+                except Exception as exc:
+                    _put_status(
+                        report_queue,
+                        {
+                            "ts": now_str(),
+                            "camera_id": "__system__",
+                            "stage": "camera_reconciler",
+                            "detail": "desired_state_read_failed",
+                            "error": type(exc).__name__,
+                        },
+                    )
+
+            manager.poll()
+            manager.retry_failed(revision=desired_revision)
+            if health_registry is not None and health_queue is not None:
+                health_registry.sync_cameras(manager.get_camera_status())
+                health_registry.drain(health_queue, health_drain_limit)
+                now_monotonic = time.monotonic()
+                if now_monotonic - last_watchdog >= watchdog_interval:
+                    last_watchdog = now_monotonic
+                    for stage, admission in (("person", person_request_queue),
+                                             ("pose", pose_request_queue),
+                                             ("stage3", stage3_queue)):
+                        if not hasattr(admission, "snapshot"):
+                            continue
+                        capacity = admission.snapshot()
+                        per_slot = capacity.pop("slots")
+                        health_registry.workers[stage]["capacity"] = capacity
+                        for camera in health_registry.cameras.values():
+                            camera.setdefault("capacity", {})[stage] = per_slot.get(str(camera["slot_id"]), {})
+                    if watchdog.tick(manager, shared_health_processes):
+                        exit_code = 10
+                        stop_event.set()
+                    try:
+                        snapshot_store.write(health_registry.snapshot(run_id))
+                        if health_snapshot_write_failed:
+                            _put_status(
+                                report_queue,
+                                {
+                                    "ts": now_str(),
+                                    "camera_id": "__system__",
+                                    "stage": "health_watchdog",
+                                    "detail": "health_snapshot_write_recovered",
+                                },
+                            )
+                        health_snapshot_write_failed = False
+                    except Exception as exc:
+                        if not health_snapshot_write_failed:
+                            _put_status(
+                                report_queue,
+                                {
+                                    "ts": now_str(),
+                                    "camera_id": "__system__",
+                                    "stage": "health_watchdog",
+                                    "detail": "health_snapshot_write_failed",
+                                    "error": type(exc).__name__,
+                                },
+                            )
+                        health_snapshot_write_failed = True
+            if stop_event.is_set():
+                break
+            stop_on_file_eof = bool(
+                runtime.get(
+                    "stop_run_when_all_file_cameras_done",
+                    _all_file_cameras(initial_cameras)
+                    and not bool(runtime.get("loop_file_sources", False)),
+                )
+            )
+            if stop_on_file_eof and manager.all_file_cameras_done():
+                if getattr(stage3_queue, "capacity_control", False) and not stage3_queue.empty():
+                    # Keep ticking health while admitted file candidates drain.
+                    # The legacy finalization timeout must not discard a fair
+                    # queue backlog or an inference already in flight.
+                    time.sleep(poll_interval)
+                    continue
+                graceful_file_finish = True
+                _put_status(
+                    report_queue,
+                    {
+                        "ts": now_str(),
+                        "camera_id": "__system__",
+                        "stage": "orchestrator",
+                        "detail": "all_file_cameras_finished",
+                        "camera_count": len(manager.runtimes),
+                    },
+                )
+                _wait_for_pipeline_settle(
+                    stage3_queue=stage3_queue,
+                    incident_queue=incident_queue,
+                    report_queue=report_queue,
+                    runtime=runtime,
+                )
+                stop_event.set()
+                break
+            time.sleep(poll_interval)
+    except KeyboardInterrupt:
+        exit_code = 130
+        stop_event.set()
+    finally:
+        manager.stop_all(reason="global_stop")
+        stop_event.set()
+        _put_sentinel(person_request_queue, person_worker)
+        _terminate_process(person_worker, timeout=8.0)
+        _put_sentinel(person_result_queue, person_result_router)
+        _terminate_process(person_result_router, timeout=5.0)
+        if use_pose:
+            _put_sentinel(pose_request_queue, pose_worker)
+            _terminate_process(pose_worker, timeout=8.0)
+            _put_sentinel(pose_result_queue, pose_result_router)
+            _terminate_process(pose_result_router, timeout=5.0)
+        try:
+            stage3_queue.put(None, timeout=1.0)
+        except Exception:
+            pass
+        _terminate_process(stage3, timeout=8.0)
+        try:
+            incident_queue.put(None, timeout=1.0)
+        except Exception:
+            pass
+        _terminate_process(incident, timeout=8.0)
+        try:
+            report_queue.put(
+                ReportMessage(
+                    kind="status",
+                    row={
+                        "ts": now_str(),
+                        "camera_id": "__system__",
+                        "stage": "orchestrator",
+                        "detail": "stopped",
+                        "exit_code": exit_code,
+                        "graceful_file_finish": int(graceful_file_finish),
+                    },
+                ),
+                timeout=1.0,
+            )
+            report_queue.put(None, timeout=1.0)
+        except Exception:
+            pass
+        _terminate_process(reporter, timeout=5.0)
+
+        wall_processing_sec = max(0.0, time.perf_counter() - run_started_monotonic)
+        try:
+            status_rows = load_status_rows(status_path, start_offset=status_start_offset)
+            summary = build_performance_summary(config, status_rows, wall_processing_sec)
+            summary["capacity"] = {
+                stage: admission.snapshot()
+                for stage, admission in (("person", person_request_queue),
+                                         ("pose", pose_request_queue),
+                                         ("stage3", stage3_queue))
+                if hasattr(admission, "snapshot")
+            }
+            write_json(output_dir / "performance_summary.json", summary)
+        except Exception as exc:
+            print(f"[PERFORMANCE][WARN] summary write failed: {exc}", flush=True)
+        for channel in person_result_channels.values():
+            _close_queue(channel)
+        for channel in pose_result_channels.values():
+            _close_queue(channel)
+        _close_queue(person_request_queue)
+        _close_queue(person_result_queue)
+        if pose_request_queue is not None:
+            _close_queue(pose_request_queue)
+        if pose_result_queue is not None:
+            _close_queue(pose_result_queue)
+        if health_queue is not None:
+            _close_queue(health_queue)
+        _close_queue(stage3_queue)
+        _close_queue(incident_queue)
+        _close_queue(report_queue)
+    return int(exit_code)
+
+
+def run(config: dict) -> int:
+    if bool(config.get("runtime", {}).get("dynamic_camera_lifecycle_enabled", False)):
+        return _run_dynamic(config)
+    return _run_static(config)
 
 
 def parse_args():

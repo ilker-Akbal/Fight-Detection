@@ -11,6 +11,7 @@ from pathlib import Path
 from django.conf import settings
 from fight.runtime_supervisor.client import (
     RuntimeSupervisorClient,
+    SupervisorRequestError,
     SupervisorUnavailable,
 )
 
@@ -144,6 +145,29 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
         "camera_cuda_tuning",
         "restart_camera_processes",
         "camera_restart_backoff_sec",
+        "dynamic_camera_slot_count",
+        "fair_scheduling_enabled",
+        "stage3_pending_per_camera",
+        "live_frame_max_age_sec",
+        "live_inference_max_age_sec",
+        "capacity_overload_ratio",
+        "dynamic_camera_reconcile_interval_sec",
+        "health_enabled",
+        "health_queue_size",
+        "health_event_drain_limit",
+        "health_heartbeat_interval_sec",
+        "health_watchdog_interval_sec",
+        "health_startup_grace_sec",
+        "camera_heartbeat_timeout_sec",
+        "camera_frame_stall_warn_sec",
+        "camera_frame_stall_fail_sec",
+        "camera_reconnect_grace_sec",
+        "shared_worker_heartbeat_timeout_sec",
+        "inference_stall_warn_sec",
+        "inference_stall_fail_sec",
+        "preview_heartbeat_timeout_sec",
+        "watchdog_camera_restart_cooldown_sec",
+        "watchdog_camera_restart_limit",
         "loop_file_sources",
         "stop_when_file_camera_done",
         "person_track_max_age",
@@ -507,7 +531,7 @@ def get_pipeline_status() -> dict:
         status = _supervisor_client().status()
         status["available"] = True
         return status
-    except SupervisorUnavailable:
+    except (SupervisorUnavailable, SupervisorRequestError):
         return {
             "ok": False,
             "available": False,
@@ -518,6 +542,35 @@ def get_pipeline_status() -> dict:
             "config_path": None,
             "run_id": None,
             "last_failure": "supervisor_unavailable",
+        }
+
+
+def get_runtime_health() -> dict:
+    """Backend-only bridge for future health APIs; no UI consumes this in Phase 10."""
+    if _control_mode() == "direct":
+        status = get_pipeline_status()
+        return {
+            "ok": True,
+            "available": False,
+            "stale": False,
+            "runtime_health": (
+                "UNKNOWN" if status["runtime_state"] == "RUNNING" else "STOPPED"
+            ),
+            "reason": "direct_mode_health_unavailable",
+            "cameras": {},
+            "workers": {},
+        }
+    try:
+        return _supervisor_client().runtime_health()
+    except (SupervisorUnavailable, SupervisorRequestError):
+        return {
+            "ok": False,
+            "available": False,
+            "stale": True,
+            "runtime_health": "UNKNOWN",
+            "reason": "supervisor_unavailable",
+            "cameras": {},
+            "workers": {},
         }
 
 

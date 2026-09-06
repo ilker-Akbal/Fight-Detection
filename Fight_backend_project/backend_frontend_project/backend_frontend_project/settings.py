@@ -226,6 +226,9 @@ RUNTIME_SUPERVISOR_TOKEN = os.getenv("RUNTIME_SUPERVISOR_TOKEN", "")
 RUNTIME_SUPERVISOR_TIMEOUT_SEC = float(
     os.getenv("RUNTIME_SUPERVISOR_TIMEOUT_SEC", "3.0")
 )
+CAMERA_REGISTRY_POLL_INTERVAL_SEC = float(
+    os.getenv("CAMERA_REGISTRY_POLL_INTERVAL_SEC", "2.0")
+)
 SPEED_PIPELINE_OUTPUT_BASE = BASE_DIR / "media" / "speed_runs"
 SPEED_CALIBRATION_OUTPUT_BASE = BASE_DIR / "media" / "speed_calibrations"
 
@@ -316,6 +319,57 @@ PIPELINE_DEFAULTS = {
 
     "restart_camera_processes": False,
     "camera_restart_backoff_sec": 3.0,
+    "dynamic_camera_slot_count": int(os.getenv("DYNAMIC_CAMERA_SLOT_COUNT", "32")),
+    "fair_scheduling_enabled": os.getenv("FAIR_SCHEDULING_ENABLED", "true").lower()
+    in {"1", "true", "yes", "on"},
+    "stage3_pending_per_camera": int(os.getenv("STAGE3_PENDING_PER_CAMERA", "1")),
+    "live_frame_max_age_sec": float(os.getenv("LIVE_FRAME_MAX_AGE_SEC", "2.0")),
+    "live_inference_max_age_sec": float(os.getenv("LIVE_INFERENCE_MAX_AGE_SEC", "2.0")),
+    "capacity_overload_ratio": float(os.getenv("CAPACITY_OVERLOAD_RATIO", "0.9")),
+    "dynamic_camera_reconcile_interval_sec": float(
+        os.getenv("DYNAMIC_CAMERA_RECONCILE_INTERVAL_SEC", "0.5")
+    ),
+    "health_enabled": os.getenv("RUNTIME_HEALTH_ENABLED", "true").lower()
+    in {"1", "true", "yes", "on"},
+    "health_queue_size": int(os.getenv("HEALTH_QUEUE_SIZE", "4096")),
+    "health_event_drain_limit": int(os.getenv("HEALTH_EVENT_DRAIN_LIMIT", "2048")),
+    "health_heartbeat_interval_sec": float(
+        os.getenv("HEALTH_HEARTBEAT_INTERVAL_SEC", "1.0")
+    ),
+    "health_watchdog_interval_sec": float(
+        os.getenv("HEALTH_WATCHDOG_INTERVAL_SEC", "1.0")
+    ),
+    "health_startup_grace_sec": float(os.getenv("HEALTH_STARTUP_GRACE_SEC", "120")),
+    "camera_heartbeat_timeout_sec": float(
+        os.getenv("CAMERA_HEARTBEAT_TIMEOUT_SEC", "20")
+    ),
+    "camera_frame_stall_warn_sec": float(
+        os.getenv("CAMERA_FRAME_STALL_WARN_SEC", "20")
+    ),
+    "camera_frame_stall_fail_sec": float(
+        os.getenv("CAMERA_FRAME_STALL_FAIL_SEC", "90")
+    ),
+    "camera_reconnect_grace_sec": float(
+        os.getenv("CAMERA_RECONNECT_GRACE_SEC", "120")
+    ),
+    "shared_worker_heartbeat_timeout_sec": float(
+        os.getenv("SHARED_WORKER_HEARTBEAT_TIMEOUT_SEC", "60")
+    ),
+    "inference_stall_warn_sec": float(
+        os.getenv("INFERENCE_STALL_WARN_SEC", "30")
+    ),
+    "inference_stall_fail_sec": float(
+        os.getenv("INFERENCE_STALL_FAIL_SEC", "120")
+    ),
+    "preview_heartbeat_timeout_sec": float(
+        os.getenv("PREVIEW_HEARTBEAT_TIMEOUT_SEC", "30")
+    ),
+    "watchdog_camera_restart_cooldown_sec": float(
+        os.getenv("WATCHDOG_CAMERA_RESTART_COOLDOWN_SEC", "120")
+    ),
+    "watchdog_camera_restart_limit": int(
+        os.getenv("WATCHDOG_CAMERA_RESTART_LIMIT", "3")
+    ),
     "loop_file_sources": False,
     "stop_when_file_camera_done": True,
 

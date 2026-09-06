@@ -5,6 +5,9 @@ import time
 
 from fight.pipeline.adapters import Stage3Adapter
 from fight.pipeline_mp.common import configure_process_runtime, now_str, ts_to_str
+from fight.pipeline_mp.generation import is_current_generation
+from fight.pipeline_mp.health import HealthEmitter
+from fight.pipeline_mp.scheduling import deliver_result
 from fight.pipeline_mp.messages import ReportMessage, Stage3ResultMessage
 from fight.pipeline_mp.performance import make_timing_collectors, metrics_runtime_config
 
@@ -16,7 +19,15 @@ def _report(report_queue, kind: str, row: dict) -> None:
         pass
 
 
-def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue, stop_event) -> None:
+def stage3_process_main(
+    config: dict,
+    stage3_queue,
+    incident_queue,
+    report_queue,
+    stop_event,
+    slot_generations=None,
+    health_queue=None,
+) -> None:
     runtime = config.get("runtime", {})
     models = config.get("models", {})
 
@@ -32,6 +43,13 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
     jobs_received = 0
     jobs_completed = 0
     errors = 0
+    health = HealthEmitter(
+        health_queue,
+        component="stage3",
+        component_type="shared_worker",
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
 
     _report(
         report_queue,
@@ -66,14 +84,38 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
         try:
             job = stage3_queue.get(timeout=0.5)
         except queue.Empty:
+            health.heartbeat(progress=jobs_completed)
             continue
 
         if job is None:
+            stage3_queue.task_done()
             break
 
         try:
             received_monotonic = time.perf_counter()
             jobs_received += 1
+            if not is_current_generation(job, slot_generations):
+                if hasattr(stage3_queue, "observe"):
+                    stage3_queue.observe(job.slot_id, "stale_generation")
+                _report(
+                    report_queue,
+                    "status",
+                    {
+                        "ts": now_str(),
+                        "camera_id": getattr(job, "camera_id", "__system__"),
+                        "stage": "stage3",
+                        "detail": "stale_generation_dropped",
+                        "generation": getattr(job, "generation", None),
+                        "slot_id": getattr(job, "slot_id", None),
+                    },
+                )
+                continue
+            health.emit(
+                "request_received",
+                force=True,
+                progress=jobs_received,
+                queue_depth=-1,
+            )
             if metrics_enabled:
                 created_monotonic = float(getattr(job, "created_monotonic", 0.0) or 0.0)
                 if created_monotonic > 0:
@@ -106,6 +148,23 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                 if metrics_enabled:
                     timing["inference_ms"].observe(inference_ms)
                 label = "fight" if prob >= fight_thr else "non_fight"
+            health.emit("inference_completed", force=True, progress=jobs_received)
+
+            # A camera may be removed or reconfigured while inference is running.
+            if not is_current_generation(job, slot_generations):
+                _report(
+                    report_queue,
+                    "status",
+                    {
+                        "ts": now_str(),
+                        "camera_id": job.camera_id,
+                        "stage": "stage3",
+                        "detail": "stale_generation_dropped",
+                        "generation": getattr(job, "generation", None),
+                        "slot_id": getattr(job, "slot_id", None),
+                    },
+                )
+                continue
 
             row = {
                 "camera_id": job.camera_id,
@@ -126,7 +185,8 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
 
             if stage3 is not None:
                 try:
-                    incident_queue.put(
+                    deliver_result(
+                        incident_queue,
                         Stage3ResultMessage(
                             camera_id=job.camera_id,
                             source=job.source,
@@ -138,9 +198,15 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
                             fight_label=label,
                             pose_score_max=float(job.pose_score_max),
                             pose_score_mean=float(job.pose_score_mean),
+                            generation=int(getattr(job, "generation", 0)),
+                            slot_id=int(getattr(job, "slot_id", -1)),
                         ),
+                        stop_event,
                         timeout=1.0,
+                        ordered=bool(getattr(stage3_queue, "capacity_control", False)),
+                        health=health,
                     )
+                    health.emit("result_produced", progress=jobs_received)
                 except Exception:
                     _report(
                         report_queue,
@@ -219,6 +285,7 @@ def stage3_process_main(config: dict, stage3_queue, incident_queue, report_queue
             "inference_ms": timing["inference_ms"].summary(),
         },
     )
+    health.emit("process_stopping", force=True, progress=jobs_completed)
 
     _report(
         report_queue,

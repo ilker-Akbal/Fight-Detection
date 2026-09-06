@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -23,6 +24,10 @@ from fight.runtime_supervisor.core import (
     SupervisorConfig,
 )
 from fight.runtime_supervisor.http_api import create_http_server
+from fight.runtime_supervisor.camera_state import (
+    DesiredCameraStateStore,
+    StaleDesiredCameraRevision,
+)
 from fight.runtime_supervisor.locking import SingletonLock, SingletonLockError
 from fight.pipeline_mp.messages import ReportMessage
 from fight.pipeline_mp.performance import build_performance_summary
@@ -284,9 +289,137 @@ class RuntimeSupervisorTests(unittest.TestCase):
             self.assertEqual(valid.status()["runtime_state"], STOPPED)
             with self.assertRaises(SupervisorRequestError):
                 invalid.start(str(self.config_path))
+            with self.assertRaises(SupervisorRequestError):
+                invalid.runtime_health()
             self.assertEqual(len(factory.calls), 0)
             self.assertEqual(valid.start(str(self.config_path))["runtime_state"], RUNNING)
+            self.assertEqual(valid.runtime_health()["runtime_health"], "UNKNOWN")
             self.assertNotIn(secret, supervisor.telemetry_path.read_text(encoding="utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2.0)
+
+    def test_runtime_health_snapshot_is_exposed_in_status_and_redacted(self):
+        supervisor = self.make_supervisor()
+        started = supervisor.start(self.config_path)
+        health_path = Path(supervisor.status()["health_snapshot_path"])
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        health_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": started["run_id"],
+                    "runtime_health": "HEALTHY",
+                    "reason": "critical_components_healthy",
+                    "updated_at": "2026-01-01T00:00:00+00:00",
+                    "written_wall_time": time.time(),
+                    "cameras": {
+                        "A": {
+                            "health": "ONLINE",
+                            "reason": "frames_progressing",
+                            "generation": 2,
+                            "source": "rtsp://user:password@host/live",
+                        }
+                    },
+                    "workers": {"person": {"health": "HEALTHY"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+        health = supervisor.runtime_health()
+        status = supervisor.status()
+        self.assertTrue(health["available"])
+        self.assertFalse(health["stale"])
+        self.assertEqual(health["runtime_health"], "HEALTHY")
+        self.assertEqual(status["runtime_health"], "HEALTHY")
+        self.assertIn("health_summary", status)
+        self.assertNotIn("source", health["cameras"]["A"])
+        self.assertNotIn("password", repr(health))
+
+    def test_stale_snapshot_and_stopped_runtime_have_explicit_semantics(self):
+        supervisor = self.make_supervisor()
+        stopped = supervisor.runtime_health()
+        self.assertEqual(stopped["runtime_health"], STOPPED)
+        self.assertFalse(stopped["available"])
+        self.assertFalse(stopped["stale"])
+
+        started = supervisor.start(self.config_path)
+        health_path = Path(supervisor.status()["health_snapshot_path"])
+        health_path.parent.mkdir(parents=True, exist_ok=True)
+        health_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "run_id": started["run_id"],
+                    "runtime_health": "HEALTHY",
+                    "reason": "critical_components_healthy",
+                    "updated_at": "old",
+                    "written_wall_time": time.time() - 30,
+                    "cameras": {},
+                    "workers": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        stale = supervisor.runtime_health()
+        self.assertTrue(stale["available"])
+        self.assertTrue(stale["stale"])
+        self.assertEqual(stale["runtime_health"], "DEGRADED")
+        self.assertEqual(stale["snapshot_runtime_health"], "HEALTHY")
+        self.assertEqual(stale["reason"], "health_snapshot_stale")
+
+    def test_desired_camera_state_is_atomic_restart_safe_and_monotonic(self):
+        store = DesiredCameraStateStore(self.root / "desired.json")
+        first = store.update(
+            {
+                "schema_version": 1,
+                "revision": 1,
+                "cameras": [
+                    {
+                        "camera_id": "cam_A",
+                        "source": "rtsp://user:secret@host/live",
+                        "enabled": True,
+                        "use_fight_detection": True,
+                    }
+                ],
+            }
+        )
+        self.assertTrue(first.changed)
+        self.assertEqual(DesiredCameraStateStore(store.path).load()["revision"], 1)
+        self.assertFalse(store.path.with_suffix(".json.tmp").exists())
+        with self.assertRaises(StaleDesiredCameraRevision):
+            store.update({"schema_version": 1, "revision": 0, "cameras": []})
+
+    def test_desired_camera_http_auth_revision_and_global_stop_independence(self):
+        factory = Factory()
+        supervisor = self.make_supervisor(factory)
+        server = create_http_server(supervisor, host="127.0.0.1", port=0, token="secret")
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://127.0.0.1:{server.server_address[1]}"
+        try:
+            valid = RuntimeSupervisorClient(url, "secret", timeout=1.0)
+            invalid = RuntimeSupervisorClient(url, "bad", timeout=1.0)
+            with self.assertRaises(SupervisorRequestError):
+                invalid.desired_cameras()
+            updated = valid.update_desired_cameras(
+                {"schema_version": 1, "revision": 1, "cameras": []}
+            )
+            self.assertEqual(updated["revision"], 1)
+            self.assertEqual(updated["runtime_state"], STOPPED)
+            self.assertEqual(len(factory.calls), 0)
+            with self.assertRaises(SupervisorRequestError):
+                valid.update_desired_cameras(
+                    {"schema_version": 1, "revision": 0, "cameras": []}
+                )
+            valid.start(str(self.config_path))
+            valid.stop()
+            after_stop = valid.update_desired_cameras(
+                {"schema_version": 1, "revision": 2, "cameras": []}
+            )
+            self.assertEqual(after_stop["runtime_state"], STOPPED)
+            self.assertEqual(len(factory.calls), 1)
         finally:
             server.shutdown()
             server.server_close()

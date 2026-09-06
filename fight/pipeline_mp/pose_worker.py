@@ -12,6 +12,9 @@ from fight.pipeline_mp.messages import (
     PoseInferenceResult,
     ReportMessage,
 )
+from fight.pipeline_mp.generation import is_current_generation
+from fight.pipeline_mp.health import HealthEmitter
+from fight.pipeline_mp.scheduling import AdmissionShed, admit, deliver_result, live_request_stale
 from fight.pipeline_mp.performance import (
     BoundedMetricCollector,
     best_effort_queue_depth,
@@ -114,9 +117,18 @@ class PoseInferenceClient:
         performance_metrics_sample_every: int = 1,
         performance_metrics_max_samples: int = 2048,
         performance_metrics_warmup_requests: int = 0,
+        slot_id: int = -1,
+        source_is_file: bool = True,
+        live_max_age_sec: float = 2.0,
+        health=None,
     ):
         self.camera_id = str(camera_id)
         self.generation = int(generation)
+        self.slot_id = int(slot_id)
+        self.source_is_file = bool(source_is_file)
+        self.live_max_age_sec = max(0.0, float(live_max_age_sec))
+        self.health = health
+        self.capacity_control = bool(getattr(request_queue, "capacity_control", False))
         self.request_queue = request_queue
         self.result_queue = result_queue
         self.report_queue = report_queue
@@ -179,13 +191,22 @@ class PoseInferenceClient:
             payload_height=int(payload.get("height", 0)),
             payload_channels=int(payload.get("channels", 0)),
             payload_bytes=int(payload.get("bytes", 0)),
+            slot_id=self.slot_id,
+            source_is_file=self.source_is_file,
+            max_age_sec=self.live_max_age_sec if self.capacity_control else 0.0,
         )
         self.stats["requests"] += 1
 
         put_started = time.perf_counter()
         request.put_started_monotonic = put_started
         try:
-            self.request_queue.put(request, timeout=self.enqueue_timeout_sec)
+            admit(
+                self.request_queue, request, self.stop_event,
+                timeout=self.enqueue_timeout_sec, ordered=self.source_is_file,
+                health=self.health, stage="pose",
+            )
+        except AdmissionShed:
+            raise
         except Exception as exc:
             self.stats["queue_full"] += 1
             self._status(
@@ -209,6 +230,11 @@ class PoseInferenceClient:
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                if self.capacity_control:
+                    # Keep the one-outstanding contract while queued. The
+                    # runtime health plane owns actual shared-worker failure.
+                    deadline = time.monotonic() + self.inference_timeout_sec
+                    continue
                 self.stats["timeouts"] += 1
                 self._status(
                     "timeout",
@@ -223,6 +249,8 @@ class PoseInferenceClient:
             try:
                 result = self.result_queue.get(timeout=min(0.25, remaining))
             except queue.Empty:
+                if self.capacity_control and self.health is not None:
+                    self.health.emit("capacity_wait", detail="pose")
                 continue
             result_received = time.perf_counter()
 
@@ -246,6 +274,12 @@ class PoseInferenceClient:
                 continue
 
             self.validator.mark_completed(request_id)
+            if getattr(result, "outcome", "accepted") == "dropped_live":
+                raise AdmissionShed("stale live pose request")
+            if live_request_stale(request):
+                if hasattr(self.request_queue, "observe"):
+                    self.request_queue.observe(self.slot_id, "dropped_live")
+                raise AdmissionShed("stale live pose result")
             self.stats["results"] += 1
             if self.metrics_enabled:
                 timings = compute_inference_timings(
@@ -297,8 +331,13 @@ def route_pose_result(
     result: PoseInferenceResult,
     result_channels: dict,
     timeout_sec: float,
+    slot_generations=None,
 ) -> tuple[bool, str]:
-    channel = result_channels.get(str(getattr(result, "camera_id", "")))
+    slot_id = int(getattr(result, "slot_id", -1))
+    if slot_id >= 0 and not is_current_generation(result, slot_generations):
+        return False, "stale_generation"
+    key = slot_id if slot_id >= 0 else str(getattr(result, "camera_id", ""))
+    channel = result_channels.get(key)
     if channel is None:
         return False, "unknown_camera_id"
     try:
@@ -314,9 +353,19 @@ def pose_result_router_main(
     result_channels: dict,
     report_queue,
     stop_event,
+    slot_generations=None,
+    health_queue=None,
 ) -> None:
     runtime = config.get("runtime", {})
     route_timeout_sec = float(runtime.get("pose_route_timeout_sec", 0.5))
+    health = HealthEmitter(
+        health_queue,
+        component="pose_router",
+        component_type="shared_worker",
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
+    routed_count = 0
 
     _report(
         report_queue,
@@ -333,12 +382,15 @@ def pose_result_router_main(
         try:
             result = shared_result_queue.get(timeout=0.25)
         except queue.Empty:
+            health.heartbeat(progress=routed_count)
             continue
 
         try:
             if result is None:
                 break
-            routed, reason = route_pose_result(result, result_channels, route_timeout_sec)
+            routed, reason = route_pose_result(
+                result, result_channels, route_timeout_sec, slot_generations
+            )
             if not routed:
                 _report(
                     report_queue,
@@ -353,6 +405,9 @@ def pose_result_router_main(
                         "request_id": getattr(result, "request_id", None),
                     },
                 )
+            else:
+                routed_count += 1
+                health.emit("result_delivered", progress=routed_count)
         finally:
             try:
                 shared_result_queue.task_done()
@@ -368,6 +423,7 @@ def pose_result_router_main(
             "detail": "stopped",
         },
     )
+    health.emit("process_stopping", force=True, progress=routed_count)
 
 
 def run_pose_inference_loop(
@@ -377,6 +433,8 @@ def run_pose_inference_loop(
     report_queue,
     stop_event,
     adapter_factory: Callable | None = None,
+    slot_generations=None,
+    health_queue=None,
 ) -> None:
     runtime = config.get("runtime", {})
     models = config.get("models", {})
@@ -408,6 +466,13 @@ def run_pose_inference_loop(
     payload_width_max = 0
     payload_height_max = 0
     payload_channels_max = 0
+    health = HealthEmitter(
+        health_queue,
+        component="pose",
+        component_type="shared_worker",
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
 
     _report(
         report_queue,
@@ -446,6 +511,7 @@ def run_pose_inference_loop(
         try:
             first_request = request_queue.get(timeout=0.25)
         except queue.Empty:
+            health.heartbeat(progress=requests_processed)
             continue
 
         batch = []
@@ -467,12 +533,61 @@ def run_pose_inference_loop(
             batch = collected.requests
             sentinel_received = collected.sentinel_received
             shutdown_after_batch = sentinel_received
+            active_batch = []
+            for request in batch:
+                if is_current_generation(request, slot_generations) and live_request_stale(request):
+                    if hasattr(request_queue, "observe"):
+                        request_queue.observe(request.slot_id, "dropped_live")
+                    deliver_result(
+                        result_queue,
+                        PoseInferenceResult(
+                            camera_id=request.camera_id, generation=request.generation,
+                            frame_idx=request.frame_idx, request_id=request.request_id,
+                            slot_id=request.slot_id, outcome="dropped_live",
+                        ), stop_event, timeout=max(0.01, result_timeout_sec),
+                        ordered=bool(getattr(request_queue, "capacity_control", False)),
+                        health=health,
+                    )
+                    health.heartbeat(progress=requests_processed)
+                    request_queue.task_done()
+                    continue
+                if is_current_generation(request, slot_generations):
+                    active_batch.append(request)
+                    continue
+                _report(
+                    report_queue,
+                    {
+                        "ts": now_str(),
+                        "camera_id": getattr(request, "camera_id", "__system__"),
+                        "stage": "pose_inference",
+                        "detail": "stale_generation_dropped",
+                        "generation": getattr(request, "generation", None),
+                        "slot_id": getattr(request, "slot_id", None),
+                    },
+                )
+                try:
+                    request_queue.task_done()
+                except Exception:
+                    pass
+                if hasattr(request_queue, "observe"):
+                    request_queue.observe(request.slot_id, "stale_generation")
+            batch = active_batch
+            if not batch:
+                if shutdown_after_batch:
+                    break
+                continue
             batches_processed += 1
 
             request_indices = list(
                 range(requests_processed + 1, requests_processed + len(batch) + 1)
             )
             requests_processed += len(batch)
+            health.emit(
+                "request_received",
+                force=True,
+                progress=requests_processed,
+                queue_depth=best_effort_queue_depth(request_queue),
+            )
             started_at = time.time()
             for request, worker_received_monotonic, request_index in zip(
                 batch,
@@ -535,6 +650,7 @@ def run_pose_inference_loop(
                         errors += 1
 
             inference_ended_monotonic = time.perf_counter()
+            health.emit("inference_completed", force=True, progress=requests_processed)
             processed_at = time.time()
             inference_ms = (inference_ended_monotonic - inference_started_monotonic) * 1000.0
             if metrics_enabled:
@@ -559,6 +675,8 @@ def run_pose_inference_loop(
                 request_indices,
                 outputs,
             ):
+                if not is_current_generation(request, slot_generations):
+                    continue
                 pose_result, error = output
                 result_put_started_monotonic = time.perf_counter()
                 result = PoseInferenceResult(
@@ -577,9 +695,15 @@ def run_pose_inference_loop(
                     inference_ended_monotonic=inference_ended_monotonic,
                     result_put_started_monotonic=result_put_started_monotonic,
                     worker_request_index=request_index,
+                    slot_id=int(getattr(request, "slot_id", -1)),
                 )
                 try:
-                    result_queue.put(result, timeout=max(0.01, result_timeout_sec))
+                    deliver_result(
+                        result_queue, result, stop_event, timeout=max(0.01, result_timeout_sec),
+                        ordered=bool(getattr(request_queue, "capacity_control", False)),
+                        health=health,
+                    )
+                    health.emit("result_delivered", progress=request_index)
                     if metrics_enabled:
                         result_enqueue_ms = (
                             time.perf_counter() - result_put_started_monotonic
@@ -676,6 +800,7 @@ def run_pose_inference_loop(
             "payload_channels_max": payload_channels_max,
         },
     )
+    health.emit("process_stopping", force=True, progress=requests_processed)
 
     _report(
         report_queue,
@@ -695,6 +820,8 @@ def pose_inference_process_main(
     result_queue,
     report_queue,
     stop_event,
+    slot_generations=None,
+    health_queue=None,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -702,7 +829,15 @@ def pose_inference_process_main(
         enable_cuda_tuning=True,
     )
     try:
-        run_pose_inference_loop(config, request_queue, result_queue, report_queue, stop_event)
+        run_pose_inference_loop(
+            config,
+            request_queue,
+            result_queue,
+            report_queue,
+            stop_event,
+            slot_generations=slot_generations,
+            health_queue=health_queue,
+        )
     except Exception as exc:
         _report(
             report_queue,
@@ -714,4 +849,9 @@ def pose_inference_process_main(
                 "error": f"{type(exc).__name__}: {exc}",
             },
         )
+        HealthEmitter(
+            health_queue,
+            component="pose",
+            component_type="shared_worker",
+        ).emit("process_error", force=True, detail=type(exc).__name__)
         raise

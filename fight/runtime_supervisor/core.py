@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
+from .camera_state import DesiredCameraStateStore
+
 
 STOPPED = "STOPPED"
 STARTING = "STARTING"
@@ -70,6 +72,7 @@ class SupervisorConfig:
     restart_window_sec: float = 300.0
     restart_backoff_sec: float = 3.0
     monitor_interval_sec: float = 0.25
+    health_snapshot_stale_sec: float = 10.0
 
     @classmethod
     def from_env(cls) -> "SupervisorConfig":
@@ -104,6 +107,9 @@ class SupervisorConfig:
             ),
             restart_backoff_sec=max(
                 0.0, float(os.getenv("SUPERVISOR_RESTART_BACKOFF_SEC", "3"))
+            ),
+            health_snapshot_stale_sec=max(
+                1.0, float(os.getenv("HEALTH_SNAPSHOT_STALE_SEC", "10"))
             ),
         )
 
@@ -153,6 +159,10 @@ class RuntimeSupervisor:
     def telemetry_path(self) -> Path:
         return self.config.state_dir / "supervisor_events.jsonl"
 
+    @property
+    def desired_camera_path(self) -> Path:
+        return self.config.state_dir / "desired_cameras.json"
+
     def _fresh_state(self) -> dict:
         return {
             "supervisor_state": STOPPED,
@@ -164,6 +174,7 @@ class RuntimeSupervisor:
             "last_exit_at": None,
             "config_path": None,
             "launch_config_path": None,
+            "health_snapshot_path": None,
             "run_id": None,
             "restart_count": 0,
             "last_failure": None,
@@ -211,6 +222,7 @@ class RuntimeSupervisor:
                 "runtime_exit_code": previous.get("runtime_exit_code"),
                 "last_exit_at": previous.get("last_exit_at"),
                 "config_path": previous.get("config_path"),
+                "health_snapshot_path": previous.get("health_snapshot_path"),
                 "run_id": previous.get("run_id"),
                 "restart_count": int(previous.get("restart_count", 0) or 0),
             }
@@ -275,8 +287,23 @@ class RuntimeSupervisor:
     def _make_launch_config(self, requested_path: Path, payload: dict, run_id: str) -> Path:
         launch_payload = dict(payload)
         launch_payload["run_id"] = run_id
+        desired = DesiredCameraStateStore(self.desired_camera_path).bootstrap(
+            list(payload.get("cameras") or [])
+        )
+        launch_payload["cameras"] = [
+            camera
+            for camera in desired["cameras"]
+            if camera["enabled"] and camera["use_fight_detection"]
+        ]
         runtime = dict(launch_payload.get("runtime") or {})
         runtime["run_id"] = run_id
+        runtime["dynamic_camera_lifecycle_enabled"] = True
+        runtime["desired_camera_state_path"] = str(self.desired_camera_path)
+        output_path = Path(str(launch_payload["output_dir"]))
+        if not output_path.is_absolute():
+            output_path = self.config.repo_root / output_path
+        health_snapshot_path = output_path.resolve() / "runtime_health.json"
+        runtime["health_snapshot_path"] = str(health_snapshot_path)
         launch_payload["runtime"] = runtime
         launch_path = requested_path.with_name(
             f"{requested_path.stem}.supervisor-{run_id}{requested_path.suffix}"
@@ -316,6 +343,10 @@ class RuntimeSupervisor:
         requested_path, payload = self._validate_config_path(config_path)
         run_id = uuid.uuid4().hex
         launch_path = self._make_launch_config(requested_path, payload, run_id)
+        output_path = Path(str(payload["output_dir"]))
+        if not output_path.is_absolute():
+            output_path = self.config.repo_root / output_path
+        health_snapshot_path = output_path.resolve() / "runtime_health.json"
         logs_dir = self.config.state_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = logs_dir / f"runtime-{run_id}.stdout.log"
@@ -332,6 +363,7 @@ class RuntimeSupervisor:
                 "last_exit_at": None,
                 "config_path": str(requested_path),
                 "launch_config_path": str(launch_path),
+                "health_snapshot_path": str(health_snapshot_path),
                 "run_id": run_id,
                 "last_failure": None,
                 "orphan_detected": False,
@@ -591,13 +623,192 @@ class RuntimeSupervisor:
                 if self._state["runtime_state"] != STOPPING:
                     self._refresh_child_locked()
 
+    def _health_snapshot_locked(self) -> dict:
+        runtime_state = str(self._state.get("runtime_state") or STOPPED)
+        if runtime_state not in {STARTING, RUNNING}:
+            return {
+                "ok": True,
+                "available": False,
+                "stale": False,
+                "runtime_health": STOPPED,
+                "reason": "runtime_stopped",
+                "updated_at": None,
+                "camera_count": 0,
+                "worker_count": 0,
+                "cameras": {},
+                "workers": {},
+            }
+        path_value = str(self._state.get("health_snapshot_path") or "").strip()
+        if not path_value:
+            return {
+                "ok": True,
+                "available": False,
+                "stale": True,
+                "runtime_health": "UNKNOWN",
+                "reason": "health_snapshot_unavailable",
+                "updated_at": None,
+                "camera_count": 0,
+                "worker_count": 0,
+                "cameras": {},
+                "workers": {},
+            }
+        path = Path(path_value)
+        try:
+            if not path.is_file() or path.stat().st_size > 1024 * 1024:
+                raise ValueError("snapshot missing or oversized")
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+                raise ValueError("invalid snapshot schema")
+            if str(payload.get("run_id") or "") != str(self._state.get("run_id") or ""):
+                raise ValueError("snapshot run mismatch")
+            raw_cameras = payload.get("cameras")
+            raw_workers = payload.get("workers")
+            if not isinstance(raw_cameras, dict) or len(raw_cameras) > 512:
+                raise ValueError("invalid camera health")
+            if not isinstance(raw_workers, dict) or len(raw_workers) > 16:
+                raise ValueError("invalid worker health")
+            camera_fields = {
+                "capacity",
+                "generation",
+                "slot_id",
+                "lifecycle",
+                "health",
+                "reason",
+                "last_ingest_heartbeat_age_sec",
+                "last_frame_age_sec",
+                "last_fight_publish_age_sec",
+                "last_worker_heartbeat_age_sec",
+                "last_frame_consumed_age_sec",
+                "last_person_request_age_sec",
+                "last_pose_request_age_sec",
+                "last_event_generated_age_sec",
+                "last_preview_publish_age_sec",
+                "reconnect_count",
+                "frames_dropped",
+                "restart_count",
+                "source_state",
+            }
+            worker_fields = {
+                "capacity",
+                "health",
+                "reason",
+                "heartbeat_age_sec",
+                "last_request_age_sec",
+                "last_completed_age_sec",
+                "last_result_age_sec",
+                "progress",
+                "queue_depth",
+                "dropped",
+            }
+            cameras = {
+                str(cid)[:100]: {
+                    key: value for key, value in record.items() if key in camera_fields
+                }
+                for cid, record in raw_cameras.items()
+                if isinstance(record, dict)
+            }
+            workers = {
+                str(name)[:100]: {
+                    key: value for key, value in record.items() if key in worker_fields
+                }
+                for name, record in raw_workers.items()
+                if isinstance(record, dict)
+            }
+            written = float(payload.get("written_wall_time") or 0.0)
+            age = max(0.0, time.time() - written) if written > 0 else float("inf")
+            stale = age > self.config.health_snapshot_stale_sec
+            reported_health = str(payload.get("runtime_health") or "UNKNOWN")
+            runtime_health = (
+                FAILED
+                if reported_health == FAILED
+                else "DEGRADED"
+                if stale
+                else reported_health
+            )
+            return {
+                "ok": True,
+                "available": True,
+                "stale": stale,
+                "snapshot_age_sec": round(age, 3) if age != float("inf") else None,
+                "runtime_health": runtime_health,
+                "snapshot_runtime_health": reported_health,
+                "reason": "health_snapshot_stale" if stale else str(payload.get("reason") or ""),
+                "updated_at": payload.get("updated_at"),
+                "camera_count": len(cameras),
+                "worker_count": len(workers),
+                "cameras": cameras,
+                "workers": workers,
+            }
+        except Exception:
+            return {
+                "ok": True,
+                "available": False,
+                "stale": True,
+                "runtime_health": "UNKNOWN",
+                "reason": "health_snapshot_unavailable",
+                "updated_at": None,
+                "camera_count": 0,
+                "worker_count": 0,
+                "cameras": {},
+                "workers": {},
+            }
+
+    def runtime_health(self) -> dict:
+        with self._lock:
+            if self._state["runtime_state"] != STOPPING:
+                self._refresh_child_locked()
+            return self._health_snapshot_locked()
+
     def status(self) -> dict:
         with self._lock:
             if self._state["runtime_state"] != STOPPING:
                 self._refresh_child_locked()
             result = dict(self._state)
+            try:
+                desired = DesiredCameraStateStore(self.desired_camera_path).load()
+                result["desired_camera_revision"] = desired["revision"]
+                result["desired_camera_count"] = len(desired["cameras"])
+                result["desired_camera_state_valid"] = True
+            except Exception:
+                result["desired_camera_revision"] = None
+                result["desired_camera_count"] = None
+                result["desired_camera_state_valid"] = False
+            health = self._health_snapshot_locked()
+            result["runtime_health"] = health["runtime_health"]
+            result["runtime_health_updated_at"] = health["updated_at"]
+            result["health_summary"] = {
+                key: health[key]
+                for key in (
+                    "available",
+                    "stale",
+                    "reason",
+                    "camera_count",
+                    "worker_count",
+                )
+            }
             result["ok"] = True
             return result
+
+    def desired_cameras(self) -> dict:
+        with self._lock:
+            result = DesiredCameraStateStore(self.desired_camera_path).load()
+            return {**result, "ok": True}
+
+    def update_desired_cameras(self, payload: dict) -> dict:
+        with self._lock:
+            update = DesiredCameraStateStore(self.desired_camera_path).update(payload)
+            if update.changed:
+                self._record(
+                    "desired_cameras_updated",
+                    revision=update.state["revision"],
+                    camera_count=len(update.state["cameras"]),
+                )
+            return {
+                **update.state,
+                "ok": True,
+                "accepted": update.changed,
+                "runtime_state": self._state["runtime_state"],
+            }
 
     def close(self, *, stop_runtime: bool = True) -> None:
         self._monitor_stop.set()

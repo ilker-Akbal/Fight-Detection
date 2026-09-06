@@ -19,13 +19,20 @@ class RuntimeSupervisorClient:
         self.token = str(token or "")
         self.timeout = max(0.1, float(timeout))
 
-    def _request(self, method: str, path: str, payload: dict | None = None) -> dict:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict | None = None,
+        *,
+        authenticated: bool = False,
+    ) -> dict:
         data = None
         headers = {"Accept": "application/json"}
         if payload is not None:
             data = json.dumps(payload).encode("utf-8")
             headers["Content-Type"] = "application/json"
-        if method != "GET":
+        if method != "GET" or authenticated:
             headers["Authorization"] = f"Bearer {self.token}"
         request = Request(
             self.base_url + path,
@@ -60,3 +67,12 @@ class RuntimeSupervisorClient:
     def restart(self, config_path: str | None = None) -> dict:
         payload = {"config_path": str(config_path)} if config_path else {}
         return self._request("POST", "/restart", payload)
+
+    def desired_cameras(self) -> dict:
+        return self._request("GET", "/runtime/cameras", authenticated=True)
+
+    def runtime_health(self) -> dict:
+        return self._request("GET", "/runtime/health", authenticated=True)
+
+    def update_desired_cameras(self, payload: dict) -> dict:
+        return self._request("PUT", "/runtime/cameras", payload)

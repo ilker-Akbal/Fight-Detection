@@ -12,6 +12,23 @@ class ReportMessage:
 
 
 @dataclass
+class HealthEvent:
+    component: str
+    component_type: str
+    event_type: str
+    monotonic_ts: float = field(default_factory=time.monotonic)
+    camera_id: str = ""
+    slot_id: int = -1
+    generation: int = -1
+    progress: int = 0
+    secondary_progress: int = 0
+    queue_depth: int = -1
+    dropped: int = 0
+    reconnect_count: int = 0
+    detail: str = ""
+
+
+@dataclass
 class CameraFrame:
     camera_id: str
     generation: int
@@ -50,6 +67,9 @@ class PersonInferenceRequest:
     payload_height: int = 0
     payload_channels: int = 0
     payload_bytes: int = 0
+    slot_id: int = -1
+    source_is_file: bool = True
+    max_age_sec: float = 0.0
 
 
 @dataclass
@@ -69,6 +89,8 @@ class PersonInferenceResult:
     inference_ended_monotonic: float = 0.0
     result_put_started_monotonic: float = 0.0
     worker_request_index: int = 0
+    slot_id: int = -1
+    outcome: str = "accepted"
 
 
 @dataclass
@@ -85,6 +107,9 @@ class PoseInferenceRequest:
     payload_height: int = 0
     payload_channels: int = 0
     payload_bytes: int = 0
+    slot_id: int = -1
+    source_is_file: bool = True
+    max_age_sec: float = 0.0
 
 
 @dataclass
@@ -104,6 +129,8 @@ class PoseInferenceResult:
     inference_ended_monotonic: float = 0.0
     result_put_started_monotonic: float = 0.0
     worker_request_index: int = 0
+    slot_id: int = -1
+    outcome: str = "accepted"
 
 
 @dataclass
@@ -121,6 +148,8 @@ class Stage3Job:
     frame_count: int = 0
     created_at: float = field(default_factory=time.time)
     created_monotonic: float = field(default_factory=time.perf_counter)
+    generation: int = 0
+    slot_id: int = -1
 
 
 @dataclass
@@ -136,6 +165,8 @@ class Stage3ResultMessage:
     pose_score_max: float
     pose_score_mean: float
     processed_at: float = field(default_factory=time.time)
+    generation: int = 0
+    slot_id: int = -1
 
 
 @dataclass

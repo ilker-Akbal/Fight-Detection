@@ -24,6 +24,20 @@ class _UnavailableClient:
     def status(self):
         raise SupervisorUnavailable("offline")
 
+    def runtime_health(self):
+        raise SupervisorUnavailable("offline")
+
+
+class _HealthyClient:
+    def runtime_health(self):
+        return {
+            "ok": True,
+            "available": True,
+            "runtime_health": "HEALTHY",
+            "cameras": {"cam_A": {"health": "ONLINE"}},
+            "workers": {"person": {"health": "HEALTHY"}},
+        }
+
 
 class _StartedClient:
     def __init__(self, config_path):
@@ -52,6 +66,23 @@ class SupervisorDjangoBridgeTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertEqual(status["runtime_state"], "UNKNOWN")
         self.assertEqual(status["last_failure"], "supervisor_unavailable")
+
+    def test_backend_health_helper_exposes_data_without_ui_dependency(self):
+        with (
+            patch.object(fight_runner, "_control_mode", return_value="supervisor"),
+            patch.object(fight_runner, "_supervisor_client", return_value=_HealthyClient()),
+        ):
+            health = fight_runner.get_runtime_health()
+        self.assertEqual(health["runtime_health"], "HEALTHY")
+        self.assertEqual(health["cameras"]["cam_A"]["health"], "ONLINE")
+
+        with (
+            patch.object(fight_runner, "_control_mode", return_value="supervisor"),
+            patch.object(fight_runner, "_supervisor_client", return_value=_UnavailableClient()),
+        ):
+            unavailable = fight_runner.get_runtime_health()
+        self.assertFalse(unavailable["available"])
+        self.assertEqual(unavailable["runtime_health"], "UNKNOWN")
 
     def test_supervisor_mode_never_calls_django_popen(self):
         with tempfile.TemporaryDirectory() as temp_dir:

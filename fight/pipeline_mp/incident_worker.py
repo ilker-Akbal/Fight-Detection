@@ -5,6 +5,8 @@ from pathlib import Path
 
 from fight.pipeline.incident_aggregator import IncidentAggregator, Stage3Result
 from fight.pipeline_mp.common import configure_process_runtime, now_str
+from fight.pipeline_mp.generation import is_current_generation
+from fight.pipeline_mp.health import HealthEmitter
 from fight.pipeline_mp.messages import ReportMessage, Stage3ResultMessage
 
 
@@ -15,7 +17,14 @@ def _report(report_queue, kind: str, row: dict) -> None:
         pass
 
 
-def incident_process_main(config: dict, incident_queue, report_queue, stop_event) -> None:
+def incident_process_main(
+    config: dict,
+    incident_queue,
+    report_queue,
+    stop_event,
+    slot_generations=None,
+    health_queue=None,
+) -> None:
     runtime = config.get("runtime", {})
     output_dir = config["output_dir"]
     output_path = Path(output_dir)
@@ -27,6 +36,15 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
     outbox_path = runtime.get("incident_outbox_path") or str(
         default_spool_root / "runtime_spool" / "incidents_outbox.jsonl"
     )
+    health = HealthEmitter(
+        health_queue,
+        component="incident",
+        component_type="shared_worker",
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
+    received_count = 0
+    completed_count = 0
 
     configure_process_runtime(
         cv2_threads=int(runtime.get("incident_cv2_threads", 1)),
@@ -71,6 +89,7 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
             try:
                 msg = incident_queue.get(timeout=0.5)
             except queue.Empty:
+                health.heartbeat(progress=completed_count)
                 continue
 
             if msg is None:
@@ -79,6 +98,23 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
             try:
                 if not isinstance(msg, Stage3ResultMessage):
                     continue
+                if not is_current_generation(msg, slot_generations):
+                    _report(
+                        report_queue,
+                        "status",
+                        {
+                            "ts": now_str(),
+                            "camera_id": msg.camera_id,
+                            "stage": "incident",
+                            "detail": "stale_generation_dropped",
+                            "generation": msg.generation,
+                            "slot_id": msg.slot_id,
+                        },
+                    )
+                    continue
+
+                received_count += 1
+                health.emit("work_received", progress=received_count)
 
                 agg.submit(
                     Stage3Result(
@@ -94,6 +130,8 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
                         pose_score_mean=msg.pose_score_mean,
                     )
                 )
+                completed_count += 1
+                health.emit("work_completed", progress=completed_count)
 
                 _report(
                     report_queue,
@@ -145,3 +183,4 @@ def incident_process_main(config: dict, incident_queue, report_queue, stop_event
                 "detail": "stopped",
             },
         )
+        health.emit("process_stopping", force=True, progress=completed_count)

@@ -14,6 +14,7 @@ from fight.pipeline_mp.common import (
     redact_source,
 )
 from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal, ReportMessage
+from fight.pipeline_mp.health import HealthEmitter
 
 
 def _report(report_queue, camera_id: str, detail: str, **extra) -> None:
@@ -118,6 +119,8 @@ def run_camera_ingest_loop(
     *,
     capture_factory: Callable[[str], object] = open_source,
     sleep_fn: Callable[[float], None] = time.sleep,
+    health_queue=None,
+    slot_id: int = -1,
 ) -> None:
     runtime = config.get("runtime", {})
     camera_id = str(camera["camera_id"])
@@ -157,6 +160,16 @@ def run_camera_ingest_loop(
     source_fps = 0.0
     source_frame_count = 0
     stopping_detail = "stopping"
+    health = HealthEmitter(
+        health_queue,
+        component="camera_ingest",
+        component_type="camera",
+        camera_id=camera_id,
+        slot_id=slot_id,
+        generation=generation,
+        interval_sec=float(runtime.get("health_heartbeat_interval_sec", 1.0)),
+    )
+    health.emit("process_started", force=True)
 
     _report(
         report_queue,
@@ -192,6 +205,12 @@ def run_camera_ingest_loop(
                     source_fps=round(source_fps, 6),
                     source_frame_count=source_frame_count,
                 )
+                health.emit(
+                    "source_online",
+                    force=True,
+                    progress=frame_seq,
+                    reconnect_count=reconnect_count,
+                )
                 if reconnect_count > 0:
                     _report(
                         report_queue,
@@ -213,6 +232,12 @@ def run_camera_ingest_loop(
                                 "eof",
                                 generation=int(generation),
                                 last_frame_seq=frame_seq,
+                            )
+                            health.emit(
+                                "eof",
+                                force=True,
+                                progress=frame_seq,
+                                reconnect_count=reconnect_count,
                             )
                             if loop_file_sources:
                                 break
@@ -246,6 +271,13 @@ def run_camera_ingest_loop(
                             "read_failed",
                             generation=int(generation),
                             last_frame_seq=frame_seq,
+                        )
+                        health.emit(
+                            "source_offline",
+                            force=True,
+                            progress=frame_seq,
+                            reconnect_count=reconnect_count,
+                            detail="read_failed",
                         )
                         break
 
@@ -290,6 +322,13 @@ def run_camera_ingest_loop(
                     frames_published_preview += int(published_preview)
                     frames_dropped_preview += int(
                         dropped_preview or not published_preview
+                    )
+                    health.emit(
+                        "frame_progress",
+                        progress=frame_seq,
+                        secondary_progress=frames_published_fight,
+                        dropped=frames_dropped_fight + frames_dropped_preview,
+                        reconnect_count=reconnect_count,
                     )
 
                     if not flow_started:
@@ -338,6 +377,13 @@ def run_camera_ingest_loop(
                     source=safe_source,
                     error=_safe_error(exc, source),
                 )
+                health.emit(
+                    "process_error",
+                    force=True,
+                    progress=frame_seq,
+                    reconnect_count=reconnect_count,
+                    detail=detail,
+                )
                 if source_is_file or not reconnect_enabled:
                     failure = CameraIngestSignal(
                         camera_id=camera_id,
@@ -380,9 +426,22 @@ def run_camera_ingest_loop(
                 reconnect_count=reconnect_count,
                 delay_sec=round(reconnect_delay, 3),
             )
+            health.emit(
+                "reconnecting",
+                force=True,
+                progress=frame_seq,
+                reconnect_count=reconnect_count,
+            )
             sleep_fn(reconnect_delay)
             reconnect_delay = min(reconnect_max, reconnect_delay * 2.0)
     finally:
+        health.emit(
+            "process_stopping",
+            force=True,
+            progress=frame_seq,
+            reconnect_count=reconnect_count,
+            detail=stopping_detail,
+        )
         if capture is not None:
             try:
                 capture.release()
@@ -452,6 +511,8 @@ def camera_ingest_process_main(
     report_queue,
     stop_event,
     generation: int,
+    health_queue=None,
+    slot_id: int = -1,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -469,6 +530,8 @@ def camera_ingest_process_main(
             report_queue,
             stop_event,
             generation,
+            health_queue=health_queue,
+            slot_id=slot_id,
         )
     except Exception as exc:
         _report(
@@ -478,4 +541,12 @@ def camera_ingest_process_main(
             generation=int(generation),
             error=_safe_error(exc, str(camera.get("source", ""))),
         )
+        HealthEmitter(
+            health_queue,
+            component="camera_ingest",
+            component_type="camera",
+            camera_id=str(camera.get("camera_id", "")),
+            slot_id=slot_id,
+            generation=generation,
+        ).emit("process_error", force=True, detail=type(exc).__name__)
         raise

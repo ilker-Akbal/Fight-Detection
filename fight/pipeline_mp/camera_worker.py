@@ -30,6 +30,8 @@ from fight.pipeline_mp.messages import (
     ReportMessage,
     Stage3Job,
 )
+from fight.pipeline_mp.health import HealthEmitter
+from fight.pipeline_mp.scheduling import AdmissionShed, AdmissionStopped, admit
 from fight.pipeline_mp.performance import BoundedMetricCollector
 from fight.pipeline_mp.person_worker import PersonInferenceClient, should_request_person_inference
 from fight.pipeline_mp.pose_worker import PoseInferenceClient, should_request_pose_inference
@@ -188,6 +190,8 @@ class CameraProcessRunner:
         pose_result_queue,
         generation: int,
         frame_queue=None,
+        slot_id: int = -1,
+        health_queue=None,
     ):
         self.config = config
         self.camera = camera
@@ -195,6 +199,7 @@ class CameraProcessRunner:
         self.report_queue = report_queue
         self.stop_event = stop_event
         self.generation = int(generation)
+        self.slot_id = int(slot_id)
         self.started_monotonic = time.perf_counter()
         self.frame_queue = frame_queue
         self.models = config.get("models", {})
@@ -208,6 +213,16 @@ class CameraProcessRunner:
             self.runtime.get("camera_ingest_mode", "legacy")
         ).strip().lower()
         self.centralized_ingest = self.camera_ingest_mode == "centralized"
+        self.health = HealthEmitter(
+            health_queue,
+            component="camera_worker",
+            component_type="camera",
+            camera_id=self.camera_id,
+            slot_id=self.slot_id,
+            generation=self.generation,
+            interval_sec=float(self.runtime.get("health_heartbeat_interval_sec", 1.0)),
+        )
+        self.health.emit("process_started", force=True)
 
         self.paths = MpPaths.from_output_dir(config["output_dir"])
         self.paths.mkdirs()
@@ -242,6 +257,10 @@ class CameraProcessRunner:
                 performance_metrics_sample_every=metrics_sample_every,
                 performance_metrics_max_samples=metrics_max_samples,
                 performance_metrics_warmup_requests=metrics_warmup_requests,
+                slot_id=self.slot_id,
+                source_is_file=self.source_is_file,
+                live_max_age_sec=float(self.runtime.get("live_inference_max_age_sec", 2.0)),
+                health=self.health,
             )
         self.person_inference = PersonInferenceClient(
             camera_id=self.camera_id,
@@ -256,6 +275,10 @@ class CameraProcessRunner:
             performance_metrics_sample_every=metrics_sample_every,
             performance_metrics_max_samples=metrics_max_samples,
             performance_metrics_warmup_requests=metrics_warmup_requests,
+            slot_id=self.slot_id,
+            source_is_file=self.source_is_file,
+            live_max_age_sec=float(self.runtime.get("live_inference_max_age_sec", 2.0)),
+            health=self.health,
         )
 
         temporal_cfg = _load_pose_temporal(self.models["pose_config"])
@@ -456,6 +479,9 @@ class CameraProcessRunner:
             self.prebuffer.clear()
 
     def detect_persons(self, frame_bgr):
+        health = getattr(self, "health", None)
+        if health is not None:
+            health.emit("person_request", force=True, progress=self.frame_idx)
         dets = self.person_inference.infer(frame_bgr, self.frame_idx)
         person_conf = float(self.runtime.get("person_conf", 0.25))
         dets = [(c, box) for (c, box) in dets if float(c) >= person_conf]
@@ -470,6 +496,9 @@ class CameraProcessRunner:
         if self.pose_inference is None:
             return None
 
+        health = getattr(self, "health", None)
+        if health is not None:
+            health.emit("pose_request", force=True, progress=self.frame_idx)
         raw = self.pose_inference.infer(roi_bgr, self.frame_idx)
         dec = self.pose_gate.update(raw.score, raw.ok)
 
@@ -575,6 +604,13 @@ class CameraProcessRunner:
             pose_scores=[float(pose_score)],
             positive_hits=1,
         )
+        health = getattr(self, "health", None)
+        if health is not None:
+            health.emit(
+                "event_generated",
+                progress=self.frame_idx,
+                secondary_progress=self.counters["events_opened"],
+            )
 
         self.report_status(
             "event",
@@ -736,16 +772,22 @@ class CameraProcessRunner:
                     frames=list(ev.frames),
                     positive_hits=int(ev.positive_hits),
                     frame_count=int(len(ev.frames)),
+                    generation=self.generation,
+                    slot_id=self.slot_id,
                 )
 
                 try:
-                    self.stage3_queue.put(
-                        job,
+                    admit(
+                        self.stage3_queue, job, self.stop_event,
                         timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
+                        ordered=True, health=self.health, stage="stage3",
                     )
                     self.counters["stage3_jobs_submitted"] += 1
                     queue_status = "queued"
                     queue_reason = "stage3_queue"
+                except AdmissionStopped:
+                    queue_status = "cancelled"
+                    queue_reason = "intentional_stop"
                 except Exception:
                     queue_status = "dropped"
                     queue_reason = "stage3_queue_full"
@@ -1220,6 +1262,12 @@ class CameraProcessRunner:
                         break
 
                     self.counters["frames_read"] += 1
+                    health = getattr(self, "health", None)
+                    if health is not None:
+                        health.emit(
+                            "frame_consumed",
+                            progress=self.counters["frames_read"],
+                        )
                     self.process_frame(frame)
 
             except Exception as exc:
@@ -1258,6 +1306,9 @@ class CameraProcessRunner:
             try:
                 message = self.frame_queue.get(timeout=0.25)
             except queue.Empty:
+                health = getattr(self, "health", None)
+                if health is not None:
+                    health.heartbeat(progress=self.counters["frames_read"])
                 continue
 
             if isinstance(message, CameraIngestSignal):
@@ -1323,7 +1374,27 @@ class CameraProcessRunner:
 
             self.frame_idx = int(message.frame_seq) - 2
             self.counters["frames_read"] += 1
-            self.process_frame(message.frame)
+            health = getattr(self, "health", None)
+            if health is not None:
+                health.emit(
+                    "frame_consumed",
+                    progress=self.counters["frames_read"],
+                )
+            if not self.source_is_file:
+                max_age = float(self.runtime.get("live_frame_max_age_sec", 2.0))
+                if max_age > 0 and time.perf_counter() - message.captured_monotonic >= max_age:
+                    self.counters["live_frames_shed"] = self.counters.get("live_frames_shed", 0) + 1
+                    if health is not None:
+                        health.emit("live_shed", detail="stale_frame")
+                    continue
+            try:
+                self.process_frame(message.frame)
+            except AdmissionShed:
+                # No negative AI decision is synthesized: temporal state is
+                # retained until a fresh usable frame can be processed.
+                self.counters["live_inferences_shed"] = self.counters.get("live_inferences_shed", 0) + 1
+                if health is not None:
+                    health.emit("live_shed", detail="stale_inference")
 
         if self.active_event is not None:
             self.close_event("shutdown")
@@ -1410,6 +1481,8 @@ def camera_process_main(
     pose_result_queue,
     generation: int,
     frame_queue=None,
+    slot_id: int = -1,
+    health_queue=None,
 ) -> None:
     runtime = config.get("runtime", {})
 
@@ -1430,8 +1503,15 @@ def camera_process_main(
         pose_result_queue=pose_result_queue,
         generation=generation,
         frame_queue=frame_queue,
+        slot_id=slot_id,
+        health_queue=health_queue,
     )
     try:
         runner.run_loop()
     finally:
+        runner.health.emit(
+            "process_stopping",
+            force=True,
+            progress=runner.counters["frames_read"],
+        )
         runner.report_performance_summary()
