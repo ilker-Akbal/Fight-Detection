@@ -28,25 +28,25 @@
     "direction": "A_TO_B",
     "line_a": [
       [
-        371,
-        250
+        388,
+        257
       ],
       [
-        452,
-        269
+        447,
+        272
       ]
     ],
     "line_b": [
       [
-        379,
-        440
+        76,
+        435
       ],
       [
-        164,
-        365
+        324,
+        503
       ]
     ],
-    "distance_m": 30.0
+    "distance_m": 29.9
   },
   "scale": {
     "source": "not_required_two_line_time_gate",
@@ -55,11 +55,11 @@
     "user_corrected": true
   },
   "created_at": 1778687279.4371064,
-  "updated_at": 1778687279.4371064,
+  "updated_at": 1788876730.9686797,
   "meta": {
     "created_by": "dashboard",
     "camera_name": "trafik",
-    "source": "C:\\Users\\HP\\Desktop\\Fight-Detection\\HizTespiti\\traffic_video.avi",
+    "source": "C:\\Users\\HP\\Desktop\\Fight-Detection\\Fight_backend_project\\backend_frontend_project\\media\\camera_uploads\\00010_c2fc011da725.avi",
     "frame_coordinate_space": "pipeline_resize_width",
     "resize_width": 960
   }

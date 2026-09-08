@@ -1001,6 +1001,12 @@ def _run_dynamic(config: dict) -> int:
             slot_id: ctx.Queue(maxsize=pose_channel_size) for slot_id in range(slot_count)
         }
     slot_generations = ctx.Array("q", slot_count, lock=True)
+    from fight.pipeline_mp.speed_worker import vehicle_service_main
+    speed_epochs = ctx.Array("q", slot_count, lock=True)
+    vehicle_requests = FairRequestQueue(ctx, slot_count, 1)
+    vehicle_results = {slot: ctx.Queue(maxsize=1) for slot in range(slot_count)}
+    vehicle_worker = _start_process("vehicle_inference", vehicle_service_main,
+        (config, vehicle_requests, vehicle_results, stop_event, slot_generations, speed_epochs, health_queue))
     # Stable-slot reservations prevent a hot camera from taking another
     # camera's admission budget. Consumer-side RR also feeds microbatching.
     if bool(runtime.get("fair_scheduling_enabled", True)):
@@ -1111,6 +1117,9 @@ def _run_dynamic(config: dict) -> int:
         health_queue=health_queue,
         terminate_process=_terminate_process,
         close_queue=_close_queue,
+        vehicle_requests=vehicle_requests,
+        vehicle_results=vehicle_results,
+        speed_epochs=speed_epochs,
     )
     desired_path = str(runtime.get("desired_camera_state_path") or "").strip()
     desired_store = DesiredCameraStateStore(desired_path) if desired_path else None
@@ -1129,6 +1138,7 @@ def _run_dynamic(config: dict) -> int:
         shared_processes["pose_inference"] = (pose_worker, 6)
         shared_processes["pose_result_router"] = (pose_result_router, 7)
     shared_health_processes = {
+        "vehicle": vehicle_worker,
         "person": person_worker,
         "person_router": person_result_router,
         "stage3": stage3,
@@ -1226,6 +1236,8 @@ def _run_dynamic(config: dict) -> int:
                         },
                     )
 
+            manager.speed_service_available = vehicle_worker.is_alive() and (
+                health_registry is None or health_registry.workers["vehicle"]["health"] != "FAILED")
             manager.poll()
             manager.retry_failed(revision=desired_revision)
             if health_registry is not None and health_queue is not None:
@@ -1239,6 +1251,7 @@ def _run_dynamic(config: dict) -> int:
                         "outbox": runtime.get("incident_outbox_path") or output_dir,
                     })
                     for stage, admission in (("person", person_request_queue),
+                                             ("vehicle", vehicle_requests),
                                              ("pose", pose_request_queue),
                                              ("stage3", stage3_queue)):
                         if not hasattr(admission, "snapshot"):
@@ -1294,6 +1307,9 @@ def _run_dynamic(config: dict) -> int:
                     time.sleep(poll_interval)
                     continue
                 graceful_file_finish = True
+                if any(item.speed_failed for item in manager.runtimes.values()):
+                    exit_code = 13
+                    graceful_file_finish = False
                 _put_status(
                     report_queue,
                     {
@@ -1319,6 +1335,10 @@ def _run_dynamic(config: dict) -> int:
     finally:
         manager.stop_all(reason="global_stop")
         stop_event.set()
+        _terminate_process(vehicle_worker, timeout=5.0)
+        _close_queue(vehicle_requests)
+        for channel in vehicle_results.values():
+            _close_queue(channel)
         _put_sentinel(person_request_queue, person_worker)
         _terminate_process(person_worker, timeout=8.0)
         _put_sentinel(person_result_queue, person_result_router)
@@ -1369,6 +1389,7 @@ def _run_dynamic(config: dict) -> int:
                                          ("stage3", stage3_queue))
                 if hasattr(admission, "snapshot")
             }
+            summary["capacity"]["vehicle"] = vehicle_requests.snapshot()
             write_json(output_dir / "performance_summary.json", summary)
         except Exception as exc:
             print(f"[PERFORMANCE][WARN] summary write failed: {exc}", flush=True)
@@ -1393,6 +1414,10 @@ def _run_dynamic(config: dict) -> int:
 def run(config: dict) -> int:
     from fight.operations import atomic_json, run_lock_path
     from fight.runtime_supervisor.locking import SingletonLock
+
+    if (any(camera.get("use_speed_detection") for camera in config.get("cameras", []))
+            and not config.get("runtime", {}).get("dynamic_camera_lifecycle_enabled", False)):
+        raise ValueError("Speed requires the common dynamic CameraIngest runtime")
 
     output = Path(config["output_dir"]).resolve()
     with SingletonLock(run_lock_path(output)):

@@ -26,6 +26,7 @@ class HealthEvent:
     dropped: int = 0
     reconnect_count: int = 0
     detail: str = ""
+    consumer_epoch: int = 0
 
 
 @dataclass

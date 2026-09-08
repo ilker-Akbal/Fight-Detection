@@ -84,6 +84,31 @@ def publish_ordered(channel, item, stop_event, timeout_sec: float) -> bool:
     return False
 
 
+class ConsumerStop:
+    def __init__(self, runtime_stop, consumer_stop):
+        self.runtime_stop, self.consumer_stop = runtime_stop, consumer_stop
+
+    def is_set(self):
+        return ((self.runtime_stop is not None and self.runtime_stop.is_set())
+                or (self.consumer_stop is not None and self.consumer_stop.is_set()))
+
+
+def publish_speed(channel, item, stop, consumer_stop, ordered, timeout, health=None):
+    if channel is None or (consumer_stop is not None and consumer_stop.is_set()):
+        return False, 0
+    if not ordered:
+        return publish_latest(channel, item)
+    combined = ConsumerStop(stop, consumer_stop)
+    while not combined.is_set():
+        try:
+            channel.put(item, timeout=timeout)
+            return True, 0
+        except queue.Full:
+            if health is not None:
+                health.emit("capacity_wait", detail="vehicle")
+    return False, 0
+
+
 def _publish_signal(
     channel,
     signal: CameraIngestSignal,
@@ -121,6 +146,8 @@ def run_camera_ingest_loop(
     sleep_fn: Callable[[float], None] = time.sleep,
     health_queue=None,
     slot_id: int = -1,
+    speed_channel=None,
+    speed_stop=None,
 ) -> None:
     runtime = config.get("runtime", {})
     camera_id = str(camera["camera_id"])
@@ -151,6 +178,7 @@ def run_camera_ingest_loop(
     capture = None
     frame_seq = 0
     frames_decoded = 0
+    frames_published_speed = frames_dropped_speed = 0
     frames_published_fight = 0
     frames_dropped_fight = 0
     frames_published_preview = 0
@@ -254,6 +282,8 @@ def run_camera_ingest_loop(
                                 stop_event=stop_event,
                                 timeout=publish_timeout,
                             )
+                            publish_speed(speed_channel, eof_signal, stop_event, speed_stop,
+                                          source_is_file, publish_timeout, health)
                             _publish_signal(
                                 preview_channel,
                                 eof_signal,
@@ -299,7 +329,9 @@ def run_camera_ingest_loop(
                         source_frame_count=source_frame_count,
                     )
 
-                    if file_fight_ordered:
+                    if fight_channel is None:
+                        published_fight, dropped_fight = False, 0
+                    elif file_fight_ordered:
                         published_fight = publish_ordered(
                             fight_channel,
                             envelope,
@@ -314,6 +346,11 @@ def run_camera_ingest_loop(
                         )
                     frames_published_fight += int(published_fight)
                     frames_dropped_fight += int(dropped_fight or not published_fight)
+                    published_speed, dropped_speed = publish_speed(
+                        speed_channel, envelope, stop_event, speed_stop,
+                        source_is_file, publish_timeout, health)
+                    frames_published_speed += int(published_speed)
+                    frames_dropped_speed += dropped_speed
 
                     published_preview, dropped_preview = publish_latest(
                         preview_channel,
@@ -357,6 +394,7 @@ def run_camera_ingest_loop(
                         frame_seq=frame_seq,
                         error="live source read failed and reconnect is disabled",
                     )
+                    publish_speed(speed_channel, failure, stop_event, speed_stop, False, publish_timeout)
                     _publish_signal(
                         fight_channel,
                         failure,
@@ -392,6 +430,7 @@ def run_camera_ingest_loop(
                         frame_seq=frame_seq,
                         error=_safe_error(exc, source),
                     )
+                    publish_speed(speed_channel, failure, stop_event, speed_stop, source_is_file, publish_timeout)
                     _publish_signal(
                         fight_channel,
                         failure,
@@ -482,6 +521,8 @@ def run_camera_ingest_loop(
             "summary",
             generation=int(generation),
             frames_decoded=frames_decoded,
+            frames_published_speed=frames_published_speed,
+            frames_dropped_speed=frames_dropped_speed,
             frames_published_fight=frames_published_fight,
             frames_dropped_fight=frames_dropped_fight,
             frames_published_preview=frames_published_preview,
@@ -513,6 +554,8 @@ def camera_ingest_process_main(
     generation: int,
     health_queue=None,
     slot_id: int = -1,
+    speed_channel=None,
+    speed_stop=None,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -532,6 +575,8 @@ def camera_ingest_process_main(
             generation,
             health_queue=health_queue,
             slot_id=slot_id,
+            speed_channel=speed_channel,
+            speed_stop=speed_stop,
         )
     except Exception as exc:
         _report(

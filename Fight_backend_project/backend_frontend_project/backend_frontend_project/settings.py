@@ -320,6 +320,7 @@ PIPELINE_DEFAULTS = {
     "camera_ingest_mode": "centralized",
     "camera_ingest_fight_queue_size": 8,
     "camera_ingest_preview_queue_size": 1,
+    "camera_ingest_speed_queue_size": int(os.getenv("CAMERA_INGEST_SPEED_QUEUE_SIZE", "2")),
     "camera_ingest_publish_timeout_sec": 0.2,
     "camera_ingest_file_fight_policy": "ordered",
     "camera_ingest_cv2_threads": 1,

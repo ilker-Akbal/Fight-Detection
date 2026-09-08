@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from typing import Optional
 
-from .speed_runner import ActiveSpeedRun
+from .speed_runner import ActiveSpeedRun, get_active_speed_run
 
 
 class SpeedPipelineRuntime:
@@ -12,8 +12,9 @@ class SpeedPipelineRuntime:
         self._active_run: Optional[ActiveSpeedRun] = None
 
     def get(self) -> Optional[ActiveSpeedRun]:
-        with self._lock:
-            return self._active_run
+        # Supervisor state, not the current Django/Gunicorn process's cache,
+        # determines whether Speed is running.
+        return get_active_speed_run()
 
     def set(self, active_run: Optional[ActiveSpeedRun]) -> None:
         with self._lock:

@@ -7,6 +7,7 @@ import json
 import shutil
 import subprocess
 import time
+import os
 
 import cv2
 
@@ -50,11 +51,13 @@ class EvidenceWriter:
         camera_id: str,
         cfg: EvidenceConfig,
         fps: float,
+        persist=None,
     ):
         self.output_dir = Path(output_dir)
         self.camera_id = camera_id
         self.cfg = cfg
         self.fps = max(float(fps), 1.0)
+        self.persist = persist
 
         self.event_dir = self.output_dir / "events"
         self.snapshot_dir = self.output_dir / "snapshots"
@@ -181,11 +184,13 @@ class EvidenceWriter:
 
         if self.cfg.save_snapshot:
             snapshot_path = str(self.snapshot_dir / f"{base_name}.jpg")
-            cv2.imwrite(
+            written = cv2.imwrite(
                 snapshot_path,
                 frame_vis,
                 [int(cv2.IMWRITE_JPEG_QUALITY), int(self.cfg.jpeg_quality)],
             )
+            if self.persist is not None and not written:
+                raise OSError("speed_snapshot_write_failed")
 
         if self.cfg.save_clip:
             start_frame = int(frame_idx - self.cfg.clip_pre_sec * self.fps)
@@ -197,6 +202,8 @@ class EvidenceWriter:
 
                 if clip_file.exists() and clip_file.stat().st_size > 0:
                     clip_path = str(clip_file)
+            if self.persist is not None and clip_path is None:
+                raise OSError("speed_clip_write_failed")
 
         x1, y1, x2, y2 = [int(v) for v in track.box]
 
@@ -216,7 +223,18 @@ class EvidenceWriter:
             created_at=time.time(),
         )
 
+        if self.persist is not None:
+            from fight.operations import fsync_directory
+            for evidence in (snapshot_path, clip_path):
+                if evidence:
+                    with open(evidence, "r+b") as handle:
+                        os.fsync(handle.fileno())
+                    fsync_directory(Path(evidence).parent)
+            self.persist(event)  # Outbox before compatibility JSONL.
         with self.events_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(event), ensure_ascii=False) + "\n")
+            if self.persist is not None:
+                f.flush()
+                os.fsync(f.fileno())
 
         return event

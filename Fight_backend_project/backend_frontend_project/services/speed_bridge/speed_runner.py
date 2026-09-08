@@ -12,7 +12,6 @@ from typing import Any
 
 from django.conf import settings
 
-from speed_detection.models import SpeedCameraConfig
 from services.speed_bridge.calibration_writer import resolve_speed_calibration_path
 
 
@@ -105,6 +104,7 @@ def _safe_float(value, default: float) -> float:
 
 
 def _build_camera_items() -> list[dict[str, Any]]:
+    from speed_detection.models import SpeedCameraConfig
     qs = (
     SpeedCameraConfig.objects
     .select_related("camera")
@@ -226,120 +226,72 @@ def build_command(config_path: Path) -> list[str]:
     ]
 
 
+
+
+class CommonRuntimeProcess:
+    """Read-only process facade for existing backend callers; never opens a source."""
+    def __init__(self, pid):
+        self.pid = pid
+
+    def poll(self):
+        from services.pipeline_bridge.fight_runner import get_pipeline_status
+        status = get_pipeline_status()
+        if status.get("runtime_state") == "UNKNOWN":
+            raise RuntimeError("Common runtime ownership is unavailable")
+        if status.get("speed_paused"):
+            return 0
+        if status.get("runtime_state") in {"RUNNING", "STARTING"} and status.get("runtime_pid") == self.pid:
+            return None
+        return status.get("runtime_exit_code") or 0
+
+
+def _set_speed_paused(paused):
+    from services.pipeline_bridge.camera_registry import supervisor_client
+    client = supervisor_client()
+    current = client.desired_cameras()
+    cameras = list(current.get("cameras") or [])
+    if paused:
+        cameras = [{**item, "use_speed_detection": False} for item in cameras]
+    client.update_desired_cameras({"schema_version": 1, "revision": int(current.get("revision", 0)) + 1,
+                                   "cameras": cameras, "speed_paused": bool(paused)})
+
+
 def start_speed_pipeline() -> ActiveSpeedRun:
-    cameras = _build_camera_items()
-
-    if not cameras:
-        raise RuntimeError(
-            "Hız tespiti için aktif kamera bulunamadı. "
-            "Admin kamera düzenleme ekranından Hız Tespiti Durumu aktif edilmeli."
-        )
-
-    run_name = time.strftime("speed_run_%Y%m%d_%H%M%S")
-    run_dir = _speed_runs_root() / run_name
-    run_dir.mkdir(parents=True, exist_ok=True)
-
-    (run_dir / "previews").mkdir(parents=True, exist_ok=True)
-    (run_dir / "snapshots").mkdir(parents=True, exist_ok=True)
-    (run_dir / "clips").mkdir(parents=True, exist_ok=True)
-    (run_dir / "events").mkdir(parents=True, exist_ok=True)
-
-    config = build_run_config(run_name=run_name, run_dir=run_dir, cameras=cameras)
-    config_path = run_dir / "run_config.json"
-    config_path.write_text(
-        json.dumps(config, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-    stdout_path = run_dir / "stdout.log"
-    stderr_path = run_dir / "stderr.log"
-
-    cmd = build_command(config_path)
-
-    env = os.environ.copy()
-    repo_root = str(_repo_root())
-
-    existing_pythonpath = env.get("PYTHONPATH", "").strip()
-    if existing_pythonpath:
-        env["PYTHONPATH"] = repo_root + os.pathsep + existing_pythonpath
-    else:
-        env["PYTHONPATH"] = repo_root
-
-    _write_command_debug(run_dir, cmd, env)
-
-    stdout_handle = open(stdout_path, "a", encoding="utf-8", buffering=1)
-    stderr_handle = open(stderr_path, "a", encoding="utf-8", buffering=1)
-
-    creationflags = 0
-    if os.name == "nt":
-        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-
-    process = subprocess.Popen(
-        cmd,
-        cwd=repo_root,
-        env=env,
-        stdout=stdout_handle,
-        stderr=stderr_handle,
-        text=True,
-        creationflags=creationflags,
-    )
-
-    time.sleep(2.0)
-    rc = process.poll()
-
-    if rc is not None:
-        try:
-            stdout_handle.close()
-        except Exception:
-            pass
-        try:
-            stderr_handle.close()
-        except Exception:
-            pass
-
-        stdout_tail = _tail_file(stdout_path)
-        stderr_tail = _tail_file(stderr_path)
-        cmd_text = " ".join(cmd)
-
-        raise RuntimeError(
-            "Hız tespiti pipeline başladıktan hemen sonra kapandı.\n\n"
-            f"return_code={rc}\n"
-            f"run_dir={run_dir}\n\n"
-            f"COMMAND:\n{cmd_text}\n\n"
-            f"STDOUT tail:\n{stdout_tail}\n\n"
-            f"STDERR tail:\n{stderr_tail}\n"
-        )
-
-    return ActiveSpeedRun(
-        process=process,
-        run_name=run_name,
-        run_dir=run_dir,
-        config_path=config_path,
-        cameras=cameras,
-        stdout_path=stdout_path,
-        stderr_path=stderr_path,
-        started_at=time.time(),
-    )
+    from services.pipeline_bridge.camera_registry import CameraRegistryReconciler, desired_camera_snapshot
+    from services.pipeline_bridge.fight_runner import start_pipeline, _control_mode
+    if _control_mode() != "supervisor":
+        raise RuntimeError("Integrated Speed requires the common Runtime Supervisor")
+    cameras = desired_camera_snapshot()
+    if not any(item["use_speed_detection"] for item in cameras):
+        raise RuntimeError("No configured Speed cameras are enabled")
+    _set_speed_paused(False)
+    CameraRegistryReconciler().tick()
+    active = start_pipeline(cameras)
+    return ActiveSpeedRun(CommonRuntimeProcess(active.runtime_pid), active.run_name, active.run_dir,
+                          active.config_path, [item for item in cameras if item["use_speed_detection"]],
+                          active.stdout_path, active.stderr_path, active.started_at)
 
 
-def stop_speed_pipeline(active: ActiveSpeedRun | None) -> None:
+def stop_speed_pipeline(active: ActiveSpeedRun | None = None) -> None:
+    # Persist service intent, not a duplicate camera configuration. Reconciler
+    # retains this pause until an explicit Speed start; Fight remains enabled.
+    _set_speed_paused(True)
+
+
+def get_active_speed_run() -> ActiveSpeedRun | None:
+    from services.pipeline_bridge.fight_runner import get_pipeline_status, get_active_run
+    from services.pipeline_bridge.camera_registry import supervisor_client
+    status = get_pipeline_status()
+    if status.get("runtime_state") == "UNKNOWN":
+        raise RuntimeError("Common runtime ownership is unavailable")
+    if status.get("runtime_state") not in {"STARTING", "RUNNING"} or status.get("speed_paused"):
+        return None
+    desired = supervisor_client().desired_cameras()
+    cameras = [item for item in desired.get("cameras", []) if item.get("enabled", True) and item.get("use_speed_detection")]
+    if not cameras or desired.get("speed_paused"):
+        return None
+    active = get_active_run(status)
     if active is None:
-        return
-
-    process = active.process
-
-    if process.poll() is not None:
-        return
-
-    try:
-        if os.name == "nt":
-            process.send_signal(signal.CTRL_BREAK_EVENT)
-            process.wait(timeout=5)
-        else:
-            process.terminate()
-            process.wait(timeout=5)
-    except Exception:
-        try:
-            process.kill()
-        except Exception:
-            pass
+        raise RuntimeError("Common runtime metadata is unavailable")
+    return ActiveSpeedRun(CommonRuntimeProcess(active.runtime_pid), active.run_name, active.run_dir,
+                          active.config_path, cameras, active.stdout_path, active.stderr_path, active.started_at)

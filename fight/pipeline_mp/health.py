@@ -22,7 +22,7 @@ STOPPED = "STOPPED"
 FAILED = "FAILED"
 EOF = "EOF"
 
-CAMERA_COMPONENTS = ("camera_ingest", "camera_worker", "camera_preview")
+CAMERA_COMPONENTS = ("camera_ingest", "camera_worker", "camera_preview", "speed_worker")
 CRITICAL_SHARED_COMPONENTS = (
     "person",
     "person_router",
@@ -125,6 +125,7 @@ class HealthEmitter:
         camera_id: str = "",
         slot_id: int = -1,
         generation: int = -1,
+        consumer_epoch: int = 0,
         interval_sec: float = 1.0,
         monotonic: Callable[[], float] = time.monotonic,
     ):
@@ -134,6 +135,7 @@ class HealthEmitter:
         self.camera_id = str(camera_id)
         self.slot_id = int(slot_id)
         self.generation = int(generation)
+        self.consumer_epoch = int(consumer_epoch)
         self.interval_sec = max(0.1, float(interval_sec))
         self.monotonic = monotonic
         self._last_emit: dict[str, float] = {}
@@ -163,6 +165,7 @@ class HealthEmitter:
             camera_id=self.camera_id,
             slot_id=self.slot_id,
             generation=self.generation,
+            consumer_epoch=self.consumer_epoch,
             progress=int(progress),
             secondary_progress=int(secondary_progress),
             queue_depth=int(queue_depth),
@@ -296,6 +299,11 @@ class HealthRegistry:
             camera["lifecycle"] = str(status.get("state", STARTING))
             camera["file_done"] = bool(status.get("file_done", False))
             camera["restart_count"] = int(status.get("restart_count", 0) or 0)
+            for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts"):
+                camera[key] = status.get(key, key == "use_fight_detection")
+            if camera.get("speed_epoch") != status.get("speed_epoch"):
+                camera["speed_epoch"] = status.get("speed_epoch")
+                camera["components"]["speed_worker"] = _new_record("speed_worker", "camera", self.monotonic())
 
     def handle(self, event: HealthEvent) -> bool:
         if not isinstance(event, HealthEvent) or event.event_type not in KNOWN_EVENTS:
@@ -311,6 +319,8 @@ class HealthRegistry:
                 return False
             record = camera["components"].get(event.component)
             if record is None:
+                return False
+            if event.component == "speed_worker" and event.consumer_epoch != camera.get("speed_epoch", 0):
                 return False
         else:
             record = self.workers.get(event.component)
@@ -367,7 +377,7 @@ class HealthRegistry:
         elif event.event_type == "eof":
             record["source_state"] = EOF
         elif event.event_type == "capacity_wait":
-            record["capacity_stage"] = event.detail if event.detail in {"person", "pose", "stage3"} else ""
+            record["capacity_stage"] = event.detail if event.detail in {"person", "pose", "stage3", "vehicle"} else ""
         return True
 
     def drain(self, health_queue, limit: int = 2048) -> int:
@@ -404,7 +414,7 @@ class HealthRegistry:
         request_at = float(record["last_request"])
         pending_since = request_at if request_at > finished_at else 0.0
         fail_after = policy.inference_stall_fail_sec
-        if finished_at <= 0 and record["component"] in {"person", "pose", "stage3"}:
+        if finished_at <= 0 and record["component"] in {"person", "pose", "stage3", "vehicle"}:
             # Lazy CUDA warm-up starts at the first request, potentially long
             # after process startup. Reuse the existing bounded startup grace.
             fail_after = max(fail_after, policy.startup_grace_sec)
@@ -452,11 +462,13 @@ class HealthRegistry:
         components = camera["components"]
         ingest = components["camera_ingest"]
         worker = components["camera_worker"]
+        if not camera.get("use_fight_detection", True):
+            worker = ingest
         preview = components["camera_preview"]
         ingest_eof = ingest["source_state"] == EOF
         if not ingest_eof and not process_alive.get("ingest", True):
             return FAILED, "process_dead", "restart_camera"
-        if not process_alive.get("camera", True):
+        if camera.get("use_fight_detection", True) and not process_alive.get("camera", True):
             return FAILED, "process_dead", "restart_camera"
         if not ingest_eof and not process_alive.get("preview", True):
             return DEGRADED, "preview_process_dead", "restart_preview"
@@ -468,6 +480,10 @@ class HealthRegistry:
             return RECONNECTING, "source_reconnecting", None
         if age < policy.startup_grace_sec and float(ingest["last_frame"]) <= 0.0:
             return STARTING, "startup_grace", None
+        if (camera.get("use_speed_detection") and ingest["last_event"] == "capacity_wait"
+                and ingest["capacity_stage"] == "vehicle"
+                and now - float(ingest["last_heartbeat"]) < policy.camera_heartbeat_timeout_sec):
+            return DEGRADED, "queue_pressure", None
         # A blocked camera consumer can also fill an ordered file-ingest queue.
         # Exempt only cameras whose latest signal is a request to this pending
         # shared worker; unrelated cameras and actual process deaths still fail.
@@ -567,16 +583,26 @@ class HealthRegistry:
                 current,
                 camera_process_alive.get(cid, {}),
             )
+            if camera.get("use_speed_detection"):
+                speed = camera["components"]["speed_worker"]
+                if camera.get("speed_failed"):
+                    if action is None:
+                        health, reason = DEGRADED, "speed_consumer_failed"
+                elif (not camera["file_done"] and speed["source_state"] != EOF
+                      and current - max(float(speed["last_heartbeat"]), float(speed["registered_at"]))
+                      >= max(policy.startup_grace_sec, policy.inference_stall_fail_sec)):
+                    if action is None:
+                        health, reason, action = DEGRADED, "speed_consumer_stall", "restart_speed"
             self._transition(cid, camera, health, reason)
             if action:
                 actions.append({"action": action, "camera_id": cid, "reason": reason})
 
-        if any(record["health"] == FAILED for record in self.workers.values()):
+        if any(record["health"] == FAILED for name, record in self.workers.items() if name != "vehicle"):
             aggregate, aggregate_reason = FAILED, "critical_shared_worker_unhealthy"
         elif any(
             camera["health"] in {DEGRADED, RECONNECTING, OFFLINE, FAILED}
             for camera in self.cameras.values()
-        ) or any(record["health"] in {STARTING, DEGRADED} for record in self.workers.values()):
+        ) or any(record["health"] in {STARTING, DEGRADED, FAILED} for record in self.workers.values()):
             aggregate, aggregate_reason = DEGRADED, "component_degraded"
         else:
             aggregate, aggregate_reason = HEALTHY, "critical_components_healthy"
@@ -644,6 +670,13 @@ class HealthRegistry:
                 "restart_count": camera["restart_count"],
                 "source_state": ingest["source_state"],
                 "capacity": camera.get("capacity", {}),
+                "speed": {"enabled": camera.get("use_speed_detection", False),
+                          "failed": camera.get("speed_failed", False),
+                          "restarts": camera.get("speed_restarts", 0),
+                          "epoch": camera.get("speed_epoch"),
+                          "progress": camera["components"]["speed_worker"]["progress"],
+                          "dropped": camera["components"]["speed_worker"]["dropped"],
+                          "heartbeat_age_sec": self._age(current, camera["components"]["speed_worker"]["last_heartbeat"])},
             }
         workers = {
             name: {
@@ -777,6 +810,9 @@ class RuntimeWatchdog:
             cid = action["camera_id"]
             runtime = manager.runtimes.get(cid)
             if runtime is None or runtime.intentional_stop or runtime.file_done:
+                continue
+            if action["action"] == "restart_speed":
+                manager.disable_speed(runtime, action["reason"])
                 continue
             if action["action"] == "restart_preview":
                 if (

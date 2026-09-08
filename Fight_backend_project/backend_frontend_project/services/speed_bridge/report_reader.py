@@ -123,6 +123,9 @@ def _collect_events_from_run(run_dir: Path, run_name: str, media_root: str | Pat
     if events_dir.exists() and events_dir.is_dir():
         for path in events_dir.glob("*_speed_violations.jsonl"):
             rows.extend(_read_jsonl(path))
+    # Same evidence format, now scoped by common run/camera/consumer epoch.
+    for path in (run_dir / "incidents" / "speed").glob("*/*/events/*_speed_violations.jsonl"):
+        rows.extend(_read_jsonl(path))
 
     normalized = [
         _normalize_event(row, run_name=run_name, media_root=media_root)

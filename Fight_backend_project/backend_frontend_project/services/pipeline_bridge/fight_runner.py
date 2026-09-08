@@ -63,6 +63,9 @@ def _normalize_sources(sources: list[dict]) -> list[dict]:
                 "source": source,
                 "name": str(item.get("name") or camera_id),
                 "description": str(item.get("description") or ""),
+                "use_fight_detection": bool(item.get("use_fight_detection", True)),
+                "use_speed_detection": bool(item.get("use_speed_detection", False)),
+                "speed_config": dict(item.get("speed_config") or {}),
             }
         )
 
@@ -134,6 +137,7 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
         "camera_ingest_mode",
         "camera_ingest_fight_queue_size",
         "camera_ingest_preview_queue_size",
+        "camera_ingest_speed_queue_size",
         "camera_ingest_publish_timeout_sec",
         "camera_ingest_file_fight_policy",
         "camera_ingest_cv2_threads",
@@ -292,6 +296,7 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     runtime["incident_outbox_path"] = str(
         Path(settings.MEDIA_ROOT) / "runtime_spool" / "incidents_outbox.jsonl"
     )
+    from services.speed_bridge.speed_runner import build_run_config as build_speed_config
 
     return {
         "schema_version": 1,
@@ -301,6 +306,7 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "cameras": _normalize_sources(sources),
         "models": models,
+        "speed": build_speed_config(run_name, run_dir, []),
         "runtime": runtime,
     }
 

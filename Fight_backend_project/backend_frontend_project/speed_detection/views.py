@@ -61,12 +61,10 @@ def _speed_runs_root() -> Path:
 
 
 def _speed_run_dirs(limit: int = MAX_SPEED_HISTORY_RUNS) -> list[Path]:
-    root = _speed_runs_root()
-
-    if not root.exists() or not root.is_dir():
-        return []
-
-    dirs = [p for p in root.iterdir() if p.is_dir()]
+    dirs = []
+    for root in (_speed_runs_root(), Path(settings.PIPELINE_OUTPUT_BASE)):
+        if root.is_dir():
+            dirs.extend(p for p in root.iterdir() if p.is_dir() and not p.name.startswith("."))
     dirs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
 
     return dirs[:limit]
@@ -195,7 +193,7 @@ def _safe_url_part(value: str, label: str) -> str:
     value = str(value).strip()
     safe = Path(value).name
 
-    if safe != value or "/" in value or "\\" in value:
+    if safe != value or value in {".", ".."} or "/" in value or "\\" in value:
         raise Http404(f"{label} geçersiz.")
 
     return safe
@@ -209,6 +207,8 @@ def _find_existing_event_file(run_name: str, file_name: str, kind: str) -> Path 
         return None
 
     run_dir = (_speed_runs_root() / run_name).resolve()
+    if not run_dir.is_dir():
+        run_dir = (Path(settings.PIPELINE_OUTPUT_BASE) / run_name).resolve()
 
     if not run_dir.exists() or not run_dir.is_dir():
         return None
@@ -229,6 +229,10 @@ def _find_existing_event_file(run_name: str, file_name: str, kind: str) -> Path 
         ]
     else:
         candidates = []
+
+    if kind in {"snapshot", "clip"}:
+        folder = "snapshots" if kind == "snapshot" else "clips"
+        candidates.extend(parent / file_name for parent in (run_dir / "incidents" / "speed").glob(f"*/*/{folder}"))
 
     for path in candidates:
         path = path.resolve()
@@ -574,12 +578,21 @@ def speed_calibration_frame(request, camera_id):
     cap = None
 
     try:
-        cap = _open_camera_source(camera.source)
-
-        if cap is None or not cap.isOpened():
-            raise Http404("Kamera görüntüsü açılamadı.")
-
-        ok, frame = cap.read()
+        from services.pipeline_bridge.fight_runner import get_pipeline_status, get_active_run, _control_mode
+        status = get_pipeline_status()
+        if _control_mode() == "supervisor":
+            if status.get("runtime_state") not in {"STARTING", "RUNNING"} or status.get("orphan_detected"):
+                raise Http404("Start the common camera runtime to obtain a calibration preview.")
+            active = get_active_run(status)
+            frame = cv2.imread(str(active.run_dir / "previews" / f"{camera.camera_id}.jpg")) if active else None
+            ok = frame is not None
+        elif status.get("runtime_state") == "UNKNOWN":
+            raise Http404("Camera ownership is unavailable; refusing a second source open.")
+        else:
+            cap = _open_camera_source(camera.get_runtime_source())
+            if cap is None or not cap.isOpened():
+                raise Http404("Kamera görüntüsü açılamadı.")
+            ok, frame = cap.read()
 
         if not ok or frame is None:
             raise Http404("Kameradan kare okunamadı.")
@@ -589,7 +602,7 @@ def speed_calibration_frame(request, camera_id):
 
         h, w = frame.shape[:2]
 
-        if resize_width > 0 and w > resize_width:
+        if resize_width > 0 and w != resize_width:
             scale = resize_width / float(w)
             frame = cv2.resize(frame, (resize_width, int(h * scale)))
 

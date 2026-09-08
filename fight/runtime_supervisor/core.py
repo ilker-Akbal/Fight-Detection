@@ -309,7 +309,7 @@ class RuntimeSupervisor:
         launch_payload["cameras"] = [
             camera
             for camera in desired["cameras"]
-            if camera["enabled"] and camera["use_fight_detection"]
+            if camera["enabled"] and (camera["use_fight_detection"] or camera.get("use_speed_detection", False))
         ]
         runtime = dict(launch_payload.get("runtime") or {})
         runtime["run_id"] = run_id
@@ -692,6 +692,7 @@ class RuntimeSupervisor:
             if not isinstance(raw_workers, dict) or len(raw_workers) > 16:
                 raise ValueError("invalid worker health")
             camera_fields = {
+                "speed",
                 "capacity",
                 "generation",
                 "slot_id",
@@ -802,6 +803,7 @@ class RuntimeSupervisor:
                 result["desired_camera_revision"] = desired["revision"]
                 result["desired_camera_count"] = len(desired["cameras"])
                 result["desired_camera_state_valid"] = True
+                result["speed_paused"] = desired.get("speed_paused", False)
             except Exception:
                 result["desired_camera_revision"] = None
                 result["desired_camera_count"] = None

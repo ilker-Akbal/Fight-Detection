@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ultralytics import YOLO
 
 from .yolo_config import YoloConfig
 
@@ -17,6 +16,7 @@ class VehicleDetection:
 
 class VehicleDetector:
     def __init__(self, cfg: YoloConfig):
+        from ultralytics import YOLO
         self.cfg = cfg
         self.model = YOLO(cfg.weights)
         self.names = self.model.names

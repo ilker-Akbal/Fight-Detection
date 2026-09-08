@@ -40,14 +40,24 @@ def normalize_camera(camera: dict) -> dict:
         raise InvalidDesiredCameraState("camera source is missing or too long")
     enabled = camera.get("enabled", True)
     fight_enabled = camera.get("use_fight_detection", True)
+    speed_enabled = camera.get("use_speed_detection", False)
     if not isinstance(enabled, bool) or not isinstance(fight_enabled, bool):
         raise InvalidDesiredCameraState("camera enabled fields must be boolean")
+    if not isinstance(speed_enabled, bool):
+        raise InvalidDesiredCameraState("camera speed enable field must be boolean")
+    speed_config = camera.get("speed_config") or {}
+    if not isinstance(speed_config, dict) or len(json.dumps(speed_config)) > 16384:
+        raise InvalidDesiredCameraState("invalid speed configuration")
     return {
         "camera_id": camera_id,
         "source": source,
         "name": str(camera.get("name") or camera_id).strip()[:200],
         "enabled": enabled,
         "use_fight_detection": fight_enabled,
+        "use_speed_detection": speed_enabled,
+        "speed_config": {key: speed_config[key] for key in (
+            "speed_limit_kmh", "tolerance_kmh", "calibration_path", "roi_enabled", "roi_polygon",
+            "save_snapshot", "save_clip", "calibration_revision") if key in speed_config},
     }
 
 
@@ -60,6 +70,10 @@ def normalize_cameras(cameras) -> list[dict]:
     ids = [camera["camera_id"] for camera in normalized]
     if len(ids) != len(set(ids)):
         raise InvalidDesiredCameraState("camera_id values must be unique")
+    sources = [item["source"] for item in normalized if item["enabled"] and (
+        item["use_fight_detection"] or item["use_speed_detection"])]
+    if len(sources) != len(set(sources)):
+        raise InvalidDesiredCameraState("enabled cameras must have distinct sources; enable both consumers on one camera")
     return sorted(normalized, key=lambda camera: camera["camera_id"])
 
 
@@ -69,6 +83,8 @@ def validate_desired_state(payload: dict) -> dict:
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise InvalidDesiredCameraState("unsupported desired camera schema_version")
     revision = payload.get("revision")
+    if not isinstance(payload.get("speed_paused", False), bool):
+        raise InvalidDesiredCameraState("speed_paused must be boolean")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise InvalidDesiredCameraState("revision must be a non-negative integer")
     return {
@@ -76,6 +92,7 @@ def validate_desired_state(payload: dict) -> dict:
         "revision": revision,
         "cameras": normalize_cameras(payload.get("cameras")),
         "updated_at": str(payload.get("updated_at") or _utc_now()),
+        "speed_paused": payload.get("speed_paused", False),
     }
 
 
@@ -123,7 +140,7 @@ class DesiredCameraStateStore:
         if incoming["revision"] < current["revision"]:
             raise StaleDesiredCameraRevision("desired camera revision is stale")
         if incoming["revision"] == current["revision"]:
-            if incoming["cameras"] != current["cameras"]:
+            if incoming["cameras"] != current["cameras"] or incoming["speed_paused"] != current.get("speed_paused", False):
                 raise DesiredCameraRevisionConflict(
                     "desired camera revision already has different content"
                 )

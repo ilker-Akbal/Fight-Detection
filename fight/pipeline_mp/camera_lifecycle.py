@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import json
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -11,6 +12,7 @@ from fight.pipeline_mp.camera_worker import camera_process_main
 from fight.pipeline_mp.common import is_file_source, now_str, redact_source
 from fight.pipeline_mp.generation import set_slot_generation
 from fight.pipeline_mp.messages import ReportMessage
+from fight.pipeline_mp.speed_worker import speed_process_main
 
 
 STARTING = "STARTING"
@@ -29,11 +31,15 @@ def runtime_camera(camera: dict) -> dict:
         "name": str(camera.get("name") or camera.get("camera_id") or "").strip(),
         "enabled": bool(camera.get("enabled", True)),
         "use_fight_detection": bool(camera.get("use_fight_detection", True)),
+        "use_speed_detection": bool(camera.get("use_speed_detection", False)),
+        "speed_config": dict(camera.get("speed_config") or {}),
     }
 
 
 def restart_identity(camera: dict) -> tuple[str]:
-    return (runtime_camera(camera)["source"],)
+    item = runtime_camera(camera)
+    return (item["source"], item["use_fight_detection"], item["use_speed_detection"],
+            json.dumps(item["speed_config"], sort_keys=True))
 
 
 @dataclass
@@ -50,6 +56,12 @@ class CameraRuntime:
     file_done: bool = False
     last_restart_at: float = 0.0
     restart_count: int = 0
+    speed_queue: Any = None
+    speed_stop: Any = None
+    speed_epoch: int = 0
+    speed_failed: bool = False
+    speed_restarts: int = 0
+    speed_last_restart: float = 0
 
     @property
     def camera_id(self) -> str:
@@ -72,6 +84,9 @@ class CameraRuntimeManager:
         pose_result_channels: dict[int, Any],
         slot_generations,
         health_queue=None,
+        vehicle_requests=None,
+        vehicle_results=None,
+        speed_epochs=None,
         process_factory: Callable | None = None,
         terminate_process: Callable | None = None,
         close_queue: Callable | None = None,
@@ -88,6 +103,10 @@ class CameraRuntimeManager:
         self.pose_result_channels = pose_result_channels
         self.slot_generations = slot_generations
         self.health_queue = health_queue
+        self.vehicle_requests = vehicle_requests
+        self.vehicle_results = vehicle_results or {}
+        self.speed_epochs = speed_epochs
+        self.speed_service_available = True
         self.process_factory = process_factory or self._default_process_factory
         self.terminate_process = terminate_process or self._default_terminate
         self.close_queue = close_queue or self._default_close_queue
@@ -178,6 +197,8 @@ class CameraRuntimeManager:
                 item.generation,
                 self.health_queue,
                 item.slot_id,
+                item.speed_queue,
+                item.speed_stop,
             ),
         )
         item.processes["preview"] = self.process_factory(
@@ -193,6 +214,13 @@ class CameraRuntimeManager:
                 item.slot_id,
             ),
         )
+        if item.camera["use_fight_detection"]:
+            self._spawn_fight(item, args_common, admission_port)
+        if item.camera["use_speed_detection"]:
+            self._spawn_speed(item)
+
+    def _spawn_fight(self, item, args_common, admission_port):
+        cid = item.camera_id
         item.processes["camera"] = self.process_factory(
             f"camera_{cid}",
             camera_process_main,
@@ -211,6 +239,30 @@ class CameraRuntimeManager:
                 self.health_queue,
             ),
         )
+
+    def _spawn_speed(self, item):
+        if self.vehicle_requests is None:
+            raise RuntimeError("shared vehicle service is required")
+        self.speed_epochs[item.slot_id] += 1
+        item.speed_epoch = int(self.speed_epochs[item.slot_id])
+        item.speed_stop.clear()
+        item.speed_failed = False
+        self._drain(self.vehicle_results[item.slot_id])
+        item.processes["speed"] = self.process_factory(
+            f"speed_{item.camera_id}", speed_process_main,
+            (self.config, item.camera, item.speed_queue, self.vehicle_requests.for_slot(item.slot_id),
+             self.vehicle_results[item.slot_id], item.speed_stop, item.generation, item.slot_id,
+             self.speed_epochs, item.speed_epoch, self.slot_generations, self.health_queue))
+
+    def disable_speed(self, item, reason):
+        if item.speed_failed:
+            return
+        item.speed_failed = True
+        item.speed_stop.set()
+        self.speed_epochs[item.slot_id] += 1
+        self.terminate_process(item.processes.get("speed"), timeout=1.0)
+        self._status("speed_consumer_failed", item.camera_id, reason=reason,
+                     generation=item.generation, consumer_epoch=item.speed_epoch)
 
     def start_camera(
         self,
@@ -240,7 +292,7 @@ class CameraRuntimeManager:
             if reuse_current_generation
             else self._next_generation(slot_id)
         )
-        for admission in (self.person_request_queue, self.pose_request_queue, self.stage3_queue):
+        for admission in (self.person_request_queue, self.pose_request_queue, self.stage3_queue, self.vehicle_requests):
             if hasattr(admission, "reset_metrics"):
                 admission.reset_metrics(slot_id)
         item = CameraRuntime(
@@ -252,13 +304,16 @@ class CameraRuntimeManager:
                 maxsize=max(
                     1, int(self.runtime_config.get("camera_ingest_fight_queue_size", 8))
                 )
-            ),
+            ) if normalized["use_fight_detection"] else None,
             preview_queue=self.ctx.Queue(
                 maxsize=max(
                     1, int(self.runtime_config.get("camera_ingest_preview_queue_size", 1))
                 )
             ),
         )
+        if normalized["use_speed_detection"]:
+            item.speed_queue = self.ctx.Queue(maxsize=max(1, int(self.runtime_config.get("camera_ingest_speed_queue_size", 2))))
+            item.speed_stop = self.ctx.Event()
         self.runtimes[cid] = item
         self._status(
             "camera_starting", cid, generation=generation, slot_id=slot_id, reason=reason
@@ -291,6 +346,9 @@ class CameraRuntimeManager:
         # Invalidate first so delayed shared-worker output cannot enter a reused slot.
         self._next_generation(item.slot_id)
         item.stop_event.set()
+        if item.speed_stop is not None:
+            item.speed_stop.set()
+            self.speed_epochs[item.slot_id] += 1
         for process in item.processes.values():
             self.terminate_process(process, timeout=2.0)
         self._drain(self.person_result_channels[item.slot_id])
@@ -298,6 +356,8 @@ class CameraRuntimeManager:
             self._drain(self.pose_result_channels[item.slot_id])
         self.close_queue(item.fight_queue)
         self.close_queue(item.preview_queue)
+        if item.speed_queue is not None:
+            self.close_queue(item.speed_queue)
         item.state = STOPPED
         del self.runtimes[item.camera_id]
         self._free_slots.add(item.slot_id)
@@ -342,7 +402,7 @@ class CameraRuntimeManager:
         desired = {
             item["camera_id"]: item
             for item in (runtime_camera(camera) for camera in cameras)
-            if item["enabled"] and item["use_fight_detection"]
+            if item["enabled"] and (item["use_fight_detection"] or item["use_speed_detection"])
         }
         actual_ids = set(self.runtimes)
         desired_ids = set(desired)
@@ -418,6 +478,19 @@ class CameraRuntimeManager:
             ingest = item.processes.get("ingest")
             camera = item.processes.get("camera")
             preview = item.processes.get("preview")
+            speed = item.processes.get("speed")
+            if speed is not None:
+                if not self.speed_service_available:
+                    self.disable_speed(item, "vehicle_service_unavailable")
+                elif not speed.is_alive() and getattr(speed, "exitcode", None) != 0:
+                    self.disable_speed(item, "speed_process_dead")
+                if (item.speed_failed and self.speed_service_available
+                        and not is_file_source(item.camera["source"])
+                        and item.speed_restarts < int(self.runtime_config.get("watchdog_camera_restart_limit", 3))
+                        and self.monotonic() - item.speed_last_restart >= max(1, float(self.runtime_config.get("watchdog_camera_restart_cooldown_sec", 120)))):
+                    item.speed_restarts += 1
+                    item.speed_last_restart = self.monotonic()
+                    self._spawn_speed(item)
             if ingest is not None and not ingest.is_alive():
                 if (
                     getattr(ingest, "exitcode", None) == 0
@@ -425,6 +498,8 @@ class CameraRuntimeManager:
                     and not bool(self.runtime_config.get("loop_file_sources", False))
                 ):
                     if camera is not None and camera.is_alive():
+                        continue
+                    if speed is not None and speed.is_alive():
                         continue
                     item.file_done = True
                     item.state = STOPPED
@@ -528,6 +603,11 @@ class CameraRuntimeManager:
                 "generation": item.generation,
                 "file_done": item.file_done,
                 "restart_count": item.restart_count,
+                "use_fight_detection": item.camera["use_fight_detection"],
+                "use_speed_detection": item.camera["use_speed_detection"],
+                "speed_failed": item.speed_failed,
+                "speed_restarts": item.speed_restarts,
+                "speed_epoch": item.speed_epoch,
                 "pids": {
                     name: getattr(process, "pid", None)
                     for name, process in item.processes.items()
