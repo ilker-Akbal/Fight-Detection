@@ -9,11 +9,11 @@ This file is the architecture contract for the repository.
 Current reference commit:
 
 ```text
-7b395ef94f04b435862ab013f9226b0982de34b6
-feat: add capability-aware shared service lifecycle
+c3c019b2871dcd3891b24ef242a2c5e93fe9212f
+feat: add resilient fight service recovery
 ```
 
-Phase 14 is committed on `master` and is the current architecture baseline.
+Phase 15 is committed on `master` and is the current architecture baseline.
 
 ---
 
@@ -44,13 +44,15 @@ Primary invariants:
 5. Expensive/stateless inference models are shared services, not one model per camera.
 6. Shared inference services are capability-aware: they run only while current desired cameras require them.
 7. Temporal/tracking/calibration state remains camera-local where correctness requires it.
-8. Camera work is identified by stable slot + generation; Speed adds a consumer epoch; shared-service reincarnation adds a service epoch where required.
-9. Live and file sources intentionally use different backpressure/recovery semantics.
-10. Runtime incident truth crosses into Django through the durable incident outbox.
-11. `Incident(type=FIGHT)` and `Incident(type=SPEED)` use the same Django incident/routing domain.
-12. Queue `qsize()`/`empty()` observations must not be correctness dependencies.
-13. Windows `spawn` compatibility is a first-class constraint.
-14. Optional service absence is not a health failure when that service is not required.
+8. Camera work is identified by stable slot + generation; Speed adds a consumer epoch; shared-service reincarnation adds a service epoch.
+9. Fight recovery must fence pre-failure Stage3 publication before replacement transport can become current.
+10. Live and file sources intentionally use different backpressure/recovery semantics.
+11. Runtime incident truth crosses into Django through the durable incident outbox.
+12. `Incident(type=FIGHT)` and `Incident(type=SPEED)` use the same Django incident/routing domain.
+13. Queue `qsize()`/`empty()` observations must not be correctness dependencies.
+14. Windows `spawn` compatibility is a first-class constraint.
+15. Optional service absence is not a health failure when that service is not required.
+16. Recovery is bounded. A failed service must not create unbounded restart storms.
 
 ---
 
@@ -74,7 +76,7 @@ fight.pipeline_mp.run_multiprocess
   +--> Reporter                         (runtime-global)
   +--> Incident worker / aggregator    (runtime-global)
   |
-  +--> SharedServices                  (capability lifecycle owner)
+  +--> SharedServices                  (capability + recovery owner)
   |      |
   |      +--> Fight bundle, only when required
   |      |      +--> Person worker
@@ -103,8 +105,9 @@ Fight incident path:
 ```text
 camera_worker
   -> shared Person / Pose / Stage3
+  -> Fight service-epoch tagged Stage3 result
   -> Incident worker
-  -> IncidentAggregator
+  -> IncidentAggregator publication fence
   -> evidence
   -> durable incident outbox
   -> Django Incident Dispatcher
@@ -179,6 +182,7 @@ It owns:
 
 - multiprocessing context (`spawn`),
 - capability-aware shared inference services,
+- shared-service recovery,
 - shared-service result routers,
 - health queue/registry/watchdog,
 - fair scheduling queues,
@@ -187,11 +191,13 @@ It owns:
 - file EOF/drain/finalization,
 - Reporter and Incident worker.
 
-Capability service lifecycle is delegated to:
+Capability/recovery lifecycle is delegated to:
 
 ```text
 fight/pipeline_mp/shared_services.py::SharedServices
 ```
+
+Reporter and Incident remain runtime-global services outside the recoverable Fight/Vehicle bundles.
 
 ---
 
@@ -289,6 +295,7 @@ speed_epoch
 speed_failed
 speed_service_waiting
 speed_restarts
+fight_service_waiting
 processes
 state
 file_done
@@ -319,11 +326,15 @@ serialized speed_config
 
 Therefore changing source, detection-mode flags, Speed calibration/config, etc. restarts only the affected camera runtime. Cosmetic changes should not require a restart.
 
-The manager does not create a Speed consumer while the shared Vehicle service is unavailable. During Vehicle recovery, affected live Speed consumers wait for the replacement service; Fight/ingest/preview ownership remains independent.
+The manager does not create a Speed consumer while the shared Vehicle service is unavailable.
+
+During Fight bundle recovery, affected Fight-capable cameras are explicitly suspended. Their generations are invalidated before old readers/transports are torn down. Eligible live cameras are restarted locally after the replacement Fight bundle exists. Speed-only cameras are not involved. A mixed Fight+Speed camera is restarted locally as one camera runtime, so its Speed consumer may be briefly interrupted even though the shared Vehicle service itself is preserved.
+
+Unsafe camera/source withdrawal fails closed; recovery must not create a duplicate physical source owner.
 
 ---
 
-# 6. Identity: slot, generation, Speed epoch and service epoch
+# 6. Identity: slot, generation, consumer epoch and service epoch
 
 Camera identity is protected by:
 
@@ -335,6 +346,7 @@ Rules:
 
 - stable result slots are reserved in the parent before child spawn,
 - camera restart increments generation,
+- Fight recovery invalidates affected camera generations before transport replacement,
 - camera removal invalidates the slot before teardown,
 - delayed results from old generations are rejected,
 - health events are generation-aware,
@@ -354,7 +366,11 @@ Shared-service reincarnation adds:
 service_epoch
 ```
 
-`SharedServices` wraps the single bounded health channel with the current service epoch. Old Vehicle-service health events are rejected after replacement. Vehicle transport itself is replaced on recovery rather than reusing queues/locks from the failed incarnation.
+`SharedServices` wraps the single bounded health channel with the current service epoch. Old Fight- or Vehicle-service health events are rejected after replacement.
+
+Fight Stage3 results additionally carry their Fight service epoch into the Incident worker. This identity is used by the Fight incident publication fence so buffered results from a failed service incarnation cannot later publish as current incidents.
+
+Vehicle transport and Fight transport are replaced on recovery rather than reusing queues/locks from the failed incarnation.
 
 Do not replace this identity model with `multiprocessing.Manager`, mutable fork-only routing, queues sent through other queues, or PID-only correctness.
 
@@ -441,12 +457,13 @@ camera_worker
   -> Stage3 candidate
   -> fair bounded Stage3 admission
   -> shared Stage3/X3D worker
+  -> FightIncidentChannel(service_epoch)
   -> Incident worker
 ```
 
 IncidentAggregator must not instantiate a second local Person/Pose model.
 
-The Fight shared bundle is demand-started by `SharedServices`; it is not hot-replaced after critical worker failure. Existing critical failure semantics remain runtime-level.
+The Fight shared bundle is demand-started by `SharedServices` and, as of Phase 15, supports bounded in-runtime replacement after confirmed recoverable Fight worker death/stall. Recovery is bundle-wide rather than per-model because the bundle owns coupled request/result transport and generation-sensitive consumers.
 
 ---
 
@@ -527,7 +544,7 @@ Fight-only desired set
 
 Speed-only desired set
   -> Vehicle service runs
-  -> Fight inference bundle is not started
+  -> Fight inference bundle is disabled / absent
 
 Fight + Speed desired set
   -> both required bundles run
@@ -537,7 +554,7 @@ Capability transitions occur inside the same runtime parent:
 
 - first Speed camera can hot-start Vehicle without global runtime restart,
 - last Speed removal can stop Vehicle without disturbing Fight,
-- first Fight camera can start the Fight bundle while Speed remains active,
+- first Fight camera can hot-start the Fight bundle while Speed remains active,
 - last Fight removal drains acknowledged Fight work before stopping the Fight bundle,
 - unrelated bundle processes are preserved across capability transitions.
 
@@ -553,9 +570,11 @@ Capability lifecycle is a property of the Supervisor-managed dynamic path. Legac
 
 ---
 
-# 11. Vehicle service recovery and failure isolation
+# 11. Shared-service recovery and failure isolation
 
-Vehicle is optional to Fight and is intentionally excluded from the critical Fight shared-worker set.
+## Vehicle recovery
+
+Vehicle is optional to Fight.
 
 On confirmed Vehicle death/stall/start failure:
 
@@ -573,7 +592,7 @@ Vehicle failure
 
 Fight camera ingest, Fight workers, previews and incident infrastructure continue.
 
-Default recovery controls:
+Default controls:
 
 ```text
 VEHICLE_SERVICE_RESTART_LIMIT=3
@@ -581,26 +600,96 @@ VEHICLE_SERVICE_RESTART_BACKOFF_SEC=2
 VEHICLE_SERVICE_RESTART_MAX_BACKOFF_SEC=30
 ```
 
-Backoff is bounded/exponential over the runtime lifetime. Exhaustion leaves Vehicle in a failed optional-service state and requires operator intervention; it must not produce restart storms or force a Fight-wide runtime restart.
+Exhaustion leaves Vehicle in a failed optional-service state and requires operator intervention; it must not force a Fight-wide runtime failure solely because Vehicle is unavailable.
 
-Stale protection during recovery is layered:
+## Fight bundle recovery
+
+Recoverable Fight components:
 
 ```text
-camera generation
-+ Speed consumer epoch
-+ Vehicle service epoch for service-health incarnation
-+ replacement request/result transport
+person
+person_router
+pose
+pose_router
+stage3
 ```
 
-Old Vehicle transport is not reused after a failed incarnation.
+Incident and Reporter are deliberately **not** part of this recoverable bundle.
 
-## File-source rule
+On confirmed recoverable Fight worker death/stall:
 
-A partially failed Speed file consumer is not replayed after shared Vehicle recovery. Cleanly completed file Speed work stays completed. Failed/partial file processing remains fail-closed/incomplete rather than being silently re-run and reported as clean EOF.
+```text
+Fight component failure
+  -> raise Fight publication floor before transport teardown
+  -> invalidate generations for affected Fight-capable cameras
+  -> mark affected cameras fight_service_waiting
+  -> stop affected camera runtimes/source owners
+  -> stop the old Fight bundle
+  -> close/replace Fight request/result transport
+  -> increment Fight service epoch
+  -> bounded exponential-backoff restart
+  -> recreate required Fight bundle
+  -> restart eligible LIVE Fight-capable cameras locally
+```
 
-## Live-source rule
+The global `run_multiprocess` parent remains the same when recovery succeeds.
 
-Eligible live Speed consumers that were withdrawn specifically because the Vehicle service was restarting may be respawned after successful shared-service recovery. Local Speed-consumer retry exhaustion is not reset by unrelated Vehicle recovery.
+Unrelated domains are preserved:
+
+- Vehicle service process is not replaced because Fight failed.
+- Speed-only cameras remain untouched.
+- Incident and Reporter process identities remain unchanged.
+- A mixed Fight+Speed camera is locally restarted, so its Speed consumer may be briefly interrupted, but Vehicle itself remains alive.
+
+Default controls:
+
+```text
+FIGHT_SERVICE_RESTART_LIMIT=3
+FIGHT_SERVICE_RESTART_BACKOFF_SEC=2
+FIGHT_SERVICE_RESTART_MAX_BACKOFF_SEC=30
+```
+
+With defaults, replacement attempts occur after approximately 2 / 4 / 8 seconds. Replacement-start failures consume the same bounded runtime-lifetime retry budget.
+
+Fight recovery exhaustion escalates to the existing runtime-level failure path. Unsafe teardown/withdrawal also fails closed rather than risking duplicate source ownership.
+
+## Fight publication fence
+
+Primary implementation:
+
+```text
+fight/pipeline_mp/shared_services.py::FightIncidentChannel
+fight/pipeline/incident_aggregator.py
+fight/pipeline_mp/incident_worker.py
+```
+
+Every Stage3 result from the Fight bundle is tagged with that Fight service epoch. A shared `fight_publication_floor` is advanced **before** failed Fight transport is replaced.
+
+The IncidentAggregator checks that floor:
+
+- when accepting Stage3 results,
+- when deciding whether buffered incident state remains current,
+- immediately before durable outbox/legacy JSONL publication under the shared floor lock.
+
+Therefore Stage3 output buffered before or during a failed incarnation cannot create a current incident after recovery.
+
+## File-source recovery rules
+
+Speed:
+
+- partially failed Speed file processing is not replayed after Vehicle recovery.
+
+Fight:
+
+- if a recoverable Fight service fails while an affected Fight file source is active, the run fails closed with `fight_file_incomplete`,
+- the file is not automatically replayed from frame 0,
+- the old partial camera runtime is not presented as clean completion.
+
+## Live-source recovery rules
+
+- eligible live Speed consumers can resume after Vehicle recovery,
+- eligible live Fight-capable cameras are locally restarted on fresh Fight transport after Fight bundle recovery,
+- generation/service-epoch fences reject stale work from the failed incarnation.
 
 ---
 
@@ -695,7 +784,9 @@ Rules:
 - shed/stale outcomes are not interpreted as negative detections,
 - `CameraIngest` owns reconnect,
 - camera-local Speed consumer recovery is bounded,
-- shared Vehicle recovery may resume eligible live Speed consumers.
+- shared Vehicle recovery may resume eligible live Speed consumers,
+- shared Fight recovery may locally restart eligible live Fight-capable camera runtimes,
+- mixed Fight+Speed cameras may briefly interrupt their Speed consumer during Fight camera-local restart.
 
 ## File
 
@@ -708,11 +799,12 @@ correctness + ordering > freshness
 Rules:
 
 - ordered work waits/defer rather than silently dropping required work,
-- admitted Stage3 work drains before final completion,
+- admitted Stage3 work drains before normal final completion,
 - Speed frame/EOF delivery drains before clean completion,
 - normal non-looping EOF is not failure,
 - failed Speed file processing is not replayed after local/shared recovery,
-- a file run with Speed failure completes as incomplete rather than reporting clean success.
+- Fight service failure during affected file processing is fatal/incomplete rather than replayed,
+- a partial failed file run must not be reported as clean success.
 
 ---
 
@@ -749,6 +841,8 @@ camera_preview
 speed_worker
 ```
 
+Camera status also exposes `fight_service_waiting` while Fight recovery has withdrawn a camera pending replacement transport.
+
 Shared worker records:
 
 ```text
@@ -761,7 +855,7 @@ incident
 vehicle
 ```
 
-Capability-managed worker records expose compact lifecycle metadata:
+Capability/recovery-managed worker records expose:
 
 ```text
 required
@@ -783,9 +877,10 @@ failed
 Semantics:
 
 - not required + disabled => `HEALTHY / service_disabled`,
-- required + restarting => runtime degrades rather than pretending service is healthy,
-- Vehicle recovery exhaustion degrades the runtime but does not make Fight-wide critical health fail,
-- required critical Fight worker failure retains existing runtime-level failure semantics,
+- required + recovering Fight/Vehicle service => runtime may be `DEGRADED`,
+- confirmed recoverable Fight component failure is converted to service recovery rather than immediately forcing runtime failure,
+- Fight recovery exhaustion => required Fight service `FAILED` and runtime-level failure,
+- Vehicle recovery exhaustion => optional Vehicle service failed/degraded without forcing Fight-wide failure,
 - configured-off Pose/Stage3 absence is expected rather than a failure,
 - queue pressure may degrade health but must not trigger restart storms,
 - disk pressure may degrade health but is not itself a restart reason.
@@ -816,9 +911,9 @@ A local Speed consumer failure:
 
 Live local recovery remains bounded. File failures are not silently replayed.
 
-## Critical Fight shared-worker failure
+## Recoverable Fight shared-worker failure
 
-Critical Fight set when required/running:
+Recoverable set:
 
 ```text
 person
@@ -826,14 +921,26 @@ person_router
 pose
 pose_router
 stage3
-incident
 ```
 
-A confirmed failure remains a runtime-level failure and recovery responsibility remains with the Supervisor. Phase 14 deliberately did not generalize hot replacement to these Fight services.
+Confirmed death/stall now enters bounded in-runtime Fight bundle recovery.
+
+Global failure still occurs for:
+
+```text
+Fight recovery exhaustion
+unsafe Fight camera/source withdrawal
+Fight file-source service failure (fight_file_incomplete)
+initial Fight service startup failure
+Incident worker failure
+Reporter failure
+```
+
+Incident and Reporter deliberately retain their runtime-global critical semantics.
 
 ## Vehicle shared-worker failure
 
-Vehicle is non-critical to Fight. It has its own bounded in-runtime recovery lifecycle described above.
+Vehicle is non-critical to Fight and has its own bounded in-runtime recovery lifecycle.
 
 ---
 
@@ -861,6 +968,8 @@ Outbox semantics:
 Speed event publication creates a normal outbox envelope containing the common incident identity plus Speed metadata such as measured speed, limit/tolerance/threshold data, generation and consumer epoch.
 
 Durable Speed publication is generation/epoch guarded so stale work cannot create a current incident after reconfiguration/restart.
+
+Fight incident publication additionally uses the Phase-15 Fight service-epoch publication fence. Buffered Stage3 state whose epoch is below the current publication floor is discarded and cannot append a durable incident after a failed Fight service incarnation.
 
 ---
 
@@ -1020,9 +1129,9 @@ Phase-13 validation baseline:
 
 ---
 
-# 23. Phase-14 guarantees now present on master
+# 23. Phase-14 guarantees retained
 
-Phase 14 added:
+Phase 14 established:
 
 ```text
 capability-aware shared service lifecycle
@@ -1061,7 +1170,7 @@ tests/test_shared_services.py
 Fight_backend_project/backend_frontend_project/speed_detection/phase14_tests.py
 ```
 
-Final automated validation reported:
+Final automated validation:
 
 ```text
 148 passed, 1 skipped
@@ -1072,33 +1181,102 @@ git diff --check passed
 UI/template/static directories unchanged
 ```
 
-Live acceptance additionally verified:
-
-```text
-Fight-only cold start
-  -> Vehicle HEALTHY / service_disabled
-
-Fight-only -> first Speed camera hot-add
-  -> same runtime PID/run_id
-  -> restart_count unchanged
-  -> Vehicle heartbeat/inference progress
-  -> Speed progress
-
-last Speed camera hot-remove
-  -> same global runtime
-  -> Vehicle returns to HEALTHY / service_disabled after grace
-  -> Fight remains healthy
-```
-
-Manual OS-level Vehicle-process kill smoke was not required for acceptance because deterministic recovery/stall/exhaustion and Windows-spawn tests cover that path. Production GPU/scale validation was not performed.
+Live acceptance verified Fight-only Vehicle-disabled startup, same-runtime first-Speed hot-add, and same-runtime last-Speed hot-remove.
 
 ---
 
-# 24. Task router
+# 24. Phase-15 guarantees now present on master
+
+Phase 15 added bounded in-runtime recovery for the recoverable Fight inference bundle.
+
+Primary guarantees:
+
+```text
+Person / Person router / Pose / Pose router / Stage3 failures recover as one Fight bundle
+Fight transport is replaced, not reused
+camera generations are invalidated before failed transport replacement
+Fight service epochs reject stale shared-worker health
+old generation Person results are rejected
+pre-failure Stage3 publication is fenced before durable incident output
+LIVE Fight cameras resume through camera-local restart
+Speed-only cameras are preserved
+Vehicle process identity is preserved across Fight recovery
+Incident and Reporter process identities remain unchanged
+mixed Fight+Speed camera may briefly restart locally but Vehicle remains alive
+Fight file-source service failure is fail-closed / no replay
+replacement-start failures consume the bounded recovery budget
+recovery exhaustion escalates to runtime failure
+Windows spawn recreation is covered by deterministic tests
+```
+
+Default Fight recovery controls:
+
+```text
+FIGHT_SERVICE_RESTART_LIMIT=3
+FIGHT_SERVICE_RESTART_BACKOFF_SEC=2
+FIGHT_SERVICE_RESTART_MAX_BACKOFF_SEC=30
+```
+
+Primary implementation:
+
+```text
+fight/pipeline_mp/shared_services.py
+fight/pipeline_mp/camera_lifecycle.py
+fight/pipeline_mp/run_multiprocess.py
+fight/pipeline_mp/health.py
+fight/pipeline_mp/messages.py
+fight/pipeline_mp/incident_worker.py
+fight/pipeline/incident_aggregator.py
+fight/runtime_supervisor/core.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/fight_runner.py
+```
+
+Focused tests:
+
+```text
+tests/test_fight_service_recovery.py
+tests/test_shared_services.py
+```
+
+Final automated validation reported:
+
+```text
+162 passed, 1 skipped
+compileall passed
+Django check passed
+migration check passed
+git diff --check passed
+ARCHITECTURE.md unchanged by Codex
+UI/template/static directories unchanged
+```
+
+Live acceptance additionally verified:
+
+```text
+Fight-only startup
+  -> Fight bundle runs and processes real work
+  -> Vehicle remains HEALTHY / service_disabled
+  -> stable runtime health becomes HEALTHY
+
+Speed-only convergence
+  -> desired camera set converges to only the Speed camera
+  -> Fight bundle becomes HEALTHY / service_disabled after grace
+  -> Vehicle remains required/running and processes real work
+  -> runtime remains HEALTHY before normal file EOF shutdown
+```
+
+Manual random child-process killing was not required for acceptance because deterministic tests cover each recoverable Fight component, health-confirmed hangs, retry exhaustion, stale health/results, publication fencing, file fail-closed behavior, same-parent recovery and Windows-spawn recreation.
+
+Remaining Phase-15-specific debt:
+
+- production GPU/scale validation of recovery behavior,
+- reducing the brief Speed interruption on a mixed Fight+Speed camera during Fight bundle recovery if later justified.
+
+---
+
+# 25. Task router
 
 ## Dynamic camera + capability lifecycle
-
-Read together:
 
 ```text
 fight/pipeline_mp/camera_lifecycle.py
@@ -1109,9 +1287,10 @@ fight/runtime_supervisor/camera_state.py
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
 tests/test_dynamic_camera_lifecycle.py
 tests/test_shared_services.py
+tests/test_fight_service_recovery.py
 ```
 
-## Fight inference
+## Fight inference / recovery
 
 ```text
 fight/pipeline_mp/camera_worker.py
@@ -1120,7 +1299,11 @@ fight/pipeline_mp/pose_worker.py
 fight/pipeline_mp/stage3_worker.py
 fight/pipeline_mp/shared_services.py
 fight/pipeline_mp/messages.py
+fight/pipeline_mp/incident_worker.py
+fight/pipeline/incident_aggregator.py
 fight/pipeline_mp/scheduling.py
+tests/test_fight_service_recovery.py
+tests/test_shared_services.py
 ```
 
 ## Speed integration / recovery
@@ -1155,6 +1338,7 @@ fight/pipeline_mp/camera_lifecycle.py
 fight/runtime_supervisor/core.py
 tests/test_runtime_health.py
 tests/test_shared_services.py
+tests/test_fight_service_recovery.py
 ```
 
 ## Backpressure/fairness
@@ -1188,6 +1372,7 @@ fight/pipeline_mp/speed_worker.py
 incidents/services/ingest.py
 incidents/services/retention.py
 incidents/models.py
+tests/test_fight_service_recovery.py
 ```
 
 ## Authorization/location
@@ -1201,7 +1386,7 @@ incidents/models.py
 
 ---
 
-# 25. Cross-phase invariants checklist
+# 26. Cross-phase invariants checklist
 
 Before accepting architecture-affecting changes, verify all relevant items:
 
@@ -1215,11 +1400,15 @@ Before accepting architecture-affecting changes, verify all relevant items:
 [ ] optional disabled services remain healthy
 [ ] camera slot/generation stale protection preserved
 [ ] Speed consumer epoch protection preserved
-[ ] shared-service epoch/transport invalidation preserved where used
-[ ] Fight critical failure semantics unchanged unless explicitly in scope
+[ ] Fight/Vehicle service-epoch isolation preserved
+[ ] Fight publication floor fences failed Stage3 incarnations
+[ ] Fight recovery invalidates generations before replacement transport
+[ ] Fight retry/backoff remains bounded; no restart storms
 [ ] Vehicle recovery does not unnecessarily kill Fight
 [ ] Vehicle retry/backoff remains bounded; no restart storms
+[ ] Incident/Reporter remain runtime-global unless explicitly redesigned
 [ ] failed/partial file Speed work is not replayed as clean success
+[ ] failed/partial file Fight work is not replayed as clean success
 [ ] live freshness / file ordering semantics preserved
 [ ] no qsize()-based correctness
 [ ] bounded queues / bounded telemetry
@@ -1229,28 +1418,40 @@ Before accepting architecture-affecting changes, verify all relevant items:
 [ ] retention/disk-pressure semantics preserved
 [ ] no UI/template/static redesign during backend-only phases
 [ ] PostgreSQL untouched unless explicitly in scope
+[ ] Docker/deployment/Nginx untouched unless explicitly in scope
 ```
 
 ---
 
-# 26. Remaining debt / future phases
+# 27. Remaining debt / future backend work
 
-No Phase-15 scope is fixed by this document yet. Promote one explicitly before implementation.
+No next phase is fixed by this document. Promote one explicitly before implementation.
 
-Known remaining work:
+Current backend-focused remaining work:
 
-- production-scale CPU/RAM/VRAM/latency/throughput validation,
+- production-scale CPU/RAM/VRAM/latency/throughput characterization,
 - GPU stress/scale validation of mixed Fight + Speed workloads,
-- generalized in-runtime recovery for critical Fight shared services, if later justified,
-- shared-memory transport decision for large NumPy frames,
-- multi-GPU partitioning,
-- PostgreSQL migration,
-- production service/deployment packaging,
-- Nginx/media offload,
-- dashboard and incident UX redesign,
-- preview/offline UX redesign,
+- reusable capacity benchmark harness for 1/2/4/8/... real inference workloads,
+- control-plane/runtime scaling tests for large camera-slot counts independent of GPU model throughput,
+- shared-memory transport only if measurement proves NumPy IPC/copy is a bottleneck,
+- soak/chaos validation for long-running runtime behavior,
+- production GPU validation of Vehicle and Fight recovery,
+- possible reduction of mixed-camera Speed interruption during Fight recovery,
+- Fight model quality hardening on broader real-camera/hard-negative data,
+- Speed measurement accuracy validation and calibration robustness,
+- production storage sizing and cleanup-scan observability,
 - durable incident-history archival/compaction,
-- legacy/aborted-run operator tooling,
-- production storage sizing and cleanup-scan observability.
+- legacy/aborted-run operator tooling.
 
-Do not combine these into another phase by default. Each must be promoted deliberately with its own acceptance criteria.
+Explicitly deferred for later discussion; do **not** pull these into backend-hardening phases by default:
+
+```text
+PostgreSQL migration
+Docker
+Nginx/media offload
+production deployment/service packaging
+UI/UX redesign
+multi-GPU deployment topology
+```
+
+The current priority is to make the backend/runtime excellent first. Deployment/database packaging decisions remain separate until explicitly promoted with their own acceptance criteria.
