@@ -6,7 +6,6 @@ import re
 import time
 from io import BytesIO
 from pathlib import Path
-from typing import Iterator
 
 import cv2
 from django.conf import settings
@@ -580,13 +579,13 @@ def speed_calibration_frame(request, camera_id):
     try:
         from services.pipeline_bridge.fight_runner import get_pipeline_status, get_active_run, _control_mode
         status = get_pipeline_status()
-        if _control_mode() == "supervisor":
+        if _control_mode() == "supervisor" or status.get("runtime_state") in {"STARTING", "RUNNING"}:
             if status.get("runtime_state") not in {"STARTING", "RUNNING"} or status.get("orphan_detected"):
                 raise Http404("Start the common camera runtime to obtain a calibration preview.")
             active = get_active_run(status)
             frame = cv2.imread(str(active.run_dir / "previews" / f"{camera.camera_id}.jpg")) if active else None
             ok = frame is not None
-        elif status.get("runtime_state") == "UNKNOWN":
+        elif status.get("runtime_state") != "STOPPED" or status.get("orphan_detected"):
             raise Http404("Camera ownership is unavailable; refusing a second source open.")
         else:
             cap = _open_camera_source(camera.get_runtime_source())
@@ -682,84 +681,6 @@ def save_speed_calibration(request, camera_id):
             status=400,
         )
 
-def _mjpeg_frame_generator(source: str) -> Iterator[bytes]:
-    """
-    Üst kamera kartı için ham canlı akış üretir.
-
-    Burada pipeline'ın yazdığı preview jpg dosyasını okumuyoruz.
-    Kamera/video kaynağını doğrudan Django tarafından açıp multipart MJPEG olarak
-    tarayıcıya gönderiyoruz. Böylece üst kart clip/preview gibi yenilenmez, sürekli akar.
-    """
-    cap = None
-
-    speed_defaults = getattr(settings, "SPEED_PIPELINE_DEFAULTS", {})
-    stream_width = int(speed_defaults.get("stream_width", speed_defaults.get("resize_width", 960)) or 960)
-    stream_fps = float(speed_defaults.get("stream_fps", 18.0) or 18.0)
-    jpeg_quality = int(speed_defaults.get("stream_jpeg_quality", 82) or 82)
-
-    stream_fps = max(1.0, min(stream_fps, 30.0))
-    jpeg_quality = max(45, min(jpeg_quality, 95))
-    delay = 1.0 / stream_fps
-
-    try:
-        cap = _open_camera_source(source)
-
-        if cap is None or not cap.isOpened():
-            return
-
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
-
-        while True:
-            started = time.monotonic()
-
-            ok, frame = cap.read()
-
-            if not ok or frame is None:
-                # Kaynak video dosyasıysa başa saralım ki demo akış bitince siyaha düşmesin.
-                try:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                    ok, frame = cap.read()
-                except Exception:
-                    ok, frame = False, None
-
-                if not ok or frame is None:
-                    time.sleep(0.2)
-                    continue
-
-            h, w = frame.shape[:2]
-
-            if stream_width > 0 and w > stream_width:
-                scale = stream_width / float(w)
-                frame = cv2.resize(frame, (stream_width, int(h * scale)))
-
-            ok, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality],
-            )
-
-            if not ok:
-                continue
-
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Cache-Control: no-cache\r\n\r\n"
-                + buffer.tobytes()
-                + b"\r\n"
-            )
-
-            elapsed = time.monotonic() - started
-
-            if elapsed < delay:
-                time.sleep(delay - elapsed)
-
-    finally:
-        if cap is not None:
-            cap.release()
 
 
 @never_cache
@@ -767,9 +688,13 @@ def _mjpeg_frame_generator(source: str) -> Iterator[bytes]:
 @require_GET
 def speed_camera_stream(request, camera_id):
     item = _get_speed_config_by_camera_id(camera_id, request.user)
+    from services.pipeline_bridge.common_preview import preview_context, preview_mjpeg
+    context = preview_context(item.camera.camera_id)
+    if context is None or not context[1].is_file():
+        raise Http404("Common runtime camera preview is unavailable.")
 
     response = StreamingHttpResponse(
-        _mjpeg_frame_generator(item.camera.source),
+        preview_mjpeg(item.camera.camera_id, *context),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
     response["Cache-Control"] = "no-cache, no-store, must-revalidate"

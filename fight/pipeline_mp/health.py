@@ -326,6 +326,8 @@ class HealthRegistry:
             record = self.workers.get(event.component)
             if record is None:
                 return False
+            if event.service_epoch != record.get("service_epoch", 0):
+                return False
 
         ts = float(event.monotonic_ts)
         if ts < float(record["registered_at"]) or ts < float(record["last_event_at"]):
@@ -563,15 +565,20 @@ class HealthRegistry:
         worker_process_alive = worker_process_alive or {}
         actions: list[dict] = []
         for component, record in self.workers.items():
-            health, reason = self._worker_health(
-                component,
-                record,
-                policy,
-                current,
-                worker_process_alive.get(component, True),
-            )
+            service_state = record.get("service_state")
+            if service_state == "disabled" and not record.get("required", True):
+                health, reason = HEALTHY, "service_disabled"
+            elif service_state == "restarting":
+                health, reason = DEGRADED, "service_restarting"
+            elif service_state == "failed":
+                health, reason = FAILED, "service_recovery_exhausted"
+            else:
+                health, reason = self._worker_health(
+                    component, record, policy, current,
+                    worker_process_alive.get(component, True),
+                )
             capacity = record.get("capacity", {})
-            if (health == HEALTHY and capacity.get("capacity", 0) > 0
+            if (health == HEALTHY and service_state != "disabled" and capacity.get("capacity", 0) > 0
                     and capacity.get("outstanding", 0) >=
                     capacity["capacity"] * policy.capacity_overload_ratio):
                 health, reason = DEGRADED, "queue_pressure"
@@ -690,6 +697,10 @@ class HealthRegistry:
                 "queue_depth": record["queue_depth"],
                 "dropped": record["dropped"],
                 "capacity": record.get("capacity", {}),
+                "required": record.get("required", True),
+                "service_state": record.get("service_state", "running"),
+                "service_epoch": record.get("service_epoch", 0),
+                "restart_count": record.get("restart_count", 0),
             }
             for name, record in sorted(self.workers.items())
         }

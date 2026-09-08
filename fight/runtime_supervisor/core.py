@@ -714,6 +714,7 @@ class RuntimeSupervisor:
                 "source_state",
             }
             worker_fields = {
+                "required", "service_state", "service_epoch", "restart_count",
                 "capacity",
                 "health",
                 "reason",

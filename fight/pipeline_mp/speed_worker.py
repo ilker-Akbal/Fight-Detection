@@ -112,7 +112,10 @@ def vehicle_service_main(config, requests, results, stop, generations, epochs, h
                         detector = detector_factory(cfg.yolo)
                     detections = detector.detect(request.frame)
             except Exception:
-                outcome = "inference_failed"  # No source/config exception text in status.
+                health.emit("process_error", force=True, detail="vehicle_inference_failed")
+                # A broken shared model is a service failure, not a per-camera
+                # negative detection. Parent recovery owns the bounded retry.
+                raise RuntimeError("vehicle_inference_failed") from None
             count += 1
             health.emit("inference_completed", force=True, progress=count)
             # Do not send frame pixels back through the result queue.

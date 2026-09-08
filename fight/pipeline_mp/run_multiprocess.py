@@ -229,7 +229,7 @@ def _wait_for_pipeline_settle(
     )
 
     while time.time() < deadline:
-        stage3_empty = _safe_empty(stage3_queue)
+        stage3_empty = stage3_queue is None or _safe_empty(stage3_queue)
         incident_empty = _safe_empty(incident_queue)
 
         if stage3_empty and incident_empty:
@@ -937,7 +937,7 @@ def _run_static(config: dict) -> int:
 
 
 def _run_dynamic(config: dict) -> int:
-    """Run shared inference services once and reconcile camera process trios in-place."""
+    """Reconcile camera capabilities and their shared services in the same parent."""
     run_started_monotonic = time.perf_counter()
     run_id = str(config.get("run_id") or uuid.uuid4().hex)
     config["run_id"] = run_id
@@ -955,70 +955,15 @@ def _run_dynamic(config: dict) -> int:
     slot_count = max(
         len(initial_cameras), int(runtime.get("dynamic_camera_slot_count", 32)), 1
     )
-    use_pose = bool(runtime.get("use_pose", True))
     stop_event = ctx.Event()
     install_signal_handlers(stop_event)
 
-    stage3_queue = ctx.JoinableQueue(maxsize=max(1, int(runtime.get("stage3_queue_size", 64))))
-    incident_queue = ctx.JoinableQueue(
-        maxsize=max(1, int(runtime.get("incident_queue_size", 256)))
-    )
-    report_queue = ctx.JoinableQueue(
-        maxsize=max(1, int(runtime.get("report_queue_size", 8192)))
-    )
+    incident_queue = ctx.JoinableQueue(maxsize=max(1, int(runtime.get("incident_queue_size", 256))))
+    report_queue = ctx.JoinableQueue(maxsize=max(1, int(runtime.get("report_queue_size", 8192))))
     health_enabled = bool(runtime.get("health_enabled", True))
-    health_queue = (
-        ctx.Queue(maxsize=max(64, int(runtime.get("health_queue_size", 4096))))
-        if health_enabled
-        else None
-    )
-    person_request_queue = ctx.JoinableQueue(
-        maxsize=max(1, int(runtime.get("person_request_queue_size", slot_count)))
-    )
-    person_result_queue = ctx.JoinableQueue(
-        maxsize=max(1, int(runtime.get("person_result_queue_size", slot_count)))
-    )
-    person_channel_size = max(
-        1, int(runtime.get("person_camera_result_queue_size", 2))
-    )
-    person_result_channels = {
-        slot_id: ctx.Queue(maxsize=person_channel_size) for slot_id in range(slot_count)
-    }
-    pose_request_queue = None
-    pose_result_queue = None
-    pose_result_channels = {}
-    if use_pose:
-        pose_request_queue = ctx.JoinableQueue(
-            maxsize=max(1, int(runtime.get("pose_request_queue_size", slot_count)))
-        )
-        pose_result_queue = ctx.JoinableQueue(
-            maxsize=max(1, int(runtime.get("pose_result_queue_size", slot_count)))
-        )
-        pose_channel_size = max(
-            1, int(runtime.get("pose_camera_result_queue_size", 2))
-        )
-        pose_result_channels = {
-            slot_id: ctx.Queue(maxsize=pose_channel_size) for slot_id in range(slot_count)
-        }
+    health_queue = ctx.Queue(maxsize=max(64, int(runtime.get("health_queue_size", 4096)))) if health_enabled else None
     slot_generations = ctx.Array("q", slot_count, lock=True)
-    from fight.pipeline_mp.speed_worker import vehicle_service_main
     speed_epochs = ctx.Array("q", slot_count, lock=True)
-    vehicle_requests = FairRequestQueue(ctx, slot_count, 1)
-    vehicle_results = {slot: ctx.Queue(maxsize=1) for slot in range(slot_count)}
-    vehicle_worker = _start_process("vehicle_inference", vehicle_service_main,
-        (config, vehicle_requests, vehicle_results, stop_event, slot_generations, speed_epochs, health_queue))
-    # Stable-slot reservations prevent a hot camera from taking another
-    # camera's admission budget. Consumer-side RR also feeds microbatching.
-    if bool(runtime.get("fair_scheduling_enabled", True)):
-        for old_queue in (stage3_queue, person_request_queue, pose_request_queue):
-            if old_queue is not None:
-                _close_queue(old_queue)
-        person_request_queue = FairRequestQueue(ctx, slot_count, 1)
-        stage3_queue = FairRequestQueue(
-            ctx, slot_count, max(1, int(runtime.get("stage3_pending_per_camera", 1)))
-        )
-        if use_pose:
-            pose_request_queue = FairRequestQueue(ctx, slot_count, 1)
     config["cameras"] = initial_cameras
     write_json(output_dir / "run_config.effective.json", config)
 
@@ -1035,90 +980,19 @@ def _run_dynamic(config: dict) -> int:
             health_queue,
         ),
     )
-    stage3 = _start_process(
-        "stage3",
-        stage3_process_main,
-        (
-            config,
-            stage3_queue,
-            incident_queue,
-            report_queue,
-            stop_event,
-            slot_generations,
-            health_queue,
-        ),
-    )
-    person_result_router = _start_process(
-        "person_result_router",
-        person_result_router_main,
-        (
-            config,
-            person_result_queue,
-            person_result_channels,
-            report_queue,
-            stop_event,
-            slot_generations,
-            health_queue,
-        ),
-    )
-    person_worker = _start_process(
-        "person_inference",
-        person_inference_process_main,
-        (
-            config,
-            person_request_queue,
-            person_result_queue,
-            report_queue,
-            stop_event,
-            slot_generations,
-            health_queue,
-        ),
-    )
-    pose_result_router = None
-    pose_worker = None
-    if use_pose:
-        pose_result_router = _start_process(
-            "pose_result_router",
-            pose_result_router_main,
-            (
-                config,
-                pose_result_queue,
-                pose_result_channels,
-                report_queue,
-                stop_event,
-                slot_generations,
-                health_queue,
-            ),
-        )
-        pose_worker = _start_process(
-            "pose_inference",
-            pose_inference_process_main,
-            (
-                config,
-                pose_request_queue,
-                pose_result_queue,
-                report_queue,
-                stop_event,
-                slot_generations,
-                health_queue,
-            ),
-        )
-
     manager = CameraRuntimeManager(
         ctx=ctx,
         config=config,
-        stage3_queue=stage3_queue,
+        stage3_queue=None,
         report_queue=report_queue,
-        person_request_queue=person_request_queue,
-        person_result_channels=person_result_channels,
-        pose_request_queue=pose_request_queue,
-        pose_result_channels=pose_result_channels,
+        person_request_queue=None,
+        person_result_channels={},
+        pose_request_queue=None,
+        pose_result_channels={},
         slot_generations=slot_generations,
         health_queue=health_queue,
         terminate_process=_terminate_process,
         close_queue=_close_queue,
-        vehicle_requests=vehicle_requests,
-        vehicle_results=vehicle_results,
         speed_epochs=speed_epochs,
     )
     desired_path = str(runtime.get("desired_camera_state_path") or "").strip()
@@ -1127,26 +1001,8 @@ def _run_dynamic(config: dict) -> int:
     poll_interval = max(
         0.1, float(runtime.get("dynamic_camera_reconcile_interval_sec", 0.5))
     )
-    shared_processes = {
-        "stage3": (stage3, 2),
-        "incident": (incident, 3),
-        "person_inference": (person_worker, 4),
-        "person_result_router": (person_result_router, 5),
-        "reporter": (reporter, 8),
-    }
-    if use_pose:
-        shared_processes["pose_inference"] = (pose_worker, 6)
-        shared_processes["pose_result_router"] = (pose_result_router, 7)
-    shared_health_processes = {
-        "vehicle": vehicle_worker,
-        "person": person_worker,
-        "person_router": person_result_router,
-        "stage3": stage3,
-        "incident": incident,
-    }
-    if use_pose:
-        shared_health_processes["pose"] = pose_worker
-        shared_health_processes["pose_router"] = pose_result_router
+    shared_processes = {"incident": (incident, 3), "reporter": (reporter, 8)}
+    shared_health_processes = {"incident": incident}
     from fight.operations import DiskMonitor
     disk_monitor = DiskMonitor(runtime)
     health_registry = HealthRegistry(max_cameras=slot_count) if health_enabled else None
@@ -1164,6 +1020,8 @@ def _run_dynamic(config: dict) -> int:
             report_queue,
         )
         snapshot_store = HealthSnapshotStore(health_snapshot_path)
+    from fight.pipeline_mp.shared_services import SharedServices, SharedServiceStartError
+    services = SharedServices(manager, incident_queue, _start_process, _terminate_process, health_registry)
     watchdog_interval = max(0.25, float(runtime.get("health_watchdog_interval_sec", 1.0)))
     health_drain_limit = max(64, int(runtime.get("health_event_drain_limit", 2048)))
     last_watchdog = -1e30
@@ -1187,9 +1045,18 @@ def _run_dynamic(config: dict) -> int:
     )
 
     try:
+        # Prefer the current durable state over a potentially older launch snapshot.
+        if desired_store is not None:
+            try:
+                desired = desired_store.load()
+                initial_cameras = desired["cameras"]
+                desired_revision = int(desired["revision"])
+            except InvalidDesiredCameraState:
+                pass
+        services.prepare(initial_cameras)
         manager.reconcile(initial_cameras, revision=desired_revision)
         while not stop_event.is_set():
-            for name, (process, failure_code) in shared_processes.items():
+            for name, (process, failure_code) in {**shared_processes, **services.critical_processes()}.items():
                 if process is not None and not process.is_alive():
                     _put_status(
                         report_queue,
@@ -1212,6 +1079,7 @@ def _run_dynamic(config: dict) -> int:
                     desired = desired_store.load()
                     revision = int(desired["revision"])
                     if revision > desired_revision:
+                        services.prepare(desired["cameras"])
                         manager.reconcile(desired["cameras"], revision=revision)
                         desired_revision = revision
                 except InvalidDesiredCameraState:
@@ -1224,6 +1092,8 @@ def _run_dynamic(config: dict) -> int:
                             "detail": "desired_state_invalid_ignored",
                         },
                     )
+                except SharedServiceStartError:
+                    raise
                 except Exception as exc:
                     _put_status(
                         report_queue,
@@ -1236,8 +1106,7 @@ def _run_dynamic(config: dict) -> int:
                         },
                     )
 
-            manager.speed_service_available = vehicle_worker.is_alive() and (
-                health_registry is None or health_registry.workers["vehicle"]["health"] != "FAILED")
+            services.tick()
             manager.poll()
             manager.retry_failed(revision=desired_revision)
             if health_registry is not None and health_queue is not None:
@@ -1250,10 +1119,7 @@ def _run_dynamic(config: dict) -> int:
                         "runs": output_dir,
                         "outbox": runtime.get("incident_outbox_path") or output_dir,
                     })
-                    for stage, admission in (("person", person_request_queue),
-                                             ("vehicle", vehicle_requests),
-                                             ("pose", pose_request_queue),
-                                             ("stage3", stage3_queue)):
+                    for stage, admission in services.admissions().items():
                         if not hasattr(admission, "snapshot"):
                             continue
                         capacity = admission.snapshot()
@@ -1261,7 +1127,7 @@ def _run_dynamic(config: dict) -> int:
                         health_registry.workers[stage]["capacity"] = capacity
                         for camera in health_registry.cameras.values():
                             camera.setdefault("capacity", {})[stage] = per_slot.get(str(camera["slot_id"]), {})
-                    if watchdog.tick(manager, shared_health_processes):
+                    if watchdog.tick(manager, {**shared_health_processes, **services.processes()}):
                         exit_code = 10
                         stop_event.set()
                     try:
@@ -1300,7 +1166,7 @@ def _run_dynamic(config: dict) -> int:
                 )
             )
             if stop_on_file_eof and manager.all_file_cameras_done():
-                if getattr(stage3_queue, "capacity_control", False) and not stage3_queue.empty():
+                if getattr(manager.stage3_queue, "capacity_control", False) and not manager.stage3_queue.empty():
                     # Keep ticking health while admitted file candidates drain.
                     # The legacy finalization timeout must not discard a fair
                     # queue backlog or an inference already in flight.
@@ -1321,7 +1187,7 @@ def _run_dynamic(config: dict) -> int:
                     },
                 )
                 _wait_for_pipeline_settle(
-                    stage3_queue=stage3_queue,
+                    stage3_queue=manager.stage3_queue,
                     incident_queue=incident_queue,
                     report_queue=report_queue,
                     runtime=runtime,
@@ -1329,30 +1195,18 @@ def _run_dynamic(config: dict) -> int:
                 stop_event.set()
                 break
             time.sleep(poll_interval)
+    except SharedServiceStartError:
+        exit_code = 10
+        stop_event.set()
     except KeyboardInterrupt:
         exit_code = 130
         stop_event.set()
     finally:
         manager.stop_all(reason="global_stop")
         stop_event.set()
-        _terminate_process(vehicle_worker, timeout=5.0)
-        _close_queue(vehicle_requests)
-        for channel in vehicle_results.values():
-            _close_queue(channel)
-        _put_sentinel(person_request_queue, person_worker)
-        _terminate_process(person_worker, timeout=8.0)
-        _put_sentinel(person_result_queue, person_result_router)
-        _terminate_process(person_result_router, timeout=5.0)
-        if use_pose:
-            _put_sentinel(pose_request_queue, pose_worker)
-            _terminate_process(pose_worker, timeout=8.0)
-            _put_sentinel(pose_result_queue, pose_result_router)
-            _terminate_process(pose_result_router, timeout=5.0)
-        try:
-            stage3_queue.put(None, timeout=1.0)
-        except Exception:
-            pass
-        _terminate_process(stage3, timeout=8.0)
+        final_capacity = {stage: admission.snapshot() for stage, admission in services.admissions().items()
+                          if hasattr(admission, "snapshot")} if exit_code in {0, 13} else {}
+        services.close()
         try:
             incident_queue.put(None, timeout=1.0)
         except Exception:
@@ -1382,30 +1236,12 @@ def _run_dynamic(config: dict) -> int:
         try:
             status_rows = load_status_rows(status_path, start_offset=status_start_offset)
             summary = build_performance_summary(config, status_rows, wall_processing_sec)
-            summary["capacity"] = {
-                stage: admission.snapshot()
-                for stage, admission in (("person", person_request_queue),
-                                         ("pose", pose_request_queue),
-                                         ("stage3", stage3_queue))
-                if hasattr(admission, "snapshot")
-            }
-            summary["capacity"]["vehicle"] = vehicle_requests.snapshot()
+            summary["capacity"] = final_capacity
             write_json(output_dir / "performance_summary.json", summary)
         except Exception as exc:
             print(f"[PERFORMANCE][WARN] summary write failed: {exc}", flush=True)
-        for channel in person_result_channels.values():
-            _close_queue(channel)
-        for channel in pose_result_channels.values():
-            _close_queue(channel)
-        _close_queue(person_request_queue)
-        _close_queue(person_result_queue)
-        if pose_request_queue is not None:
-            _close_queue(pose_request_queue)
-        if pose_result_queue is not None:
-            _close_queue(pose_result_queue)
         if health_queue is not None:
             _close_queue(health_queue)
-        _close_queue(stage3_queue)
         _close_queue(incident_queue)
         _close_queue(report_queue)
     return int(exit_code)
