@@ -964,6 +964,7 @@ def _run_dynamic(config: dict) -> int:
     health_queue = ctx.Queue(maxsize=max(64, int(runtime.get("health_queue_size", 4096)))) if health_enabled else None
     slot_generations = ctx.Array("q", slot_count, lock=True)
     speed_epochs = ctx.Array("q", slot_count, lock=True)
+    fight_publication_floor = ctx.Array("q", 1, lock=True)
     config["cameras"] = initial_cameras
     write_json(output_dir / "run_config.effective.json", config)
 
@@ -978,6 +979,7 @@ def _run_dynamic(config: dict) -> int:
             stop_event,
             slot_generations,
             health_queue,
+            fight_publication_floor,
         ),
     )
     manager = CameraRuntimeManager(
@@ -1021,7 +1023,8 @@ def _run_dynamic(config: dict) -> int:
         )
         snapshot_store = HealthSnapshotStore(health_snapshot_path)
     from fight.pipeline_mp.shared_services import SharedServices, SharedServiceStartError
-    services = SharedServices(manager, incident_queue, _start_process, _terminate_process, health_registry)
+    services = SharedServices(manager, incident_queue, _start_process, _terminate_process, health_registry,
+                              publication_floor=fight_publication_floor)
     watchdog_interval = max(0.25, float(runtime.get("health_watchdog_interval_sec", 1.0)))
     health_drain_limit = max(64, int(runtime.get("health_event_drain_limit", 2048)))
     last_watchdog = -1e30
@@ -1056,7 +1059,7 @@ def _run_dynamic(config: dict) -> int:
         services.prepare(initial_cameras)
         manager.reconcile(initial_cameras, revision=desired_revision)
         while not stop_event.is_set():
-            for name, (process, failure_code) in {**shared_processes, **services.critical_processes()}.items():
+            for name, (process, failure_code) in shared_processes.items():
                 if process is not None and not process.is_alive():
                     _put_status(
                         report_queue,
@@ -1107,6 +1110,14 @@ def _run_dynamic(config: dict) -> int:
                     )
 
             services.tick()
+            if services.fight_failed:
+                # Also fatal with health snapshots/watchdog disabled. No file replay.
+                if health_registry is not None:
+                    health_registry.evaluate(HealthPolicy.from_runtime(runtime))
+                    snapshot_store.write(health_registry.snapshot(run_id))
+                exit_code = 10
+                stop_event.set()
+                break
             manager.poll()
             manager.retry_failed(revision=desired_revision)
             if health_registry is not None and health_queue is not None:

@@ -692,6 +692,7 @@ class RuntimeSupervisor:
             if not isinstance(raw_workers, dict) or len(raw_workers) > 16:
                 raise ValueError("invalid worker health")
             camera_fields = {
+                "fight_service_waiting",
                 "speed",
                 "capacity",
                 "generation",

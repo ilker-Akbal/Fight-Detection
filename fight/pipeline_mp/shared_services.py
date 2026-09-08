@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, replace
+from contextlib import nullcontext
 
 from fight.pipeline_mp.common import is_file_source
 from fight.pipeline_mp.health import HealthPolicy, HealthRegistry
@@ -24,6 +25,15 @@ class ServiceHealthChannel:
         self.channel.put_nowait(replace(event, service_epoch=self.epoch))
 
 
+@dataclass
+class FightIncidentChannel:
+    channel: object
+    epoch: int
+
+    def put(self, result, *args, **kwargs):
+        self.channel.put(replace(result, service_epoch=self.epoch), *args, **kwargs)
+
+
 def required_capabilities(cameras):
     active = [cam for cam in cameras if cam.get("enabled", True)]
     return {"fight": any(cam.get("use_fight_detection", True) for cam in active),
@@ -31,7 +41,7 @@ def required_capabilities(cameras):
 
 
 class SharedServices:
-    """Fight is demand-started/drain-stopped, never hot-replaced on failure.
+    """Capability-managed transport bundles with bounded in-runtime recovery.
 
     Vehicle recovery replaces its entire transport after withdrawing consumers.
     This avoids reusing multiprocessing queues/locks from a killed CUDA worker.
@@ -42,7 +52,7 @@ class SharedServices:
     CODES = {"person": 4, "person_router": 5, "pose": 6, "pose_router": 7, "stage3": 2}
 
     def __init__(self, manager, incident_queue, process_factory, terminate_process,
-                 registry=None, monotonic=time.monotonic):
+                 registry=None, monotonic=time.monotonic, publication_floor=None):
         self.manager, self.ctx, self.config = manager, manager.ctx, manager.config
         self.runtime = self.config.get("runtime", {})
         self.incident_queue = incident_queue
@@ -60,6 +70,14 @@ class SharedServices:
         self.retry_max = max(self.retry_base, float(self.runtime.get("vehicle_service_restart_max_backoff_sec", 30)))
         self.attempts, self.vehicle_epoch = 0, 0
         self.fight_epoch = 0
+        self.publication_floor = publication_floor if publication_floor is not None else self.ctx.Array("q", 1, lock=True)
+        self.fight_attempts = 0
+        self.fight_retry_at = None
+        self.fight_failed = False
+        self.fight_failure_reason = ""
+        self.fight_retry_limit = max(0, int(self.runtime.get("fight_service_restart_limit", 3)))
+        self.fight_retry_base = max(.25, float(self.runtime.get("fight_service_restart_backoff_sec", 2)))
+        self.fight_retry_max = max(self.fight_retry_base, float(self.runtime.get("fight_service_restart_max_backoff_sec", 30)))
         self.health_queue = manager.health_queue if manager.health_queue is not None else self.ctx.Queue(
             maxsize=max(64, int(self.runtime.get("health_queue_size", 4096))))
         self.retry_at = None
@@ -134,7 +152,8 @@ class SharedServices:
             if self.runtime.get("use_stage3", True):
                 manager.stage3_queue = self._admission(bundle, "stage3", max(1, int(self.runtime.get("stage3_pending_per_camera", 1))))
                 self._spawn(bundle, "stage3", stage3_process_main, (cfg, manager.stage3_queue,
-                    self.incident_queue, manager.report_queue, stop, generations, health))
+                    FightIncidentChannel(self.incident_queue, self.fight_epoch), manager.report_queue, stop, generations, health))
+            manager.fight_service_available = True
 
     @staticmethod
     def _close(channel):
@@ -152,6 +171,9 @@ class SharedServices:
         bundle["stop"].set()
         for process in bundle["processes"].values():
             self.terminate(process, timeout=1.0)
+            if kind == "fight" and process.is_alive():
+                self.bundles[kind] = bundle
+                raise SharedServiceStartError("fight_service_stop_failed")
         for channel in bundle["queues"]:
             self._close(channel)
         if kind == "vehicle":
@@ -161,6 +183,31 @@ class SharedServices:
             self.manager.person_request_queue = self.manager.pose_request_queue = self.manager.stage3_queue = None
             self.manager.person_result_channels, self.manager.pose_result_channels = {}, {}
             self.draining = None
+
+    def _fight_failure(self, reason):
+        # Fence both buffered aggregator segments and late Stage3 output BEFORE
+        # touching old transport. Normal capability removal/EOF does not fence
+        # valid pending incidents; only a failed incarnation does.
+        lock = getattr(self.publication_floor, "get_lock", lambda: nullcontext())()
+        with lock:
+            self.publication_floor[0] = self.fight_epoch + 1
+        file_affected = any(item.camera["use_fight_detection"] and is_file_source(item.camera["source"])
+                            and not item.fight_service_waiting for item in self.manager.runtimes.values())
+        self.fight_failure_reason = "fight_file_incomplete" if file_affected else reason
+        try:
+            self.manager.suspend_fight()
+            self._stop("fight")
+        except Exception:
+            self.fight_failure_reason = "fight_withdrawal_failed"
+            file_affected = True  # Unsafe teardown must never start a duplicate owner.
+        self.fight_failed = file_affected or self.fight_attempts >= self.fight_retry_limit
+        if self.fight_failed and not file_affected:
+            self.fight_failure_reason = "fight_recovery_exhausted"
+        self.fight_retry_at = None if self.fight_failed else self.clock() + min(
+            self.fight_retry_max, self.fight_retry_base * 2 ** min(self.fight_attempts, 20))
+        self.manager._status("fight_service_failed" if self.fight_failed else "fight_service_restarting",
+            reason=self.fight_failure_reason, component_failure=reason,
+            retries=self.fight_attempts, service_epoch=self.fight_epoch)
 
     def _withdraw_speed(self):
         self.manager.speed_service_available = False
@@ -190,7 +237,8 @@ class SharedServices:
                 if kind == "fight":
                     self.drain_invalidated = True
                 if kind not in self.bundles and (kind != "vehicle" or
-                        (self.retry_at is None and not self.vehicle_failed)):
+                        (self.retry_at is None and not self.vehicle_failed)) and (kind != "fight" or
+                        (self.fight_retry_at is None and not self.fight_failed)):
                     try:
                         self._start(kind)
                     except Exception:
@@ -228,6 +276,22 @@ class SharedServices:
         if self.manager.health_queue is not None:
             self.registry.sync_cameras(self.manager.get_camera_status())
         self.registry.drain(self.health_queue, max(64, int(self.runtime.get("health_event_drain_limit", 2048))))
+        fight = self.bundles.get("fight")
+        if fight is not None and not self.fight_failed:
+            for component, process in fight["processes"].items():
+                state, reason = self.registry._worker_health(component, self.registry.workers[component],
+                    self.policy, self.clock(), process.is_alive())
+                if state == "FAILED":
+                    self._fight_failure(f"{component}_{reason}")
+                    break
+        if self.required["fight"] and self.fight_retry_at is not None and self.clock() >= self.fight_retry_at:
+            self.fight_attempts += 1
+            self.fight_retry_at = None
+            try:
+                self._start("fight")
+                self.manager.resume_fight()
+            except Exception:
+                self._fight_failure("fight_replacement_start_failed")
         bundle = self.bundles.get("vehicle")
         if bundle is not None:
             process = bundle["processes"]["vehicle"]
@@ -254,6 +318,8 @@ class SharedServices:
                             item.speed_restarts += 1
                             item.speed_last_restart = self.clock()
         for kind in list(self.bundles):
+            if kind == "fight" and self.fight_failed:
+                continue
             if not self.required[kind] and self.clock() - self.idle_since[kind] >= self.grace:
                 if kind == "fight" and not self._fight_drained(self.bundles[kind]):
                     continue
@@ -267,10 +333,14 @@ class SharedServices:
             required = self.required[kind] and (component not in {"pose", "pose_router", "stage3"} or
                 self.runtime.get("use_stage3" if component == "stage3" else "use_pose", True))
             record = self.registry.workers[component]
-            if component in processes:
+            if kind == "fight" and self.fight_failed and required:
+                state = "failed"
+            elif component in processes:
                 state = "starting" if record["last_event"] == "registered" else "running"
             elif required and kind == "vehicle":
                 state = "failed" if self.vehicle_failed else "restarting"
+            elif required and kind == "fight" and self.fight_retry_at is not None:
+                state = "restarting"
             else:
                 state = "disabled"
             record.update(required=bool(required), service_state=state)
@@ -278,6 +348,9 @@ class SharedServices:
                 record["capacity"] = {}
             if component == "vehicle":
                 record.update(service_epoch=self.vehicle_epoch, restart_count=self.attempts)
+            else:
+                record.update(service_epoch=self.fight_epoch, restart_count=self.fight_attempts, recoverable=True)
+                record["service_failure_reason"] = self.fight_failure_reason
 
     def processes(self):
         return {name: process for bundle in self.bundles.values() for name, process in bundle["processes"].items()}

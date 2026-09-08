@@ -169,6 +169,7 @@ class Stage3ResultMessage:
     processed_at: float = field(default_factory=time.time)
     generation: int = 0
     slot_id: int = -1
+    service_epoch: int = 0
 
 
 @dataclass

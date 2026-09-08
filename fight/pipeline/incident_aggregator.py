@@ -9,6 +9,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
@@ -44,6 +45,7 @@ class Stage3Result:
     fight_label: str
     pose_score_max: float
     pose_score_mean: float
+    service_epoch: int = 0
 
 
 @dataclass
@@ -183,7 +185,9 @@ class IncidentAggregator:
         sweep_interval_sec: float = 0.50,
         run_id: str = "",
         outbox_path: str | Path | None = None,
+        publication_floor=None,
     ):
+        self.publication_floor = publication_floor
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -247,6 +251,11 @@ class IncidentAggregator:
             camera_id = result.camera_id
 
             st = self.by_camera.get(camera_id)
+            if not self._publication_current(result):
+                return
+            if st is not None and not self._state_current(st):
+                self.by_camera.pop(camera_id, None)
+                st = None
 
             if st is None and result.fight_prob < self.keep_thr:
                 print(
@@ -395,7 +404,14 @@ class IncidentAggregator:
             fight_label=str(result.fight_label),
             pose_score_max=float(result.pose_score_max),
             pose_score_mean=float(result.pose_score_mean),
+            service_epoch=int(result.service_epoch),
         )
+
+    def _publication_current(self, result):
+        return self.publication_floor is None or result.service_epoch >= int(self.publication_floor[0])
+
+    def _state_current(self, state):
+        return all(self._publication_current(segment.result) for segment in state.segments)
 
     def _new_state(self, camera_id: str, source: str) -> TemporalIncidentState:
         idx = self.counter.get(camera_id, 0) + 1
@@ -563,6 +579,9 @@ class IncidentAggregator:
         st = self.by_camera.get(camera_id)
         if st is None:
             return
+        if not self._state_current(st):
+            self.by_camera.pop(camera_id, None)
+            return
 
         if st.state == "cooldown":
             return
@@ -692,8 +711,13 @@ class IncidentAggregator:
             with out_path.open("r+b") as evidence:
                 os.fsync(evidence.fileno())
             fsync_directory(out_path.parent)
-            append_envelope_durable(self.outbox_path, envelope)
-            self._append_jsonl(self.incidents_jsonl, row)
+            lock = getattr(self.publication_floor, "get_lock", lambda: nullcontext())()
+            with lock:
+                if not self._state_current(st):
+                    self.by_camera.pop(camera_id, None)
+                    return
+                append_envelope_durable(self.outbox_path, envelope)
+                self._append_jsonl(self.incidents_jsonl, row)
         except OSError as exc:
             raise DurableWriteError(exc.errno, "incident_persistence_failed") from exc
 

@@ -92,7 +92,7 @@ def test_capability_transitions_preserve_unrelated_processes_and_stable_slots():
         close(services, manager)
 
 
-def test_configured_absence_is_healthy_and_fight_critical_failure_is_unchanged():
+def test_configured_absence_is_healthy_and_fight_fault_defers_to_bundle_owner():
     services, manager, registry, now = fixture({"use_pose": False, "use_stage3": False})
     try:
         reconcile(services, manager, [camera("speed", False, True)])
@@ -103,8 +103,11 @@ def test_configured_absence_is_healthy_and_fight_critical_failure_is_unchanged()
         registry.evaluate(HealthPolicy(), worker_process_alive={"pose": False, "stage3": False})
         assert registry.workers["pose"]["health"] == registry.workers["stage3"]["health"] == "HEALTHY"
         registry.evaluate(HealthPolicy(), worker_process_alive={"person": False})
-        assert registry.runtime_health == "FAILED"
+        assert registry.runtime_health == "DEGRADED"
         assert services.critical_processes()["person"][1] == 4
+        registry.register_worker("incident")
+        registry.evaluate(HealthPolicy(), worker_process_alive={"incident": False})
+        assert registry.runtime_health == "FAILED"
     finally:
         close(services, manager)
 

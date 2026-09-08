@@ -299,7 +299,7 @@ class HealthRegistry:
             camera["lifecycle"] = str(status.get("state", STARTING))
             camera["file_done"] = bool(status.get("file_done", False))
             camera["restart_count"] = int(status.get("restart_count", 0) or 0)
-            for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts"):
+            for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts", "fight_service_waiting"):
                 camera[key] = status.get(key, key == "use_fight_detection")
             if camera.get("speed_epoch") != status.get("speed_epoch"):
                 camera["speed_epoch"] = status.get("speed_epoch")
@@ -461,6 +461,8 @@ class HealthRegistry:
         if lifecycle == FAILED:
             return FAILED, "lifecycle_failed", None
         age = now - float(camera["registered_at"])
+        if camera.get("fight_service_waiting"):
+            return DEGRADED, "fight_service_restarting", None
         components = camera["components"]
         ingest = components["camera_ingest"]
         worker = components["camera_worker"]
@@ -571,13 +573,17 @@ class HealthRegistry:
             elif service_state == "restarting":
                 health, reason = DEGRADED, "service_restarting"
             elif service_state == "failed":
-                health, reason = FAILED, "service_recovery_exhausted"
+                health, reason = FAILED, record.get("service_failure_reason") or "service_recovery_exhausted"
             else:
                 health, reason = self._worker_health(
                     component, record, policy, current,
                     worker_process_alive.get(component, True),
                 )
             capacity = record.get("capacity", {})
+            if health == FAILED and record.get("recoverable") and service_state != "failed":
+                # The parent bundle owner handles the confirmed fault on its next
+                # tick, including health changes between lifecycle/watchdog ticks.
+                health, reason = DEGRADED, "service_failure_detected"
             if (health == HEALTHY and service_state != "disabled" and capacity.get("capacity", 0) > 0
                     and capacity.get("outstanding", 0) >=
                     capacity["capacity"] * policy.capacity_overload_ratio):

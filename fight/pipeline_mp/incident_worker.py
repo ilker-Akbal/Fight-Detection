@@ -24,6 +24,7 @@ def incident_process_main(
     stop_event,
     slot_generations=None,
     health_queue=None,
+    fight_publication_floor=None,
 ) -> None:
     runtime = config.get("runtime", {})
     output_dir = config["output_dir"]
@@ -71,6 +72,7 @@ def incident_process_main(
         temporal_iou_merge_thr=float(runtime.get("incident_temporal_iou_merge_thr", 0.30)),
         run_id=str(config.get("run_id") or runtime.get("run_id") or ""),
         outbox_path=outbox_path,
+        publication_floor=fight_publication_floor,
     )
 
     _report(
@@ -129,6 +131,7 @@ def incident_process_main(
                         fight_label=msg.fight_label,
                         pose_score_max=msg.pose_score_max,
                         pose_score_mean=msg.pose_score_mean,
+                        service_epoch=msg.service_epoch,
                     )
                 )
                 completed_count += 1

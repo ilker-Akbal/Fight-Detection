@@ -54,6 +54,7 @@ class CameraRuntime:
     state: str = STARTING
     intentional_stop: bool = False
     file_done: bool = False
+    fight_service_waiting: bool = False
     last_restart_at: float = 0.0
     restart_count: int = 0
     speed_queue: Any = None
@@ -108,6 +109,7 @@ class CameraRuntimeManager:
         self.vehicle_results = vehicle_results or {}
         self.speed_epochs = speed_epochs
         self.speed_service_available = True
+        self.fight_service_available = True
         self.process_factory = process_factory or self._default_process_factory
         self.terminate_process = terminate_process or self._default_terminate
         self.close_queue = close_queue or self._default_close_queue
@@ -325,6 +327,11 @@ class CameraRuntimeManager:
             "camera_starting", cid, generation=generation, slot_id=slot_id, reason=reason
         )
         try:
+            if normalized["use_fight_detection"] and not self.fight_service_available:
+                item.fight_service_waiting = True
+                item.intentional_stop = True
+                item.state = RECONNECTING
+                return item
             self._spawn_trio(item)
         except Exception:
             item.state = FAILED
@@ -357,8 +364,9 @@ class CameraRuntimeManager:
             self.speed_epochs[item.slot_id] += 1
         for process in item.processes.values():
             self.terminate_process(process, timeout=2.0)
-        self._drain(self.person_result_channels.get(item.slot_id))
-        if item.slot_id in self.pose_result_channels:
+        if not item.fight_service_waiting:
+            self._drain(self.person_result_channels.get(item.slot_id))
+        if not item.fight_service_waiting and item.slot_id in self.pose_result_channels:
             self._drain(self.pose_result_channels[item.slot_id])
         self.close_queue(item.fight_queue)
         self.close_queue(item.preview_queue)
@@ -375,6 +383,47 @@ class CameraRuntimeManager:
             reason=reason,
         )
         return True
+
+    def suspend_fight(self):
+        """Reserve slots, invalidate all affected generations, then withdraw readers.
+
+        Whole affected LIVE camera runtimes restart on fresh transport; Speed-only
+        cameras and the shared Vehicle process are not involved.
+        """
+        self.fight_service_available = False
+        affected = [item for item in self.runtimes.values()
+                    if item.camera["use_fight_detection"] and not item.fight_service_waiting]
+        for item in affected:
+            item.generation = self._next_generation(item.slot_id)
+            item.fight_service_waiting = True
+            item.intentional_stop = True
+            item.state = RECONNECTING
+            item.stop_event.set()
+            if item.speed_stop is not None:
+                item.speed_stop.set()
+                self.speed_epochs[item.slot_id] += 1
+        for item in affected:
+            for process in item.processes.values():
+                self.terminate_process(process, timeout=1.0)
+                if process.is_alive():
+                    raise RuntimeError("fight_camera_withdrawal_failed")
+            item.processes.clear()
+            for channel in (item.fight_queue, item.preview_queue, item.speed_queue):
+                try:
+                    channel.cancel_join_thread()
+                except AttributeError:
+                    pass
+                self.close_queue(channel)
+
+    def resume_fight(self):
+        self.fight_service_available = True
+        for item in list(self.runtimes.values()):
+            if item.fight_service_waiting:
+                try:
+                    self.restart_camera(item.camera_id, item.camera, reason="fight_service_recovered")
+                except Exception as exc:
+                    self._remember_failed(item.camera, "fight_camera_resume_failed", exc)
+                    raise
 
     def restart_camera(self, camera_id: str, camera: dict, *, reason: str) -> CameraRuntime:
         old = self.runtimes[str(camera_id)]
@@ -610,6 +659,7 @@ class CameraRuntimeManager:
                 "slot_id": item.slot_id,
                 "generation": item.generation,
                 "file_done": item.file_done,
+                "fight_service_waiting": item.fight_service_waiting,
                 "restart_count": item.restart_count,
                 "use_fight_detection": item.camera["use_fight_detection"],
                 "use_speed_detection": item.camera["use_speed_detection"],
