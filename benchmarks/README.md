@@ -154,11 +154,29 @@ scheduler storage scale with the explicitly requested count.
 ## Local validation notes (RTX 3050 laptop, 2026-09-10)
 
 The 50/100/200/300 synthetic mixed scenarios completed with all correctness checks.
-An initial one-camera real smoke using the current effective Fight configuration
-and sample_2.mp4 exited 10 after native workers reported duplicate libiomp5md.dll
-initialization (OpenMP Error #15). The harness reported INCOMPLETE. This is not a
-capacity result; two-camera stress was not attempted after that environment error.
-The harness does not set the unsafe KMP_DUPLICATE_LIB_OK workaround or change the
-inference environment to conceal the failure. Repair/verify the native environment,
-rerun a small real smoke, then use the same harness and comparable configuration
-on the RTX 5090 machine. No 5090 camera-count extrapolation is justified.
+
+An initial one-camera real smoke using the current effective Fight configuration and
+`sample_2.mp4` exited 10 after native workers reported duplicate `libiomp5md.dll`
+initialization (OpenMP Error #15). The harness correctly reported that attempt as
+INCOMPLETE and did not set `KMP_DUPLICATE_LIB_OK=TRUE` or otherwise conceal the
+native error.
+
+Follow-up diagnosis found both the active environment and base Anaconda
+`libiomp5md.dll` locations, with identical observed SHA-256 content. Ordinary
+Torch/OpenCV/NumPy/Ultralytics/sklearn imports and a CUDA tensor allocation worked.
+After starting from a clean conda activation (`CONDA_SHLVL=1`) and invoking the
+benchmark via `conda run -n torch_gpu --no-capture-output`, the one-camera Fight
+smoke completed HEALTHY and a two-camera Fight smoke also completed HEALTHY. The
+exact OpenMP root cause is therefore **not proven**; do not encode a speculative
+cause or use the unsafe duplicate-runtime override.
+
+The accepted one-camera smoke decoded 903 frames and reported about 14.76 aggregate
+full-run effective FPS with zero live admission drops/rejection attempts and a
+0.03125 observed queue-ratio peak. This is a short ordered-file harness smoke, not
+a steady-state live-capacity result. The two-camera smoke is accepted as HEALTHY,
+but no detailed two-camera metrics are recorded here.
+
+Use a clean inference environment for future measurements. Continue scaling real
+counts deliberately, preserve the result metadata, and run the same harness with
+comparable workloads on the production-target GPU. No RTX 5090 camera-count
+extrapolation from RTX 3050 measurements is justified.
