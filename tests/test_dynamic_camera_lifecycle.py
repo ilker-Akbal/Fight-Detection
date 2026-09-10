@@ -213,6 +213,7 @@ class DynamicCameraLifecycleTests(unittest.TestCase):
             source.touch()
             self.manager.reconcile([self.camera("file", str(source))])
             item = self.manager.runtimes["file"]
+            item.file_eof_event.set()
             for name in ("ingest", "camera", "preview"):
                 item.processes[name].alive = False
                 item.processes[name].exitcode = 0

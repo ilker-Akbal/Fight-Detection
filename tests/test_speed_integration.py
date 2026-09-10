@@ -13,8 +13,8 @@ import pytest
 
 from fight.pipeline_mp.camera_ingest import run_camera_ingest_loop, publish_speed
 from fight.pipeline_mp.camera_lifecycle import CameraRuntimeManager
-from fight.pipeline_mp.health import HealthRegistry, HealthPolicy, HealthEmitter
-from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal
+from fight.pipeline_mp.health import HealthRegistry, HealthPolicy, HealthEmitter, RuntimeWatchdog
+from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal, HealthEvent
 from fight.pipeline_mp.scheduling import FairRequestQueue, AdmissionStopped
 from fight.pipeline_mp.speed_worker import (
     SpeedProcessor, SpeedGenerationGuard, VehicleRequest, vehicle_service_main, persist_speed_event, speed_process_main,
@@ -173,6 +173,7 @@ def test_file_eof_waits_for_speed_and_failure_is_not_clean(tmp_path):
     manager = manager_fixture()
     manager.reconcile([camera(source=str(source))])
     item = manager.runtimes["camera"]
+    item.file_eof_event.set()
     for name in ("ingest", "camera"):
         item.processes[name].alive = False
         item.processes[name].exitcode = 0
@@ -189,6 +190,116 @@ def test_file_eof_waits_for_speed_and_failure_is_not_clean(tmp_path):
     assert actions == [] and registry.runtime_health == "DEGRADED"
     assert registry.snapshot("run")["cameras"]["camera"]["speed"]["failed"]
     manager.stop_all()
+
+
+@pytest.mark.parametrize("fight", [False, True])
+def test_zero_speed_exit_before_authoritative_eof_stays_failed_without_replay(tmp_path, monkeypatch, fight):
+    source = tmp_path / "file.mp4"
+    source.touch()
+    manager = manager_fixture()
+    manager.reconcile([camera(fight=fight, source=str(source))])
+    item = manager.runtimes["camera"]
+    processes, generation, epoch = dict(item.processes), item.generation, item.speed_epoch
+    speed = processes["speed"]
+    guard = SpeedGenerationGuard(manager.slot_generations, manager.speed_epochs,
+                                 item.slot_id, generation, epoch)
+    # A real already-exited process retains exitcode 0 on terminate().
+    monkeypatch.setattr(speed, "terminate", lambda: None)
+    try:
+        speed.alive, speed.exitcode = False, 0
+        assert not manager.file_eof_reached(item)
+        manager.poll()
+        assert item.speed_failed and item.speed_stop.is_set() and not item.file_done
+        assert not guard() and manager.speed_epochs[item.slot_id] == epoch + 1
+        assert not item.speed_service_waiting and item.speed_restarts == 0
+        for _ in range(2):
+            manager.poll()
+        assert not item.file_done and manager.runtimes["camera"] is item
+        item.file_eof_event.set()
+        for name in ("ingest", "camera") if fight else ("ingest",):
+            processes[name].alive, processes[name].exitcode = False, 0
+        for _ in range(3):
+            manager.poll()
+        # file_done is existing terminal accounting, not success: speed_failed
+        # remains latched and the runtime's existing finalization returns 13.
+        assert item.file_done and item.speed_failed and speed.exitcode == 0
+        assert item.generation == generation and item.restart_count == item.speed_restarts == 0
+        assert manager.speed_epochs[item.slot_id] == epoch + 1 and not guard()
+        assert item.processes == processes and manager.runtimes["camera"] is item
+        registry = HealthRegistry()
+        registry.sync_cameras(manager.get_camera_status())
+        actions, _ = registry.evaluate(HealthPolicy())
+        assert actions == [] and registry.cameras["camera"]["reason"] == "speed_consumer_failed"
+        reports = [msg.row for msg in _drain(manager.report_queue)]
+        assert sum(row["detail"] == "speed_consumer_failed" for row in reports) == 1
+    finally:
+        manager.stop_all()
+
+
+@pytest.mark.parametrize("fight", [False, True])
+def test_clean_file_consumers_drain_without_replay_or_early_completion(tmp_path, fight):
+    source = tmp_path / "file.mp4"
+    source.touch()
+    manager = manager_fixture()
+    manager.reconcile([camera(fight=fight, source=str(source))])
+    item = manager.runtimes["camera"]
+    processes, generation, speed_epoch = dict(item.processes), item.generation, item.speed_epoch
+    now = [100.0]
+    registry = HealthRegistry(monotonic=lambda: now[0])
+    watchdog = RuntimeWatchdog(registry, HealthPolicy(), queue.Queue(), monotonic=lambda: now[0])
+    try:
+        item.file_eof_event.set()
+        if fight:
+            processes["camera"].alive, processes["camera"].exitcode = False, 0
+        for _ in range(2):
+            manager.poll()
+            watchdog.tick(manager, {})
+            assert not item.file_done and item.generation == generation
+        processes["ingest"].alive, processes["ingest"].exitcode = False, 0
+        now[0] += 300  # Fight/ingest finished; Speed remains active and owns its health.
+        registry.handle(HealthEvent("speed_worker", "camera", "heartbeat", now[0],
+            camera_id=item.camera_id, slot_id=item.slot_id, generation=item.generation,
+            consumer_epoch=item.speed_epoch))
+        manager.poll()
+        watchdog.tick(manager, {})
+        assert not item.file_done and registry.cameras["camera"]["reason"] == "file_draining"
+        processes["speed"].alive, processes["speed"].exitcode = False, 0
+        for _ in range(3):
+            manager.poll()
+            watchdog.tick(manager, {})
+        assert item.file_done and item.state == "STOPPED" and not item.speed_failed
+        assert item.generation == generation and item.speed_epoch == speed_epoch and item.restart_count == 0
+        assert item.processes == processes and manager.runtimes["camera"] is item
+        reports = [msg.row for msg in _drain(manager.report_queue)]
+        assert sum(row.get("reason") == "file_eof" for row in reports) == 1
+        assert not any(msg.row["detail"] == "camera_watchdog_restart_requested" for msg in _drain(watchdog.report_queue))
+    finally:
+        manager.stop_all()
+
+
+@pytest.mark.parametrize("exitcode", [0, 9])
+def test_speed_exit_between_poll_observations_is_classified_at_finalization(tmp_path, monkeypatch, exitcode):
+    source = tmp_path / "file.mp4"
+    source.touch()
+    manager = manager_fixture()
+    manager.reconcile([camera(fight=False, source=str(source))])
+    item = manager.runtimes["camera"]
+    speed = item.processes["speed"]
+    calls = []
+    def observe():
+        calls.append(True)
+        if len(calls) > 1:
+            speed.alive, speed.exitcode = False, exitcode
+        return speed.alive
+    monkeypatch.setattr(speed, "is_alive", observe)
+    try:
+        item.file_eof_event.set()
+        item.processes["ingest"].alive, item.processes["ingest"].exitcode = False, 0
+        manager.poll()
+        assert item.file_done and item.speed_failed == (exitcode != 0)
+        assert item.restart_count == 0 and manager.runtimes["camera"] is item
+    finally:
+        manager.stop_all()
 
 
 def test_shared_vehicle_service_rejects_old_generations_and_sheds_only_live(tmp_path):

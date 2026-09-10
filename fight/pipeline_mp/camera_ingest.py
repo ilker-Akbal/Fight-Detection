@@ -148,6 +148,7 @@ def run_camera_ingest_loop(
     slot_id: int = -1,
     speed_channel=None,
     speed_stop=None,
+    file_eof_event=None,
 ) -> None:
     runtime = config.get("runtime", {})
     camera_id = str(camera["camera_id"])
@@ -269,6 +270,11 @@ def run_camera_ingest_loop(
                             )
                             if loop_file_sources:
                                 break
+                            # Reliable generation-local lifecycle state, published
+                            # before any consumer can receive EOF and exit. Health
+                            # events are bounded/best-effort and cannot own this fact.
+                            if file_eof_event is not None:
+                                file_eof_event.set()
                             eof_signal = CameraIngestSignal(
                                 camera_id=camera_id,
                                 generation=int(generation),
@@ -556,6 +562,7 @@ def camera_ingest_process_main(
     slot_id: int = -1,
     speed_channel=None,
     speed_stop=None,
+    file_eof_event=None,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -577,6 +584,7 @@ def camera_ingest_process_main(
             slot_id=slot_id,
             speed_channel=speed_channel,
             speed_stop=speed_stop,
+            file_eof_event=file_eof_event,
         )
     except Exception as exc:
         _report(

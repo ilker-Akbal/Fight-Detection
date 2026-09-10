@@ -149,6 +149,7 @@ def test_vehicle_recovery_replaces_transport_rejects_stale_work_and_never_replay
         with pytest.raises(AdmissionStopped):
             persist_speed_event(manager.config, both.camera, SimpleNamespace(), both.generation, both.speed_epoch - 2, guard)
         file.processes["ingest"].alive, file.processes["ingest"].exitcode = False, 0
+        file.file_eof_event.set()
         manager.poll()
         assert file.file_done and file.speed_failed
     finally:
@@ -236,6 +237,7 @@ def test_completed_file_and_local_consumer_failure_are_not_replayed_by_service_r
         reconcile(services, manager, [camera("file", False, True, str(source)), camera("local", False, True)])
         file, local = manager.runtimes["file"], manager.runtimes["local"]
         file.processes["speed"].alive, file.processes["speed"].exitcode = False, 0
+        file.file_eof_event.set()
         file.processes["ingest"].alive, file.processes["ingest"].exitcode = False, 0
         manager.disable_speed(local, "speed_process_dead")
         local.speed_restarts = 3  # Exhausted local budget must not be reset by shared recovery.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pickle
+import multiprocessing as mp
 import queue
 import tempfile
 import threading
@@ -65,7 +66,34 @@ def _status_rows(channel):
     return [item.row for item in _drain(channel) if isinstance(item, ReportMessage)]
 
 
+def _spawn_eof_ingest(source, marker, frames):
+    run_camera_ingest_loop({"runtime": {}}, {"camera_id": "file", "source": source},
+        frames, queue.Queue(1), queue.Queue(), threading.Event(), 1,
+        capture_factory=lambda _: FakeCapture([]), file_eof_event=marker)
+
+
 class CameraIngestTests(unittest.TestCase):
+    def test_eof_marker_is_spawn_safe_and_precedes_consumer_signal(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = Path(temp) / "file.mp4"
+            source.touch()
+            ctx = mp.get_context("spawn")
+            marker, frames = ctx.Event(), ctx.Queue(1)
+            process = ctx.Process(target=_spawn_eof_ingest, args=(str(source), marker, frames))
+            process.start()
+            try:
+                signal = frames.get(timeout=10)
+                self.assertEqual(signal.detail, "eof")
+                self.assertTrue(marker.is_set())
+                process.join(5)
+                self.assertEqual(process.exitcode, 0)
+            finally:
+                if process.is_alive():
+                    process.terminate()
+                    process.join(5)
+                frames.close()
+                frames.join_thread()
+
     def test_file_source_opens_once_and_fans_out_identity_then_eof(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             source = Path(temp_dir) / "camera.mp4"

@@ -298,6 +298,7 @@ class HealthRegistry:
             camera = self.cameras[cid]
             camera["lifecycle"] = str(status.get("state", STARTING))
             camera["file_done"] = bool(status.get("file_done", False))
+            camera["file_eof"] = bool(status.get("file_eof", False))
             camera["restart_count"] = int(status.get("restart_count", 0) or 0)
             for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts", "fight_service_waiting"):
                 camera[key] = status.get(key, key == "use_fight_detection")
@@ -449,7 +450,8 @@ class HealthRegistry:
         return HEALTHY, "heartbeat_fresh"
 
     def _camera_health(
-        self, camera: dict, policy: HealthPolicy, now: float, process_alive: dict
+        self, camera: dict, policy: HealthPolicy, now: float, process_alive: dict,
+        process_exitcodes: dict,
     ) -> tuple[str, str, str | None]:
         lifecycle = camera["lifecycle"]
         if camera["file_done"]:
@@ -469,13 +471,25 @@ class HealthRegistry:
         if not camera.get("use_fight_detection", True):
             worker = ingest
         preview = components["camera_preview"]
-        ingest_eof = ingest["source_state"] == EOF
-        if not ingest_eof and not process_alive.get("ingest", True):
+        ingest_eof = camera.get("file_eof", False) or ingest["source_state"] == EOF
+        if not process_alive.get("ingest", True) and (
+            not ingest_eof or ("ingest" in process_exitcodes and process_exitcodes["ingest"] != 0)
+        ):
             return FAILED, "process_dead", "restart_camera"
+        fight_drained = False
         if camera.get("use_fight_detection", True) and not process_alive.get("camera", True):
-            return FAILED, "process_dead", "restart_camera"
+            # Only authoritative non-looping file EOF plus a clean exit permits
+            # a dead Fight consumer. Missing/unknown/nonzero exit status fails.
+            fight_drained = camera.get("file_eof", False) and process_exitcodes.get("camera") == 0
+            if not fight_drained:
+                return FAILED, "process_dead", "restart_camera"
         if not ingest_eof and not process_alive.get("preview", True):
             return DEGRADED, "preview_process_dead", "restart_preview"
+        if ingest_eof and (fight_drained or not camera.get("use_fight_detection", True)):
+            # A finished Fight consumer has no future heartbeat. Speed's own
+            # health/failure policy is evaluated separately below, while the
+            # lifecycle manager waits for every required consumer to terminate.
+            return ONLINE, "file_draining", None
         reconnect_age = now - float(ingest["last_reconnect"])
         if (
             ingest["source_state"] == RECONNECTING
@@ -560,10 +574,12 @@ class HealthRegistry:
         *,
         now: float | None = None,
         camera_process_alive: dict[str, dict] | None = None,
+        camera_process_exitcodes: dict[str, dict] | None = None,
         worker_process_alive: dict[str, bool] | None = None,
     ) -> tuple[list[dict], list[dict]]:
         current = self.monotonic() if now is None else float(now)
         camera_process_alive = camera_process_alive or {}
+        camera_process_exitcodes = camera_process_exitcodes or {}
         worker_process_alive = worker_process_alive or {}
         actions: list[dict] = []
         for component, record in self.workers.items():
@@ -595,6 +611,7 @@ class HealthRegistry:
                 policy,
                 current,
                 camera_process_alive.get(cid, {}),
+                camera_process_exitcodes.get(cid, {}),
             )
             if camera.get("use_speed_detection"):
                 speed = camera["components"]["speed_worker"]
@@ -651,6 +668,7 @@ class HealthRegistry:
                 "generation": camera["generation"],
                 "slot_id": camera["slot_id"],
                 "lifecycle": camera["lifecycle"],
+                "file_eof": camera.get("file_eof", False),
                 "health": camera["health"],
                 "reason": camera["reason"],
                 "last_ingest_heartbeat_age_sec": self._age(
@@ -776,17 +794,24 @@ class RuntimeWatchdog:
             return False
 
     def tick(self, manager, shared_processes: dict[str, object]) -> bool:
+        camera_alive = {}
+        camera_exitcodes = {}
+        for cid, runtime in manager.runtimes.items():
+            camera_alive[cid], camera_exitcodes[cid] = {}, {}
+            for name in ("ingest", "camera", "preview"):
+                process = runtime.processes.get(name)
+                alive = self._alive(process)
+                code = getattr(process, "exitcode", None)
+                camera_alive[cid][name] = alive and code is None
+                camera_exitcodes[cid][name] = code
+        # Read the reliable EOF marker AFTER observing exits. Ingest publishes
+        # it before consumer EOF delivery, so a clean EOF exit cannot overtake
+        # this snapshot even if manager.poll observed the consumer still alive.
         statuses = manager.get_camera_status()
         for cid in set(self._restart_state) - set(statuses):
             self._restart_state.pop(cid, None)
             self._preview_restart_at.pop(cid, None)
         self.registry.sync_cameras(statuses)
-        camera_alive = {}
-        for cid, runtime in manager.runtimes.items():
-            camera_alive[cid] = {
-                name: self._alive(runtime.processes.get(name))
-                for name in ("ingest", "camera", "preview")
-            }
         worker_alive = {
             component: self._alive(process)
             for component, process in shared_processes.items()
@@ -794,6 +819,7 @@ class RuntimeWatchdog:
         actions, transitions = self.registry.evaluate(
             self.policy,
             camera_process_alive=camera_alive,
+            camera_process_exitcodes=camera_exitcodes,
             worker_process_alive=worker_alive,
         )
         for transition in transitions:

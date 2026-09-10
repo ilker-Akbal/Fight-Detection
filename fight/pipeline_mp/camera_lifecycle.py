@@ -54,6 +54,7 @@ class CameraRuntime:
     state: str = STARTING
     intentional_stop: bool = False
     file_done: bool = False
+    file_eof_event: Any = None
     fight_service_waiting: bool = False
     last_restart_at: float = 0.0
     restart_count: int = 0
@@ -202,6 +203,7 @@ class CameraRuntimeManager:
                 item.slot_id,
                 item.speed_queue,
                 item.speed_stop,
+                item.file_eof_event,
             ),
         )
         item.processes["preview"] = self.process_factory(
@@ -308,6 +310,7 @@ class CameraRuntimeManager:
             slot_id=slot_id,
             generation=generation,
             stop_event=self.ctx.Event(),
+            file_eof_event=self.ctx.Event(),
             fight_queue=self.ctx.Queue(
                 maxsize=max(
                     1, int(self.runtime_config.get("camera_ingest_fight_queue_size", 8))
@@ -526,6 +529,13 @@ class CameraRuntimeManager:
         desired.extend(self._failed_desired.values())
         return self.reconcile(desired, revision=revision)
 
+    def file_eof_reached(self, item: CameraRuntime) -> bool:
+        return bool(
+            is_file_source(item.camera["source"])
+            and not self.runtime_config.get("loop_file_sources", False)
+            and item.file_eof_event is not None and item.file_eof_event.is_set()
+        )
+
     def poll(self) -> None:
         for cid, item in list(self.runtimes.items()):
             if item.intentional_stop or item.file_done:
@@ -535,11 +545,18 @@ class CameraRuntimeManager:
             preview = item.processes.get("preview")
             speed = item.processes.get("speed")
             if speed is not None:
-                speed_drained = (is_file_source(item.camera["source"])
-                                 and not speed.is_alive() and getattr(speed, "exitcode", None) == 0)
+                speed_alive = speed.is_alive()
+                speed_exitcode = getattr(speed, "exitcode", None)
+                speed_dead = not speed_alive or speed_exitcode is not None
+                speed_drained = (speed_dead and speed_exitcode == 0
+                                 and self.file_eof_reached(item))
                 if not self.speed_service_available and not speed_drained:
                     self.disable_speed(item, "vehicle_service_unavailable")
-                elif not speed.is_alive() and getattr(speed, "exitcode", None) != 0:
+                elif speed_dead and (speed_exitcode != 0 or (
+                    is_file_source(item.camera["source"]) and not speed_drained
+                )):
+                    # Zero exit can mean stop/epoch invalidation, not EOF. Latch
+                    # the existing file failure; later ingest EOF cannot erase it.
                     self.disable_speed(item, "speed_process_dead")
                 if (item.speed_failed and self.speed_service_available
                         and not is_file_source(item.camera["source"])
@@ -548,16 +565,27 @@ class CameraRuntimeManager:
                     item.speed_restarts += 1
                     item.speed_last_restart = self.monotonic()
                     self._spawn_speed(item)
+            # Check a Fight exit before finalizing on ingest exit. A nonzero
+            # consumer exit must never be mislabeled as successful file drain.
+            if camera is not None and not camera.is_alive():
+                if not (getattr(camera, "exitcode", None) == 0 and self.file_eof_reached(item)):
+                    self._restart_failed(item, "camera_process_dead")
+                    continue
             if ingest is not None and not ingest.is_alive():
                 if (
                     getattr(ingest, "exitcode", None) == 0
-                    and is_file_source(item.camera["source"])
-                    and not bool(self.runtime_config.get("loop_file_sources", False))
+                    and self.file_eof_reached(item)
                 ):
                     if camera is not None and camera.is_alive():
                         continue
+                    if camera is not None and getattr(camera, "exitcode", None) != 0:
+                        self._restart_failed(item, "camera_process_dead")
+                        continue
                     if speed is not None and speed.is_alive():
                         continue
+                    if speed is not None and getattr(speed, "exitcode", None) != 0:
+                        # It may have exited since the Speed observation above.
+                        self.disable_speed(item, "speed_process_dead")
                     item.file_done = True
                     item.state = STOPPED
                     self._status(
@@ -570,8 +598,9 @@ class CameraRuntimeManager:
                     continue
                 self._restart_failed(item, "ingest_process_dead")
                 continue
-            if camera is not None and not camera.is_alive():
-                self._restart_failed(item, "camera_process_dead")
+            if self.file_eof_reached(item):
+                # Other required consumers can still be draining. Preview exit
+                # is expected too; do not spawn another reader of its EOF queue.
                 continue
             if preview is not None and not preview.is_alive():
                 self._status(
@@ -659,6 +688,7 @@ class CameraRuntimeManager:
                 "slot_id": item.slot_id,
                 "generation": item.generation,
                 "file_done": item.file_done,
+                "file_eof": self.file_eof_reached(item),
                 "fight_service_waiting": item.fight_service_waiting,
                 "restart_count": item.restart_count,
                 "use_fight_detection": item.camera["use_fight_detection"],
