@@ -33,6 +33,7 @@ from fight.pipeline_mp.messages import (
 from fight.pipeline_mp.health import HealthEmitter
 from fight.pipeline_mp.scheduling import AdmissionShed, AdmissionStopped, admit
 from fight.pipeline_mp.performance import BoundedMetricCollector
+from fight.pipeline_mp.attribution import AttributionMetrics
 from fight.pipeline_mp.person_worker import PersonInferenceClient, should_request_person_inference
 from fight.pipeline_mp.pose_worker import PoseInferenceClient, should_request_pose_inference
 from fight.pose.src.pose_gate import PoseGate
@@ -478,11 +479,28 @@ class CameraProcessRunner:
         if clear_prebuffer:
             self.prebuffer.clear()
 
+    @property
+    def attribution(self):
+        if not hasattr(self, "_attribution"):
+            self._attribution = AttributionMetrics(getattr(self, "runtime", {}),
+                ("person_call_ms", "pose_call_ms", "stage3_enqueue_ms", "local_processing_ms", "frame_delivery_age_ms"),
+                ("frames_completed",))
+        return self._attribution
+
+    def process_frame_measured(self, frame):
+        with self.attribution.measure("local_processing_ms",
+                excluding=("person_call_ms", "pose_call_ms", "stage3_enqueue_ms")):
+            self.process_frame(frame)
+        self.attribution.count("frames_completed")
+        self.attribution.publish(getattr(self, "report_queue", None), "fight_local",
+                                 camera_id=self.camera_id, generation=self.generation)
+
     def detect_persons(self, frame_bgr):
         health = getattr(self, "health", None)
         if health is not None:
             health.emit("person_request", force=True, progress=self.frame_idx)
-        dets = self.person_inference.infer(frame_bgr, self.frame_idx)
+        with self.attribution.measure("person_call_ms"):
+            dets = self.person_inference.infer(frame_bgr, self.frame_idx)
         person_conf = float(self.runtime.get("person_conf", 0.25))
         dets = [(c, box) for (c, box) in dets if float(c) >= person_conf]
         dets.sort(key=lambda x: x[0], reverse=True)
@@ -499,7 +517,8 @@ class CameraProcessRunner:
         health = getattr(self, "health", None)
         if health is not None:
             health.emit("pose_request", force=True, progress=self.frame_idx)
-        raw = self.pose_inference.infer(roi_bgr, self.frame_idx)
+        with self.attribution.measure("pose_call_ms"):
+            raw = self.pose_inference.infer(roi_bgr, self.frame_idx)
         dec = self.pose_gate.update(raw.score, raw.ok)
 
         raw.ok = dec.pose_ok
@@ -777,11 +796,12 @@ class CameraProcessRunner:
                 )
 
                 try:
-                    admit(
-                        self.stage3_queue, job, self.stop_event,
-                        timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
-                        ordered=True, health=self.health, stage="stage3",
-                    )
+                    with self.attribution.measure("stage3_enqueue_ms"):
+                        admit(
+                            self.stage3_queue, job, self.stop_event,
+                            timeout=float(self.runtime.get("stage3_enqueue_timeout_sec", 0.35)),
+                            ordered=True, health=self.health, stage="stage3",
+                        )
                     self.counters["stage3_jobs_submitted"] += 1
                     queue_status = "queued"
                     queue_reason = "stage3_queue"
@@ -1268,7 +1288,7 @@ class CameraProcessRunner:
                             "frame_consumed",
                             progress=self.counters["frames_read"],
                         )
-                    self.process_frame(frame)
+                    self.process_frame_measured(frame)
 
             except Exception as exc:
                 self.report_status(
@@ -1364,6 +1384,8 @@ class CameraProcessRunner:
                     max(0, int(message.frame_seq) - 1) / self.capture_fps
                 )
             if self.frame_age_ms.enabled:
+                self.attribution.observe("frame_delivery_age_ms",
+                    (time.perf_counter() - float(message.captured_monotonic)) * 1000)
                 self.frame_age_ms.observe(
                     max(
                         0.0,
@@ -1388,7 +1410,7 @@ class CameraProcessRunner:
                         health.emit("live_shed", detail="stale_frame")
                     continue
             try:
-                self.process_frame(message.frame)
+                self.process_frame_measured(message.frame)
             except AdmissionShed:
                 # No negative AI decision is synthesized: temporal state is
                 # retained until a fresh usable frame can be processed.
@@ -1405,6 +1427,8 @@ class CameraProcessRunner:
         self.report_status("camera", "stopped")
 
     def report_performance_summary(self) -> None:
+        self.attribution.publish(self.report_queue, "fight_local", force=True,
+                                 camera_id=self.camera_id, generation=self.generation)
         elapsed_sec = max(0.0, time.perf_counter() - self.started_monotonic)
         frame_age_summary = (
             self.frame_age_ms.summary()

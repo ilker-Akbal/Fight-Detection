@@ -322,6 +322,7 @@ def test_shared_vehicle_service_rejects_old_generations_and_sheds_only_live(tmp_
 
 
 def test_speed_local_pipeline_quiet_traffic_never_opens_source_or_loads_model(tmp_path, monkeypatch):
+    from fight.pipeline_mp.attribution import AttributionMetrics
     calibration = tmp_path / "calibration.json"
     calibration.write_text(json.dumps({"measurement": {"mode": "two_line_time_gate",
         "line_a": [[0, 1], [12, 1]], "line_b": [[0, 6], [12, 6]], "distance_m": 10}}))
@@ -334,11 +335,15 @@ def test_speed_local_pipeline_quiet_traffic_never_opens_source_or_loads_model(tm
     monkeypatch.setattr("cv2.VideoCapture", forbidden)
     monkeypatch.setattr("HizTespiti.yolo.src.vehicle_detector.VehicleDetector.__init__", forbidden)
     frames = CameraFrame("camera", 1, 1, time.perf_counter(), time.time(), np.zeros((8, 12, 3), dtype=np.uint8), 25)
-    processor = SpeedProcessor(config, cam, frames, SimpleNamespace(detect=lambda *_: []), 1, 1, lambda: True)
+    telemetry = AttributionMetrics({"performance_metrics_enabled": True},
+        ("preprocess_ms", "tracking_ms", "speed_decision_ms", "visualization_evidence_ms"))
+    processor = SpeedProcessor(config, cam, frames,
+        SimpleNamespace(detect=lambda *_: [], telemetry=telemetry), 1, 1, lambda: True)
     processor.process(frames)
     frames.frame_seq = 20
     processor.process(frames)
     assert not list(tmp_path.rglob("*speed_violations.jsonl"))
+    assert all(metric["observations"] == 2 for metric in telemetry.snapshot()["timings"].values())
 
 
 def test_speed_evidence_failure_cannot_publish_legacy_success(tmp_path):

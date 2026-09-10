@@ -14,6 +14,7 @@ from fight.operations import atomic_json
 from fight.runtime_supervisor.core import RuntimeSupervisor, SupervisorConfig
 from fight.runtime_supervisor.camera_state import normalize_cameras
 from benchmarks.telemetry import SystemSampler, file_identity, psutil, redact
+from fight.pipeline_mp.attribution import attribution_summary
 
 
 @dataclass(frozen=True)
@@ -210,6 +211,7 @@ def run_real(args, count, output, repo):
     if final_health.get("run_id") == started.get("run_id"):
         latest_health = final_health
     performance = read_json(directory / "runtime" / "performance_summary.json")
+    attribution = performance.get("attribution") or attribution_summary(config, [])
     # No raw JSONL scan or new latency inference: consume existing bounded summaries.
     ingest = {r["camera_id"]: r for r in performance.get("camera_ingest", {}).get("cameras", [])}
     fight = {r["camera_id"]: r for r in performance.get("cameras", [])}
@@ -241,6 +243,13 @@ def run_real(args, count, output, repo):
         stages[name] = {"accepted": counters.get("accepted"), "dispatches": counters.get("dispatches"),
                         "completed_or_client_results": completed, "health_progress": worker.get("progress"),
                         "latency": latency or {"available": False, "reason": "no_existing_latency_summary"}}
+    vehicle = (attribution.get("vehicle") or {}).get("metrics", {})
+    if vehicle:
+        stages["vehicle"]["completed_or_client_results"] = vehicle.get("counters", {}).get("requests_completed")
+        stages["vehicle"]["latency"] = vehicle.get("timings", {})
+    stages["vehicle"]["client_round_trip_ms_by_camera"] = {
+        cid: (row or {}).get("metrics", {}).get("timings", {}).get("vehicle_round_trip_ms")
+        for cid, row in attribution.get("speed_local", {}).items()}
     system = sampler.summary()
     complete = (not deadline_reached and status.get("runtime_exit_code") == 0
                 and len(ingest) == count and system["observations"] > 0 and not recovered
@@ -262,9 +271,8 @@ def run_real(args, count, output, repo):
               "system": system, "cameras": cameras, "total_frames_decoded": frames,
               "aggregate_decode_effective_fps_full_run": frames / wall if wall else None,
               "aggregate_fight_processing_fps": performance.get("aggregate_processing_fps"),
-              "stages": stages, "capacity": capacity,
-              "unavailable": ["end_to_end_incident_latency", "vehicle_latency", "steady_window_camera_fps",
-                              "speed_completed_frame_count (health progress is a sequence, not a count)"],
+              "stages": stages, "capacity": capacity, "attribution": attribution,
+              "unavailable": ["end_to_end_incident_latency", "pure_ipc_copy_ms", "gpu_kernel_ms", "steady_window_camera_fps"],
               "measurement_scope": "ordered local files, EOF or deadline; frame rates include startup and drain; "
                                    "system samples exclude wall warmup; stage steady-state excludes configured first requests"}
     result.update(classify(complete=complete, frames=frames, capacity=capacity, system=system,

@@ -12,6 +12,7 @@ from fight.pipeline.incident_outbox import IncidentOutboxEnvelope, append_envelo
 from fight.pipeline_mp.common import is_file_source, configure_process_runtime
 from fight.pipeline_mp.generation import is_current_generation
 from fight.pipeline_mp.health import HealthEmitter
+from fight.pipeline_mp.attribution import AttributionMetrics
 from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal
 from fight.pipeline_mp.scheduling import admit, AdmissionShed, AdmissionStopped, live_request_stale
 
@@ -27,6 +28,7 @@ class VehicleRequest:
     created_monotonic: float
     source_is_file: bool
     max_age_sec: float
+    submitted_monotonic: float = 0.0  # Admission start, NOT the capture/staleness clock.
 
 
 @dataclass
@@ -79,10 +81,23 @@ def speed_config(config, camera):
     return _patch_cfg(load_config(mp_config.base_config), mp_config, cam, Path(config["output_dir"])), cam
 
 
-def vehicle_service_main(config, requests, results, stop, generations, epochs, health_queue=None, detector_factory=None):
+def vehicle_service_main(config, requests, results, stop, generations, epochs, health_queue=None,
+                         detector_factory=None, report_queue=None, service_epoch=0):
     configure_process_runtime(cv2_threads=1, enable_cuda_tuning=False)
     health = HealthEmitter(health_queue, component="vehicle", component_type="shared_worker")
     health.emit("process_started", force=True)
+    telemetry = AttributionMetrics(config.get("runtime", {}),
+        ("queue_wait_inclusive_ms", "model_initialize_ms", "inference_ms", "result_enqueue_ms"),
+        ("requests_accepted", "requests_completed", "inferences_completed", "stale_generation", "stale_live"))
+    try:
+        _vehicle_service_loop(config, requests, results, stop, generations, epochs, health,
+                              detector_factory, telemetry, report_queue, service_epoch)
+    finally:
+        telemetry.publish(report_queue, "vehicle", force=True, service_epoch=service_epoch)
+
+
+def _vehicle_service_loop(config, requests, results, stop, generations, epochs, health,
+                          detector_factory, telemetry, report_queue, service_epoch):
     detector = None
     count = 0
     while not stop.is_set():
@@ -95,12 +110,17 @@ def vehicle_service_main(config, requests, results, stop, generations, epochs, h
             if request is None:
                 return
             if not is_current_generation(request, generations) or request.epoch != epochs[request.slot_id]:
+                telemetry.count("stale_generation")
                 requests.observe(request.slot_id, "stale_generation")
                 continue
             health.emit("request_received", force=True, progress=count + 1)
+            telemetry.count("requests_accepted")
+            if telemetry.enabled and request.submitted_monotonic > 0:
+                telemetry.observe("queue_wait_inclusive_ms", (time.perf_counter() - request.submitted_monotonic) * 1000)
             outcome, detections = "accepted", []
             try:
                 if live_request_stale(request):
+                    telemetry.count("stale_live")
                     outcome = "stale"
                     requests.observe(request.slot_id, "dropped_live")
                 else:
@@ -108,9 +128,12 @@ def vehicle_service_main(config, requests, results, stop, generations, epochs, h
                         if detector_factory is None:
                             from HizTespiti.yolo.src.vehicle_detector import VehicleDetector
                             detector_factory = VehicleDetector
-                        cfg, _ = speed_config(config, {"camera_id": "shared", "source": "0"})
-                        detector = detector_factory(cfg.yolo)
-                    detections = detector.detect(request.frame)
+                        with telemetry.measure("model_initialize_ms"):
+                            cfg, _ = speed_config(config, {"camera_id": "shared", "source": "0"})
+                            detector = detector_factory(cfg.yolo)
+                    with telemetry.measure("inference_ms"):
+                        detections = detector.detect(request.frame)
+                    telemetry.count("inferences_completed")
             except Exception:
                 health.emit("process_error", force=True, detail="vehicle_inference_failed")
                 # A broken shared model is a service failure, not a per-camera
@@ -121,15 +144,19 @@ def vehicle_service_main(config, requests, results, stop, generations, epochs, h
             # Do not send frame pixels back through the result queue.
             request.frame = None
             result = VehicleResult(request, detections, outcome)
+            enqueue_started = telemetry.start_timer()
             while (not stop.is_set() and is_current_generation(request, generations)
                    and request.epoch == epochs[request.slot_id]):
                 try:
                     results[request.slot_id].put(result, timeout=0.1)
+                    telemetry.count("requests_completed")
+                    telemetry.finish_timer("result_enqueue_ms", enqueue_started)
                     break
                 except queue.Full:
                     health.heartbeat(progress=count)
         finally:
             requests.task_done()
+            telemetry.publish(report_queue, "vehicle", service_epoch=service_epoch)
 
 
 class VehicleClient:
@@ -140,13 +167,25 @@ class VehicleClient:
         self.watchdog_enabled = bool(runtime.get("health_enabled", True))
         self.fail_after = max(float(runtime.get("inference_stall_fail_sec", 120)),
                               float(runtime.get("health_startup_grace_sec", 120)))
+        self.telemetry = AttributionMetrics(runtime,
+            ("vehicle_call_ms", "vehicle_enqueue_ms", "vehicle_round_trip_ms", "frame_delivery_age_ms",
+             "local_processing_ms", "processor_initialize_ms", "preprocess_ms", "tracking_ms",
+             "speed_decision_ms", "visualization_evidence_ms"),
+            ("frames_received", "frames_completed", "requests_accepted", "results_received"))
 
     def detect(self, frame, envelope):
+        with self.telemetry.measure("vehicle_call_ms"):
+            return self._detect(frame, envelope)
+
+    def _detect(self, frame, envelope):
         request = VehicleRequest(self.camera["camera_id"], self.slot, self.generation, self.epoch,
                                  envelope.frame_seq, frame, envelope.captured_monotonic,
                                  is_file_source(self.camera["source"]), self.max_age)
-        admit(self.requests, request, self.stop, timeout=0.1, ordered=request.source_is_file,
-              health=self.health, stage="vehicle")
+        request.submitted_monotonic = time.perf_counter() if self.telemetry.enabled else 0.0
+        with self.telemetry.measure("vehicle_enqueue_ms"):
+            admit(self.requests, request, self.stop, timeout=0.1, ordered=request.source_is_file,
+                  health=self.health, stage="vehicle")
+        self.telemetry.count("requests_accepted")
         started = time.monotonic()
         while not self.stop.is_set():
             self.health.emit("capacity_wait", detail="vehicle")
@@ -159,6 +198,9 @@ class VehicleClient:
             identity = result.request
             if (identity.generation, identity.epoch, identity.request_id) != (self.generation, self.epoch, request.request_id):
                 continue
+            self.telemetry.count("results_received")
+            if self.telemetry.enabled:
+                self.telemetry.observe("vehicle_round_trip_ms", (time.perf_counter() - request.submitted_monotonic) * 1000)
             if result.outcome == "stale" or live_request_stale(request):
                 raise AdmissionShed("stale vehicle inference")
             if result.outcome != "accepted":
@@ -208,6 +250,7 @@ class SpeedProcessor:
         cfg, cal = self.cfg, self.calibration
         self.fps = max(float(first_frame.source_fps or 25), 1)
         self.client = client
+        self.telemetry = getattr(client, "telemetry", None) or AttributionMetrics({})
         self.roi = RoiMask(True, cal.road_roi_polygon) if cal.road_roi_enabled and cal.road_roi_polygon else RoiMask(cfg.roi.enabled, cfg.roi.polygon)
         self.motion = BackgroundMotionDetector(cfg.motion) if cfg.motion.enabled else None
         self.gate = MotionGate(cfg.motion) if cfg.motion.enabled else None
@@ -223,25 +266,35 @@ class SpeedProcessor:
 
     def process(self, envelope):
         from HizTespiti.speed.src.utils import resize_keep_aspect
-        from HizTespiti.speed_mp.process_camera import _draw_calibration_overlay
-        cfg, cal = self.cfg, self.calibration
+        cfg = self.cfg
         index = envelope.frame_seq  # Never compress time when live frames are shed.
-        frame = resize_keep_aspect(envelope.frame, cfg.runtime.resize_width)
-        gate_result = None
-        if self.motion is not None:
-            motion = self.motion.detect(frame, self.roi.get_mask(frame.shape))
-            gate_result = self.gate.update(index, motion["motion_score"], len(motion["boxes"]))
+        with self.telemetry.measure("preprocess_ms"):
+            frame = resize_keep_aspect(envelope.frame, cfg.runtime.resize_width)
+            gate_result = None
+            if self.motion is not None:
+                motion = self.motion.detect(frame, self.roi.get_mask(frame.shape))
+                gate_result = self.gate.update(index, motion["motion_score"], len(motion["boxes"]))
         active = gate_result is None or gate_result.active
         ran = active and index % cfg.yolo.stride == 0
         if ran:
-            self.tracks = self.tracker.update(self.client.detect(frame, envelope), index)
+            detections = self.client.detect(frame, envelope)
+            with self.telemetry.measure("tracking_ms"):
+                self.tracks = self.tracker.update(detections, index)
         else:
-            self.tracks = self.tracker.active_tracks() if active else []
-        ids = {track.track_id for track in self.tracks}
-        self.decider.cleanup(ids)
-        self.estimator.cleanup(ids)
-        speeds = {track.track_id: self.estimator.estimate(track) for track in self.tracks}
-        decisions = {key: self.decider.update(value) for key, value in speeds.items()}
+            with self.telemetry.measure("tracking_ms"):
+                self.tracks = self.tracker.active_tracks() if active else []
+        with self.telemetry.measure("speed_decision_ms"):
+            ids = {track.track_id for track in self.tracks}
+            self.decider.cleanup(ids)
+            self.estimator.cleanup(ids)
+            speeds = {track.track_id: self.estimator.estimate(track) for track in self.tracks}
+            decisions = {key: self.decider.update(value) for key, value in speeds.items()}
+        with self.telemetry.measure("visualization_evidence_ms"):
+            self._visualize_and_persist(frame, gate_result, index, ran, speeds, decisions)
+
+    def _visualize_and_persist(self, frame, gate_result, index, ran, speeds, decisions):
+        from HizTespiti.speed_mp.process_camera import _draw_calibration_overlay
+        cfg, cal = self.cfg, self.calibration
         vis = self.visualizer.draw(frame=frame, tracks=self.tracks, speed_results=speeds,
             decisions=decisions, motion_gate=gate_result, frame_idx=index, camera_id=cfg.camera.camera_id,
             yolo_ran=ran, speed_limit_kmh=cal.speed_limit_kmh,
@@ -256,12 +309,14 @@ class SpeedProcessor:
 
 
 def speed_process_main(config, camera, frames, requests, results, stop, generation, slot,
-                       epochs, epoch, generations, health_queue=None, processor_factory=SpeedProcessor):
+                       epochs, epoch, generations, health_queue=None, processor_factory=SpeedProcessor,
+                       report_queue=None):
     configure_process_runtime(cv2_threads=1, enable_cuda_tuning=False)
     health = HealthEmitter(health_queue, component="speed_worker", component_type="camera",
                            camera_id=camera["camera_id"], slot_id=slot, generation=generation, consumer_epoch=epoch)
     health.emit("process_started", force=True)
     client = VehicleClient(requests, results, stop, health, camera, slot, generation, epoch, config.get("runtime", {}))
+    telemetry = client.telemetry
     processor = None
     progress = 0
     dropped = 0
@@ -285,6 +340,9 @@ def speed_process_main(config, camera, frames, requests, results, stop, generati
                 continue
             if not isinstance(frame, CameraFrame):
                 continue
+            telemetry.count("frames_received")
+            if telemetry.enabled:
+                telemetry.observe("frame_delivery_age_ms", (time.perf_counter() - frame.captured_monotonic) * 1000)
             if (not is_file_source(camera["source"]) and client.max_age > 0
                     and time.perf_counter() - frame.captured_monotonic >= client.max_age):
                 health.emit("live_shed", progress=progress)
@@ -292,7 +350,8 @@ def speed_process_main(config, camera, frames, requests, results, stop, generati
                 health.heartbeat(progress=progress, dropped=dropped)
                 continue
             if processor is None:
-                processor = processor_factory(config, camera, frame, client, generation, epoch, valid)
+                with telemetry.measure("processor_initialize_ms"):
+                    processor = processor_factory(config, camera, frame, client, generation, epoch, valid)
             max_fps = getattr(getattr(getattr(processor, "cfg", None), "runtime", None), "max_fps", 0)
             if max_fps > 0:
                 remaining = 1.0 / max_fps - (time.monotonic() - last_processed)
@@ -304,15 +363,22 @@ def speed_process_main(config, camera, frames, requests, results, stop, generati
                     return
             last_processed = time.monotonic()
             try:
-                processor.process(frame)
+                with telemetry.measure("local_processing_ms", excluding=("vehicle_call_ms",)):
+                    processor.process(frame)
             except AdmissionShed:
                 dropped += 1
                 health.emit("live_shed", progress=progress, dropped=dropped)
                 continue
             progress = frame.frame_seq
+            telemetry.count("frames_completed")
             health.emit("frame_consumed", progress=progress)
+            telemetry.publish(report_queue, "speed_local", camera_id=camera["camera_id"],
+                              generation=generation, consumer_epoch=epoch)
     except AdmissionStopped:
         return
     except Exception:
         health.emit("process_error", force=True, detail="speed_consumer_failed")
         raise
+    finally:
+        telemetry.publish(report_queue, "speed_local", force=True, camera_id=camera["camera_id"],
+                          generation=generation, consumer_epoch=epoch)

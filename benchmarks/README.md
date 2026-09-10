@@ -45,7 +45,78 @@ Host CPU utilization, runtime process-tree RSS (a sum, not unique physical RAM),
 
 Existing reports supply per-camera decoded/Fight-consumed frames, effective FPS, Fight/Speed drops, reconnects, final lifecycle/health and Speed sequence progress. Stage reports supply accepted/dispatches, client results or job completion, health progress and bounded existing latency summaries. Health progress can include a started request; it is not relabeled as completed inference. Capacity reports include accepted, rejected_capacity, deferred_file, dropped_live, stale_generation, high_water and outstanding. Sampled outstanding peaks can miss short bursts; existing high_water counters retain production definitions.
 
-Unavailable metrics remain null or explicitly unavailable, not fabricated: Vehicle latency, reliable end-to-end incident latency, steady-window camera FPS and Speed completed-frame counts are not instrumented by this phase. Missing or zero-sample latency distributions do not establish zero latency. Failed/early runs may lack camera or worker summaries; zero decoded totals in those runs are only the sum of available reports, not proof that decoding never began.
+Unavailable metrics remain null or explicitly unavailable, not fabricated. Phase 18 adds Vehicle/local timings and Speed completed-frame counters (see below), but pure IPC copy cost, GPU kernel duration, reliable end-to-end incident latency and steady-window camera FPS remain unavailable. Missing or zero-sample latency distributions do not establish zero latency. Failed/early runs may lack camera or worker summaries; zero decoded totals in those runs are only the sum of available reports, not proof that decoding never began.
+
+## Phase 18: bottleneck attribution
+
+The real runtime `performance_summary.json` and real benchmark result now contain
+`attribution`. It is separate from synthetic results and does not participate in
+HEALTHY/PRESSURED/SATURATED/INCOMPLETE classification.
+
+Enable with the existing `performance_metrics_enabled` runtime flag (real benchmarks
+already enable it). Existing `performance_metrics_sample_every` and
+`performance_metrics_max_samples` bound each timing collector. Reports use the
+existing bounded Reporter queue and `put_nowait`. The runtime setting
+`performance_attribution_report_interval_sec` defaults to **30 seconds** and is
+clamped to a **5-second minimum**; invalid/non-finite values use the default.
+Each producer independently allows its first report immediately, then at most one
+periodic attempt per interval (failed attempts are rate-limited too). The final
+`force=True` attempt bypasses the interval. Rows include the normal status `ts`.
+Failures are swallowed; a later successful report
+includes `reports_dropped`. If the final report is lost or a process is killed, the
+last observed report may be partial or null. No added telemetry drives health,
+admission, generation, service recovery or authoritative file EOF.
+
+Metrics (milliseconds unless a counter):
+
+| Component | New attribution |
+|---|---|
+| Vehicle service | `requests_accepted`, `requests_completed`, `inferences_completed`, `stale_generation`, `stale_live`; `queue_wait_inclusive_ms`, `model_initialize_ms`, `inference_ms`, `result_enqueue_ms` |
+| Speed client | `requests_accepted`, `results_received`; `vehicle_enqueue_ms`, `vehicle_round_trip_ms`, `vehicle_call_ms` |
+| CameraIngest | `read_ms`, `fight_enqueue_ms`, `speed_enqueue_ms`, `preview_enqueue_ms`, `fanout_ms`; per-branch `offered`, `enqueued`, `dropped` frame counts |
+| Fight consumer | `frames_completed`, `frame_delivery_age_ms`, `local_processing_ms`, `person_call_ms`, `pose_call_ms`, `stage3_enqueue_ms` |
+| Speed consumer | `frames_received`, `frames_completed`, `frame_delivery_age_ms`, `processor_initialize_ms`, `local_processing_ms`, `preprocess_ms`, `tracking_ms`, `speed_decision_ms`, `visualization_evidence_ms` |
+| Preview consumer | `frames_received`, `frame_delivery_age_ms` |
+
+Interpretation limits:
+
+- Vehicle queue wait starts **before admission**, so it includes file defer,
+  enqueue, multiprocessing transport and service queueing. It is not a pure
+  post-enqueue queue wait. The existing capture/staleness clock is unchanged.
+- Vehicle `requests_accepted` counts generation-valid work handled by the service.
+  `requests_completed` counts only results successfully published to the per-slot
+  queue, including explicit stale-live outcomes; abandoned delivery is not completion.
+  `inferences_completed` counts only successful detector calls, even if delivery
+  is later abandoned. Stale-generation work is not completed.
+  `result_enqueue_ms` records one total interval per successfully published result,
+  including all `queue.Full` retry waits; abandoned delivery has no observation.
+  Scheduler admission counts remain in the
+  unchanged common `capacity` report for Person/Pose/Stage3/Vehicle.
+- Vehicle `inference_ms` is the detector-call wall time, including its internal
+  preprocessing/postprocessing and excluding separately measured model setup.
+  There is no CUDA synchronization added and no GPU-kernel-time claim.
+- Client RTT covers admission through the matching result (including stale
+  outcomes). Client-call timing additionally covers failed/stopped calls; local
+  timings subtract the actual nested call elapsed time, not sampled percentiles.
+- Fight local timing excludes Person/Pose calls and Stage3 admission wait. Other
+  camera-local work, evidence and status I/O remain included. Speed local timing
+  excludes Vehicle calls and external FPS pacing, includes preprocessing,
+  tracking/decision, visualization and evidence/persistence. Local durations can
+  include interrupted frame attempts; completed counters count only returns.
+- Ingest read timing includes unsuccessful/EOF reads. Enqueued means a successful
+  publication, **not a consumed frame**; latest queues may later evict it. Offered
+  counts exclude absent/disabled branches and exclude EOF signals. Fan-out timing
+  covers the existing sequential branch publication calls, including blocking.
+- Frame delivery age uses the existing capture-complete monotonic timestamp. It
+  combines earlier fan-out waits, queue backlog, IPC/deserialization and receive
+  bookkeeping. Pure IPC cost cannot be isolated without additional boundaries;
+  no frame copy or shared-memory transport was introduced.
+- Reports retain bounded tails and are per process incarnation (generation /
+  Speed epoch / Vehicle service epoch). Status scans retain only the latest new
+  attribution summaries with a registry-sized cap, not the periodic history.
+  Camera summaries are not pooled across cameras and percentiles are never
+  averaged. Disabled/missing/no-sample metrics remain null. Existing status and
+  incident history/cursor behavior is not compacted or rewritten.
 
 ## Classification and interpretation
 

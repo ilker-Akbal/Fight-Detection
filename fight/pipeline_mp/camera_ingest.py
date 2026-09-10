@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import time
+from contextlib import nullcontext
 from typing import Callable
 
 import cv2
@@ -15,6 +16,7 @@ from fight.pipeline_mp.common import (
 )
 from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal, ReportMessage
 from fight.pipeline_mp.health import HealthEmitter
+from fight.pipeline_mp.attribution import AttributionMetrics
 
 
 def _report(report_queue, camera_id: str, detail: str, **extra) -> None:
@@ -151,6 +153,10 @@ def run_camera_ingest_loop(
     file_eof_event=None,
 ) -> None:
     runtime = config.get("runtime", {})
+    telemetry = AttributionMetrics(runtime,
+        ("read_ms", "fight_enqueue_ms", "speed_enqueue_ms", "preview_enqueue_ms", "fanout_ms"),
+        tuple(f"{consumer}_{counter}" for consumer in ("fight", "speed", "preview")
+              for counter in ("offered", "enqueued", "dropped")))
     camera_id = str(camera["camera_id"])
     source = str(camera["source"])
     safe_source = redact_source(source)
@@ -252,7 +258,8 @@ def run_camera_ingest_loop(
                 flow_started = False
 
                 while stop_event is None or not stop_event.is_set():
-                    ok, frame = capture.read()
+                    with telemetry.measure("read_ms"):
+                        ok, frame = capture.read()
                     if not ok or frame is None:
                         if source_is_file:
                             _report(
@@ -335,37 +342,53 @@ def run_camera_ingest_loop(
                         source_frame_count=source_frame_count,
                     )
 
-                    if fight_channel is None:
-                        published_fight, dropped_fight = False, 0
-                    elif file_fight_ordered:
-                        published_fight = publish_ordered(
-                            fight_channel,
-                            envelope,
-                            stop_event,
-                            publish_timeout,
-                        )
-                        dropped_fight = 0
-                    else:
-                        published_fight, dropped_fight = publish_latest(
-                            fight_channel,
-                            envelope,
-                        )
+                    fanout_started = time.perf_counter() if telemetry.enabled else 0.0
+                    with telemetry.measure("fight_enqueue_ms") if fight_channel is not None else nullcontext():
+                        if fight_channel is None:
+                            published_fight, dropped_fight = False, 0
+                        elif file_fight_ordered:
+                            published_fight = publish_ordered(
+                                fight_channel,
+                                envelope,
+                                stop_event,
+                                publish_timeout,
+                            )
+                            dropped_fight = 0
+                        else:
+                            published_fight, dropped_fight = publish_latest(
+                                fight_channel,
+                                envelope,
+                            )
                     frames_published_fight += int(published_fight)
                     frames_dropped_fight += int(dropped_fight or not published_fight)
-                    published_speed, dropped_speed = publish_speed(
-                        speed_channel, envelope, stop_event, speed_stop,
-                        source_is_file, publish_timeout, health)
+                    speed_offered = speed_channel is not None and (speed_stop is None or not speed_stop.is_set())
+                    with telemetry.measure("speed_enqueue_ms") if speed_offered else nullcontext():
+                        published_speed, dropped_speed = publish_speed(
+                            speed_channel, envelope, stop_event, speed_stop,
+                            source_is_file, publish_timeout, health)
                     frames_published_speed += int(published_speed)
                     frames_dropped_speed += dropped_speed
 
-                    published_preview, dropped_preview = publish_latest(
-                        preview_channel,
-                        envelope,
-                    )
+                    with telemetry.measure("preview_enqueue_ms") if preview_channel is not None else nullcontext():
+                        published_preview, dropped_preview = publish_latest(
+                            preview_channel,
+                            envelope,
+                        )
                     frames_published_preview += int(published_preview)
                     frames_dropped_preview += int(
                         dropped_preview or not published_preview
                     )
+                    if telemetry.enabled:
+                        telemetry.observe("fanout_ms", (time.perf_counter() - fanout_started) * 1000)
+                        for name, offered, delivered, dropped in (
+                            ("fight", fight_channel is not None, published_fight, dropped_fight),
+                            ("speed", speed_offered, published_speed, dropped_speed),
+                            ("preview", preview_channel is not None, published_preview, dropped_preview),
+                        ):
+                            telemetry.count(name + "_offered", int(offered))
+                            telemetry.count(name + "_enqueued", int(delivered))
+                            telemetry.count(name + "_dropped", int(dropped or (offered and not delivered)))
+                        telemetry.publish(report_queue, "camera_ingest", camera_id=camera_id, generation=generation)
                     health.emit(
                         "frame_progress",
                         progress=frame_seq,
@@ -480,6 +503,7 @@ def run_camera_ingest_loop(
             sleep_fn(reconnect_delay)
             reconnect_delay = min(reconnect_max, reconnect_delay * 2.0)
     finally:
+        telemetry.publish(report_queue, "camera_ingest", force=True, camera_id=camera_id, generation=generation)
         health.emit(
             "process_stopping",
             force=True,

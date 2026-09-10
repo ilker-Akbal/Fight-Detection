@@ -126,7 +126,8 @@ class SharedServices:
             manager.vehicle_requests = self._admission(bundle, "vehicle", 1)
             manager.vehicle_results = {slot: self._queue(bundle) for slot in range(self.slots)}
             self._spawn(bundle, "vehicle", vehicle_service_main, (cfg, manager.vehicle_requests,
-                manager.vehicle_results, stop, generations, manager.speed_epochs, health))
+                manager.vehicle_results, stop, generations, manager.speed_epochs, health,
+                None, manager.report_queue, self.vehicle_epoch))
             manager.speed_service_available = True
         else:
             from fight.pipeline_mp.person_worker import person_inference_process_main, person_result_router_main

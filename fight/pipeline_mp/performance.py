@@ -182,6 +182,7 @@ def build_performance_summary(
     status_rows: list[dict],
     wall_processing_sec: float,
 ) -> dict:
+    from fight.pipeline_mp.attribution import attribution_summary
     wall_sec = max(0.0, float(wall_processing_sec))
     camera_rows = [
         row
@@ -402,11 +403,14 @@ def build_performance_summary(
         },
         "cameras": [_clean_camera_row(row) for row in camera_rows],
         "error_drop_counters": errors,
+        "attribution": attribution_summary(config, status_rows),
     }
 
 
 def load_status_rows(path: str | Path, start_offset: int = 0) -> list[dict]:
+    from fight.pipeline_mp.attribution import retain_attribution
     rows = []
+    attribution = {}
     p = Path(path)
     if not p.exists():
         return rows
@@ -414,7 +418,11 @@ def load_status_rows(path: str | Path, start_offset: int = 0) -> list[dict]:
         fh.seek(max(0, int(start_offset)))
         for raw_line in fh:
             try:
-                rows.append(json.loads(raw_line.decode("utf-8")))
+                row = json.loads(raw_line.decode("utf-8"))
+                if isinstance(row, dict) and row.get("stage") == "attribution":
+                    retain_attribution(attribution, row)
+                else:
+                    rows.append(row)
             except Exception:
                 continue
-    return rows
+    return rows + list(attribution.values())

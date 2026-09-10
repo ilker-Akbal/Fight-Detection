@@ -56,6 +56,8 @@ def run_preview_consumer_loop(
     slot_id: int = -1,
 ) -> None:
     runtime = config.get("runtime", {})
+    from fight.pipeline_mp.attribution import AttributionMetrics
+    telemetry = AttributionMetrics(runtime, ("frame_delivery_age_ms",), ("frames_received",))
     camera_id = str(camera["camera_id"])
     preview_path = MpPaths.from_output_dir(config["output_dir"]).previews_dir / f"{camera_id}.jpg"
     quality = int(runtime.get("preview_jpeg_quality", 75))
@@ -93,6 +95,10 @@ def run_preview_consumer_loop(
             continue
 
         frames_received += 1
+        telemetry.count("frames_received")
+        if telemetry.enabled:
+            telemetry.observe("frame_delivery_age_ms", (time.perf_counter() - message.captured_monotonic) * 1000)
+            telemetry.publish(report_queue, "preview", camera_id=camera_id, generation=generation)
         last_frame_seq = int(message.frame_seq)
         now = time.monotonic()
         if now - last_write < interval:
@@ -106,6 +112,7 @@ def run_preview_consumer_loop(
                 secondary_progress=frames_written,
             )
 
+    telemetry.publish(report_queue, "preview", force=True, camera_id=camera_id, generation=generation)
     _report(
         report_queue,
         camera_id,

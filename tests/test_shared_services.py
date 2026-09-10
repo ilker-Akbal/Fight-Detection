@@ -273,7 +273,7 @@ def test_start_failure_is_bounded_for_vehicle_and_critical_for_fight():
 def test_recreated_vehicle_handles_are_windows_spawn_safe():
     ctx = mp.get_context("spawn")
     def spawn(name, target, args):
-        process = ctx.Process(target=target, args=(*args, SpawnVehicleDetector))
+        process = ctx.Process(target=target, args=(*args[:7], SpawnVehicleDetector, *args[8:]))
         process.start()
         return process
     services, manager, registry, now = fixture(ctx=ctx, factory=spawn)

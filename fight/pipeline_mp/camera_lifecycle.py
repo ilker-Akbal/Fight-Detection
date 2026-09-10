@@ -12,7 +12,7 @@ from fight.pipeline_mp.camera_worker import camera_process_main
 from fight.pipeline_mp.common import is_file_source, now_str, redact_source
 from fight.pipeline_mp.generation import set_slot_generation
 from fight.pipeline_mp.messages import ReportMessage
-from fight.pipeline_mp.speed_worker import speed_process_main
+from fight.pipeline_mp.speed_worker import speed_process_main, SpeedProcessor
 
 
 STARTING = "STARTING"
@@ -261,7 +261,8 @@ class CameraRuntimeManager:
             f"speed_{item.camera_id}", speed_process_main,
             (self.config, item.camera, item.speed_queue, self.vehicle_requests.for_slot(item.slot_id),
              self.vehicle_results[item.slot_id], item.speed_stop, item.generation, item.slot_id,
-             self.speed_epochs, item.speed_epoch, self.slot_generations, self.health_queue))
+             self.speed_epochs, item.speed_epoch, self.slot_generations, self.health_queue,
+             SpeedProcessor, self.report_queue))
 
     def disable_speed(self, item, reason):
         if item.speed_failed:
