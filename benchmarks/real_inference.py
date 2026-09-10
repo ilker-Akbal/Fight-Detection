@@ -17,6 +17,13 @@ from benchmarks.telemetry import SystemSampler, file_identity, psutil, redact
 from fight.pipeline_mp.attribution import attribution_summary
 
 
+def stage_latency_summary(metrics):
+    """Export existing distributions verbatim, including worker/batch views."""
+    return {key: value for key, value in metrics.items()
+            if key.endswith("_ms") or key in
+            ("all_requests", "steady_state", "warmup_requests", "batch", "worker_timings")}
+
+
 @dataclass(frozen=True)
 class Thresholds:
     pressure_drop_ratio: float = .01
@@ -238,8 +245,7 @@ def run_real(args, count, output, repo):
             capacity[name] = {**counters, "observed_outstanding_peak": peak_outstanding.get(name, 0)}
         metrics = performance.get(name, {})
         completed = metrics.get("results") if name in ("person", "pose") else metrics.get("jobs_completed")
-        latency = {key: value for key, value in metrics.items()
-                   if key.endswith("_ms") or key in ("all_requests", "steady_state", "warmup_requests")}
+        latency = stage_latency_summary(metrics)
         stages[name] = {"accepted": counters.get("accepted"), "dispatches": counters.get("dispatches"),
                         "completed_or_client_results": completed, "health_progress": worker.get("progress"),
                         "latency": latency or {"available": False, "reason": "no_existing_latency_summary"}}

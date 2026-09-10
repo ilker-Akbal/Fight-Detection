@@ -1,4 +1,4 @@
-# Capacity benchmarks (Phase 16)
+# Capacity characterization and bottleneck benchmarks
 
 The Phase-16 harness is measurement infrastructure: its own implementation did not alter production models, thresholds, queue semantics, recovery, incident routing, or source ownership. Later production phases may harden runtime correctness independently; the harness should always exercise the current production runtime unchanged. Synthetic camera-equivalents are **not** inference capacity. RTX 3050 measurements are **not** an RTX 5090 production camera-count estimate.
 
@@ -26,6 +26,11 @@ Each logical camera gets a distinct ID and a distinct hardlink (copy fallback) t
 
 Use `--output benchmarks/results/<new-name>` to choose a new, git-ignored directory; existing directories are never overwritten. Defaults use a UTC timestamp.
 
+Treat completed run outputs as immutable evidence: use a new output directory
+for every experiment, including retries. Active runs still append their streams
+and atomically update summaries; this is not filesystem-enforced immutability.
+Do not stage generated results, source links, runtime state or the harness lock.
+
 - `benchmark_summary.json`: atomic summary with separate `real_inference` and `control_plane` arrays plus OS/Python/CPU/RAM/GPU/repository metadata.
 - `runs.jsonl`: fsynced completed run records, independent of summary replacement.
 - `system_samples.csv`: streamed, flushed system samples with JSON GPU columns.
@@ -46,6 +51,49 @@ Host CPU utilization, runtime process-tree RSS (a sum, not unique physical RAM),
 Existing reports supply per-camera decoded/Fight-consumed frames, effective FPS, Fight/Speed drops, reconnects, final lifecycle/health and Speed sequence progress. Stage reports supply accepted/dispatches, client results or job completion, health progress and bounded existing latency summaries. Health progress can include a started request; it is not relabeled as completed inference. Capacity reports include accepted, rejected_capacity, deferred_file, dropped_live, stale_generation, high_water and outstanding. Sampled outstanding peaks can miss short bursts; existing high_water counters retain production definitions.
 
 Unavailable metrics remain null or explicitly unavailable, not fabricated. Phase 18 adds Vehicle/local timings and Speed completed-frame counters (see below), but pure IPC copy cost, GPU kernel duration, reliable end-to-end incident latency and steady-window camera FPS remain unavailable. Missing or zero-sample latency distributions do not establish zero latency. Failed/early runs may lack camera or worker summaries; zero decoded totals in those runs are only the sum of available reports, not proof that decoding never began.
+
+## Phase 19: shared-worker finalization and batching readiness
+
+Normal dynamic-runtime close (including clean file EOF), and capability removal
+after required Fight drain, now send inference sentinels before setting the bundle
+stop event. Person/Pose require those sentinels to leave their loops and publish
+worker/batch summaries. Person, Pose, Stage3 and Vehicle get one shared **8-second
+grace budget per bundle**; result routers and Reporter stay available during it.
+Normal process joins allow their Reporter feeder buffers to flush. The existing
+bounded terminate/kill fallback handles unhealthy workers; failure/recovery
+withdrawal skips this grace and retains its existing fencing and forced teardown.
+
+The dynamic parent finishes producers before sending Reporter's sentinel (bounded
+retry), then joins Reporter so its final file flush precedes performance summary
+construction. This does not make telemetry an incident durability or EOF signal.
+Full/unusable report transport, forced termination, Reporter/disk failure or grace
+expiry can still leave telemetry unavailable; no client timings are substituted
+for missing worker inference distributions.
+
+Person/Pose summaries and real benchmark `stages.<stage>.latency` retain worker
+`result_enqueue_ms`, `worker_timings.all_requests`, `worker_timings.steady_state`
+and `batch` (configuration, counts, size, collection wait, inference and existing
+steady-state distributions). Worker views remain distinct from pooled raw client
+samples; no percentile averaging is performed. **Person batching remains disabled
+by default** (size 1, max wait 0); only an explicit configuration enables it.
+No GPU capacity claim or batching speedup is implied by these regression tests.
+
+## Phase 19.1: Windows snapshots and failure identity
+
+HealthSnapshotStore writes complete temporary JSON before atomic replacement.
+Windows readers/scanners can temporarily deny replacement of an open destination.
+Only replacement errors with `winerror` 5/32/33 receive bounded retries: four
+attempts, with 20/40/80 ms delays, at most 140 ms added backoff. Persistent
+permission errors and other disk failures still surface; the old snapshot is
+not unlinked or replaced with partial JSON. Snapshot publication remains
+best-effort/non-fatal; exhausted failures now include `errno` and `winerror`.
+
+Vehicle recovery status preserves `component`, `reason`, `component_failure`,
+`service_epoch`, retry count and the pre-teardown process exit code. An alive
+inference-stalled process has no original exit code; its later forced-kill code
+must not be reported as the cause. Fight health failures retain equivalent
+component/exit identity. Recovery budgets, fail-closed file behavior and Fight
+isolation are unchanged.
 
 ## Phase 18: bottleneck attribution
 
@@ -115,7 +163,8 @@ Interpretation limits:
   Speed epoch / Vehicle service epoch). Status scans retain only the latest new
   attribution summaries with a registry-sized cap, not the periodic history.
   Camera summaries are not pooled across cameras and percentiles are never
-  averaged. Disabled/missing/no-sample metrics remain null. Existing status and
+  merged by averaging. A separately labeled mean of run-level statistics is not
+  a pooled percentile. Disabled/missing/no-sample metrics remain null. Existing status and
   incident history/cursor behavior is not compacted or rewritten.
 
 ## Classification and interpretation
@@ -159,6 +208,97 @@ A pre-Phase-17 12-camera / 180-second run was INCOMPLETE and is **not a capacity
 
 Phase 17 (`3b9733f20a3ca4d3773c63fed0caba7939f2f27c`) hardens this production lifecycle: CameraIngest publishes a generation-local authoritative EOF Event before consumer EOF delivery; clean Fight/Speed file drain requires authoritative EOF plus exit code 0; pre-EOF/non-zero failures remain fail-closed; mixed Fight+Speed waits for all required consumers; clean EOF does not restart, advance generation or replay the source.
 
-Therefore the next manual acceptance is to rerun the **same 12-camera Fight workload with the same 180-second deadline** before interpreting 12-camera throughput. Do not extend the deadline first: if it remains INCOMPLETE, diagnose the new reason so the before/after comparison remains meaningful.
+That acceptance is now complete: `rtx3050-fight-12-phase17` finished HEALTHY at
+76.80 aggregate FPS with `10836 = 903 * 12` frames, no recovery/replay/restart and
+Person/Pose/Stage3 counts 5004/3732/72. Person/Pose queue p95 was approximately
+206.9/132.1 ms. These are healthy historical characterization results, not a
+supported production camera count; the failed pre-fix run remains diagnostic only.
 
 Use a clean inference environment for future measurements, preserve result metadata, and run the same harness with comparable workloads on the production-target GPU. No RTX 5090 camera-count extrapolation from RTX 3050 measurements is justified.
+
+## Characterization evidence and calculations
+
+The [project overview](../README.md#real-inference-characterization) presents the
+selected healthy results on Windows, Intel Core i7-13700H, 64 GB RAM and NVIDIA
+GeForce RTX 3050 Laptop GPU (6 GB). These short ordered-file runs characterize
+that hardware/workload; they do not guarantee sustained live capacity, detection
+accuracy or portability to another GPU. Synthetic 200/300 camera-equivalent tests
+are not real inference capacity evidence.
+
+Local evidence directories below are relative to ignored `benchmarks/results/`.
+Their `benchmark_summary.json` records were checked against the documented
+figures. They are deliberately not committed or linked as distributable assets.
+
+| Evidence directory | Workload / role | Classification |
+|---|---|---|
+| `phase18-attribution-speed8` | Speed 8, 82.70 FPS | HEALTHY, no recovery |
+| `phase18-attribution-speed12` | Speed 12, 89.25 FPS | HEALTHY, no recovery |
+| `phase19-mixed8-baseline-r2` | Pair A, OFF | HEALTHY, no recovery |
+| `phase19-mixed8-batch2` | Pair A, Batch-2 / 5 ms | HEALTHY, no recovery |
+| `phase19-mixed8-batch4` | Batch-4 / 5 ms comparison | HEALTHY, no recovery |
+| `phase19-final-mixed8-off` | Pair B, OFF after 19.1 | HEALTHY, no recovery |
+| `phase19-final-mixed8-batch2` | Pair B, Batch-2 / 5 ms after 19.1 | HEALTHY, no recovery |
+| `rtx3050-fight-12-phase17` | Historical Fight-12 EOF acceptance | HEALTHY, no recovery |
+
+Mixed traffic files contain 678 frames per logical camera: 5424 decoded frames,
+2600 Person admissions and 1344 Vehicle admissions per eight-camera run. Pose and
+Stage3 did not receive work on this content. Do not compare those runs as though
+they exercise full Fight-event inference or use the Fight-only 903-frame source.
+
+Person batching remains configurable and **OFF by default**:
+
+```json
+{"person_batch_enabled": false, "person_batch_size": 1, "person_batch_max_wait_ms": 0}
+```
+
+The optional characterized experiment changes only those runtime keys in a
+separate effective config to `true`, `2`, `5`. It is not a production-wide
+recommendation. Batch-4 lowered Person queue mean to 37.51 ms but increased
+Vehicle queue mean/p95 to 76.96/168.36 ms versus Batch-2's 39.19/103.19 ms in pair A;
+44.67 FPS was slightly below Batch-2's 45.15 FPS. Batch-2 was the better tested
+mixed-system tradeoff, not a universal optimum. Pair B also shows increased
+Vehicle queue mean (14.04 to 54.75 ms): the smaller overall throughput gain must
+be considered alongside the reduced Person queue pressure.
+
+### Calculation convention
+
+Use the supplied comparison inputs exactly as displayed in the root README:
+pair A is rounded to two decimals; pair B preserves its supplied precision.
+Raw local JSON retains additional precision for pair A (for example, OFF wall
+132.324758 s and B2 wall 120.123545 s). Thus these displayed-input calculations
+are descriptive summaries, not claims of extra measurement precision.
+
+For each metric, take the arithmetic mean of its two runs per profile, then
+compute `100 * (B2_mean / OFF_mean - 1)`. This is a ratio of profile means, not
+the average of two percentage changes, and not frames pooled over total time.
+
+| Metric | OFF calculation | B2 calculation | Relative change |
+|---|---|---|---:|
+| FPS | `(40.99 + 42.370409) / 2 = 41.6802045` | `(45.15 + 43.578609) / 2 = 44.3643045` | +6.4397477% |
+| Wall seconds | `(132.32 + 128.01387) / 2 = 130.166935` | `(120.12 + 124.464735) / 2 = 122.2923675` | -6.0495912% |
+| Person queue mean ms | `(171.57 + 166.882547) / 2 = 169.2262735` | `(105.22 + 102.568315) / 2 = 103.8941575` | -38.6063669% |
+| Mean of run queue p95 values, ms | `(197.40 + 206.51937) / 2 = 201.959685` | `(132.13 + 132.865525) / 2 = 132.4977625` | -34.3939547% |
+
+The last row is explicitly a mean of run-level statistics, **not a combined p95**.
+No runtime collector merges percentiles this way. Two pairs do not establish
+statistical significance. Per-request and per-batch inference distributions
+also have different observation populations; a batch processes approximately
+two requests, so a longer batch call alone does not establish a regression.
+
+For Speed 8 to 12, camera growth is `(12 / 8 - 1) * 100 = 50%` and throughput
+growth from the displayed values is `(89.25 / 82.70 - 1) * 100 = 7.9201935%`.
+The queue/inference/utilization pattern supports shared-service scheduling and
+arrival/backpressure explanations more than simple GPU saturation, but does not
+isolate IPC-copy cost or prove one exclusive bottleneck.
+
+### Post-19.1 validation evidence
+
+Both final mixed runs had zero `health_snapshot_write_failed` occurrences in
+`real-mixed-8/runtime/camera_status.jsonl`. Their final health snapshots reported
+zero Person/Vehicle restarts; summaries recorded Person accepted/dispatched
+2600/2600 and Vehicle 1344/1344, with zero `rejected_capacity`, `dropped_live` and
+`stale_generation` for those stages. Both were HEALTHY without recovery.
+This is successful real Windows runtime validation consistent with targeted
+sharing-error regression tests, not a guarantee that permission/disk failures
+cannot recur. The earlier incomplete `phase19-mixed8-baseline` is excluded from
+the performance comparison.

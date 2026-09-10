@@ -754,7 +754,19 @@ class HealthSnapshotStore:
             json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
             encoding="utf-8",
         )
-        temporary.replace(self.path)
+        # Windows readers/scanners may briefly hold the destination without
+        # FILE_SHARE_DELETE. Retry only replacement, never expose partial JSON
+        # or unlink the last good snapshot. Four attempts, at most 140 ms sleep.
+        for delay in (0.02, 0.04, 0.08, None):
+            try:
+                temporary.replace(self.path)
+                break
+            except OSError as exc:
+                # ACCESS_DENIED can be transient on Windows replacement too;
+                # persistent ACL/read-only errors still escape after the cap.
+                if getattr(exc, "winerror", None) not in {5, 32, 33} or delay is None:
+                    raise
+                time.sleep(delay)
 
 
 class RuntimeWatchdog:

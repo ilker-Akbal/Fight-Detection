@@ -50,6 +50,7 @@ class SharedServices:
 
     FIGHT = ("person", "person_router", "pose", "pose_router", "stage3")
     CODES = {"person": 4, "person_router": 5, "pose": 6, "pose_router": 7, "stage3": 2}
+    FINALIZE_TIMEOUT_SEC = 8.0  # One grace budget per bundle, not per worker.
 
     def __init__(self, manager, incident_queue, process_factory, terminate_process,
                  registry=None, monotonic=time.monotonic, publication_floor=None):
@@ -165,10 +166,43 @@ class SharedServices:
         except (AttributeError, OSError, ValueError):
             pass
 
-    def _stop(self, kind):
+    def _finalize(self, bundle):
+        """Normal withdrawal only: finish inference before stopping its routers.
+
+        Person/Pose require a sentinel even when idle: their loop deliberately
+        ignores the stop event. Joining a normally exited process also flushes
+        its multiprocessing Reporter feeder before the parent sends Reporter EOF.
+        The sender is bounded from the parent's perspective even if an unhealthy
+        worker left an admission lock unusable. Failed transport is never reused.
+        """
+        deadline = time.monotonic() + self.FINALIZE_TIMEOUT_SEC
+        sent = threading.Event()
+
+        def send():
+            try:
+                for stage, channel in bundle["admissions"].items():
+                    process = bundle["processes"].get(stage)
+                    if process is not None and process.is_alive():
+                        remaining = max(0.0, deadline - time.monotonic())
+                        channel.put(None, timeout=remaining)
+            except Exception:
+                pass  # The bounded forced fallback below still owns teardown.
+            finally:
+                sent.set()
+
+        threading.Thread(target=send, name="shared_service_finalize", daemon=True).start()
+        sent.wait(max(0.0, deadline - time.monotonic()))
+        for stage in bundle["admissions"]:
+            process = bundle["processes"].get(stage)
+            if process is not None:
+                process.join(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _stop(self, kind, *, graceful=False):
         bundle = self.bundles.pop(kind, None)
         if bundle is None:
             return
+        if graceful:
+            self._finalize(bundle)
         bundle["stop"].set()
         for process in bundle["processes"].values():
             self.terminate(process, timeout=1.0)
@@ -185,7 +219,7 @@ class SharedServices:
             self.manager.person_result_channels, self.manager.pose_result_channels = {}, {}
             self.draining = None
 
-    def _fight_failure(self, reason):
+    def _fight_failure(self, reason, *, component="fight", exit_code=None):
         # Fence both buffered aggregator segments and late Stage3 output BEFORE
         # touching old transport. Normal capability removal/EOF does not fence
         # valid pending incidents; only a failed incarnation does.
@@ -208,6 +242,7 @@ class SharedServices:
             self.fight_retry_max, self.fight_retry_base * 2 ** min(self.fight_attempts, 20))
         self.manager._status("fight_service_failed" if self.fight_failed else "fight_service_restarting",
             reason=self.fight_failure_reason, component_failure=reason,
+            component=component, exit_code=exit_code,
             retries=self.fight_attempts, service_epoch=self.fight_epoch)
 
     def _withdraw_speed(self):
@@ -220,13 +255,19 @@ class SharedServices:
                     continue  # Already drained before the unrelated service death.
                 self.manager.disable_speed(item, "vehicle_service_restarting")
 
-    def _vehicle_failure(self):
+    def _vehicle_failure(self, reason):
+        # Capture before withdrawal: terminate/kill exit codes are consequences,
+        # not the cause of the health decision (a stalled worker is still alive).
+        process = self.bundles.get("vehicle", {}).get("processes", {}).get("vehicle")
+        exit_code = getattr(process, "exitcode", None)
         self._withdraw_speed()  # Invalidate before killing/replacing any transport.
         self._stop("vehicle")
         self.vehicle_failed = self.attempts >= self.retry_limit
         self.retry_at = None if self.vehicle_failed else self.clock() + min(
             self.retry_max, self.retry_base * 2 ** min(self.attempts, 20))
         self.manager._status("vehicle_service_failed" if self.vehicle_failed else "vehicle_service_restarting",
+                             component="vehicle", reason=reason, component_failure=f"vehicle_{reason}",
+                             exit_code=exit_code,
                              retries=self.attempts, service_epoch=self.vehicle_epoch)
 
     def prepare(self, cameras):
@@ -246,7 +287,7 @@ class SharedServices:
                         if kind != "vehicle":
                             self._stop(kind)
                             raise SharedServiceStartError("fight_service_start_failed") from None
-                        self._vehicle_failure()
+                        self._vehicle_failure("start_failed")
             else:
                 self.idle_since.setdefault(kind, self.clock())
         self._sync_health()
@@ -283,7 +324,8 @@ class SharedServices:
                 state, reason = self.registry._worker_health(component, self.registry.workers[component],
                     self.policy, self.clock(), process.is_alive())
                 if state == "FAILED":
-                    self._fight_failure(f"{component}_{reason}")
+                    self._fight_failure(f"{component}_{reason}", component=component,
+                                        exit_code=getattr(process, "exitcode", None))
                     break
         if self.required["fight"] and self.fight_retry_at is not None and self.clock() >= self.fight_retry_at:
             self.fight_attempts += 1
@@ -297,16 +339,16 @@ class SharedServices:
         if bundle is not None:
             process = bundle["processes"]["vehicle"]
             record = self.registry.workers["vehicle"]
-            state, _ = self.registry._worker_health("vehicle", record, self.policy, self.clock(), process.is_alive())
+            state, reason = self.registry._worker_health("vehicle", record, self.policy, self.clock(), process.is_alive())
             if state == "FAILED":
-                self._vehicle_failure()
+                self._vehicle_failure(reason)
         if self.required["vehicle"] and self.retry_at is not None and self.clock() >= self.retry_at:
             self.attempts += 1
             self.retry_at = None
             try:
                 self._start("vehicle")
             except Exception:
-                self._vehicle_failure()
+                self._vehicle_failure("replacement_start_failed")
             else:
                 # Service recovery has its own bounded budget, independent of local
                 # consumer failures. Files are never resumed after partial failure.
@@ -324,7 +366,7 @@ class SharedServices:
             if not self.required[kind] and self.clock() - self.idle_since[kind] >= self.grace:
                 if kind == "fight" and not self._fight_drained(self.bundles[kind]):
                     continue
-                self._stop(kind)
+                self._stop(kind, graceful=True)
         self._sync_health()
 
     def _sync_health(self):
@@ -362,8 +404,8 @@ class SharedServices:
     def admissions(self):
         return {stage: channel for bundle in self.bundles.values() for stage, channel in bundle["admissions"].items()}
 
-    def close(self):
+    def close(self, *, graceful=True):
         for kind in list(self.bundles):
-            self._stop(kind)
+            self._stop(kind, graceful=graceful)
         if self.manager.health_queue is None:
             self._close(self.health_queue)

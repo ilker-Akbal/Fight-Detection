@@ -1,291 +1,289 @@
-# ▶️ Pipeline Çalıştırma
+# Shared Multi-Camera Fight + Speed Detection
 
-## Motion Test
+A multi-camera video analytics system with shared inference services, camera-local
+temporal processing, and a durable incident boundary into Django. Fight-only,
+Speed-only and combined cameras run under one Supervisor-managed runtime.
 
-```text
-python -m fight.pipeline.run_live --motion-config fight/motion/configs/motion.yaml --show
-```
+[ARCHITECTURE.md](ARCHITECTURE.md) is the architecture contract.
+[benchmarks/README.md](benchmarks/README.md) defines measurement methodology,
+metric boundaries and reproducible benchmark commands.
 
----
-
-## Webcam ile Tam Pipeline
-
-```text
-python -m fight.pipeline.run_live --motion-config fight/motion/configs/motion.yaml --yolo-config fight/yolo/configs/yolo.yaml --use-pose --pose-weights fight/pose/weights/yolo11n-pose.pt --use-stage3 --stage3-config fight/3D_CNN/configs/stage3.yaml --show
-```
-
----
-
-## Video ile Pipeline
+## Architecture
 
 ```text
-python -m fight.pipeline.run_live --source fight/sample_2.mp4 --motion-config fight/motion/configs/motion.yaml --yolo-config fight/yolo/configs/yolo.yaml --use-pose --pose-weights fight/pose/weights/yolo11n-pose.pt --use-stage3 --stage3-config fight/3D_CNN/configs/stage3.yaml --show
+Django desired-camera registry -> Runtime Supervisor -> one runtime parent
+  CameraIngest per physical source
+    -> Fight consumer -> shared Person / optional Pose / optional Stage3
+    -> Speed consumer -> shared Vehicle
+    -> Preview consumer
+  Evidence + durable incident outbox -> Django Incident Dispatcher
 ```
 
----
+- **Shared models:** one Person inference service for Fight, shared Pose and
+  Stage3/X3D when configured and required, and one Vehicle inference service for
+  Speed. Models are shared across cameras, not loaded per camera. Fight temporal
+  state and Speed tracking/calibration/decisions remain camera-local.
+- **Single decode owner:** production sources are opened by CameraIngest, once
+  per active physical source. Fight and Speed on the same camera share its decoded
+  frames. Duplicate active physical-source ownership is rejected.
+- **Capability-aware lifecycle:** services start when the desired cameras require
+  them and can stop after demand disappears and required work drains.
 
-# 📁 Proje Klasör Yapısı
+| Camera mode | Required shared services |
+|---|---|
+| Fight-only | Person; Pose/Stage3 when configured; no Vehicle |
+| Speed-only | Vehicle; no Person/Pose/Stage3 merely because the runtime exists |
+| Fight + Speed | Both applicable service groups, sharing one CameraIngest |
 
-```text
-fight
- ├── motion
- ├── yolo
- ├── pose
- ├── 3D_CNN
- ├── pipeline
- ├── shared
- ├── tools
- └── clip_debug
-```
+The Django/Gunicorn process is the application/control plane, not the AI process
+owner. The Camera Registry Reconciler publishes versioned desired camera state;
+the runtime parent owns dynamic add/remove/reconfigure and stable camera slots.
+Runtime workers have no Django ORM dependency.
 
----
+Vehicle failure/recovery is isolated from Fight. Fight bundle recovery leaves
+Speed-only cameras intact; a mixed camera currently incurs a camera-local restart
+and brief Speed interruption during Fight recovery. Generations, Speed consumer
+epochs, shared-service epochs and restart state fence stale work. Recovery uses
+bounded retries/backoff; affected file workloads fail closed without replay.
+Runtime-global Reporter/Incident failures and exhausted or unsafe Fight recovery
+remain explicit failure boundaries, not silently ignored faults.
 
-# 📌 Not
+## Scheduling, observability and durability
 
-Model `.pt` dosyalarına erişim yoksa modeli yeniden paketlemek için şu araç kullanılabilir:
+- Fair per-camera admission and round-robin shared-service scheduling provide
+  bounded backpressure. Ordered files defer rather than silently shed required
+  inference; live sources may shed stale work explicitly. No correctness decision
+  relies on OS queue `qsize()` or `empty()`.
+- CameraIngest owns live reconnects. The watchdog observes heartbeats, progress,
+  inference deadlines, warm-up grace and queue pressure without competing with
+  reconnect ownership or restarting solely because of ordinary backpressure.
+- Non-looping file EOF is a generation-local event published before consumer EOF
+  signals. Required consumers must exit cleanly after authoritative EOF; mixed
+  completion waits for both Fight and Speed. Telemetry never owns EOF correctness.
+- Evidence and the append-only durable outbox precede legacy incident output.
+  The independent Django dispatcher imports Fight/Speed events into the common
+  Incident/routing domain. Serialized writes and fsync protect the persistence
+  boundary; persistence failure is not reported as success.
+- Bounded, best-effort attribution measures ingest read/fan-out, shared inference
+  waits, client round trips and camera-local work. Missing metrics remain
+  unavailable. Attribution cannot change health, admission, recovery, incidents
+  or benchmark classification.
+- Multiprocessing transport and lifecycle paths support Windows `spawn`; there
+  is no shared-memory frame-transport optimization or extra model worker implied
+  by these measurements.
 
-```text
-fight/tools/pack_pt_from_folder_v2.py
-```
+### Phase 19 / 19.1 reliability
 
----
+Normal shared-service withdrawal sends queue sentinels and grants one bounded
+eight-second finalization grace per bundle while routers and Reporter remain
+available. Normal worker joins flush their report feeders; Reporter is joined
+and flushed before final performance-summary construction. Worker queue,
+inference, enqueue, batch and existing steady-state telemetry survive normal
+shutdown. Failure recovery retains bounded forced teardown, not an unlimited drain.
 
-## Production service boundaries
+On Windows, HealthSnapshotStore retries only atomic replacement errors with
+`winerror` 5, 32 or 33: four total attempts, with 20/40/80 ms delays (140 ms maximum
+added backoff). An overlapping reader can deny replacement; the last complete
+JSON remains intact until replacement succeeds. Persistent permission/disk errors
+still surface. Snapshot publication failures remain best-effort/non-fatal and
+include `errno`/`winerror`.
 
-The Django/Gunicorn process is the control and web plane. It does not own AI
-processes or open physical fight-camera sources. The Runtime Supervisor owns one
-`run_multiprocess` parent. Within that run, `CameraIngest` is the only physical
-source/decode owner and fans frames out to one shared Person worker, one shared
-Pose worker, and shared Stage3/X3D inference. `IncidentAggregator` finalizes
-incident evidence and writes the durable incident outbox; the Django-side
-Incident Dispatcher imports that boundary into the current SQLite database and
-performs routing and escalation.
+Vehicle recovery status retains `component`, `reason`, `component_failure`,
+`service_epoch`, retries and the pre-teardown exit code when available. A stalled,
+still-live worker does not falsely acquire its later forced-kill exit code as the
+original cause. Equivalent Fight health-failure identity is retained.
 
-The Camera Registry Reconciler publishes a versioned snapshot of active fight
-cameras to the Supervisor's atomic desired-state file. The running AI parent
-assigns cameras to pre-created result-channel slots and starts, stops, or
-restarts only the affected ingest/camera/preview trio. Shared inference workers
-remain alive. Publishing camera state never starts a globally stopped runtime;
-global start/stop remains owned by the Supervisor API.
+## Local development and operation
 
-No Django ORM dependency is imported by the fight runtime. Gunicorn does not own
-AI children, and the Runtime Supervisor does not own Django workers.
+Use an environment with the repository's runtime/model dependencies and a
+compatible PyTorch/CUDA installation for GPU work. Provision model weights and
+camera-specific Speed calibration before starting inference; the benchmark
+harness does not automatically download missing models. Backend dependencies are
+listed in [requirements.txt](Fight_backend_project/backend_frontend_project/requirements.txt);
+configuration examples are in [.env.example](.env.example). These are development
+instructions, not production deployment packaging.
 
-## Local Windows startup
-
-Run these in four separate PowerShell terminals from the repository root.
-
-Terminal 1 — Runtime Supervisor:
+Run these in separate PowerShell terminals from the repository root:
 
 ```powershell
+# 1. Runtime Supervisor
 python -m fight.runtime_supervisor.server
-```
 
-Terminal 2 — Camera Registry Reconciler:
-
-```powershell
+# 2. Camera Registry Reconciler
 Set-Location Fight_backend_project/backend_frontend_project
 python manage.py run_camera_registry_reconciler
-```
 
-Terminal 3 — Incident Dispatcher:
-
-```powershell
+# 3. Incident Dispatcher (start from repository root)
 Set-Location Fight_backend_project/backend_frontend_project
 python manage.py run_incident_dispatcher
-```
 
-Terminal 4 — Django:
-
-```powershell
+# 4. Django development server (start from repository root)
 Set-Location Fight_backend_project/backend_frontend_project
 python manage.py runserver
 ```
 
-For a file camera, EOF produces a clean `STOPPED` runtime with exit code 0; this
-is expected completion. A live RTSP camera remains active according to the
-configured reconnect and explicit-stop policy.
+The four blocks belong in separate terminals. Configure authentication and desired
+cameras before using the common start/stop controls. Publishing desired state does
+not itself start a globally stopped runtime.
 
-## Runtime health and watchdog
+The authenticated Supervisor `/status` and `/runtime/health` endpoints expose
+runtime health, camera/service identity, progress, capacity and reasons. Missing
+or stale snapshots are explicitly identified. Health deadlines and recovery
+budgets are configuration-driven; do not inflate them to conceal failed workers.
 
-The AI runtime owns a bounded health channel, an in-memory current-state
-registry, and one periodic watchdog tick. Health decisions use monotonic time.
-The atomic `runtime_health.json` snapshot contains generation-aware camera and
-shared-worker status, progress ages, bounded counters, and reasons; it never
-contains source URLs, credentials, frames, or heartbeat history.
-
-Camera lifecycle and health remain separate. A running camera can be
-`DEGRADED`; a non-looping file can finish as `EOF`; an RTSP source in its normal
-ingest reconnect loop is `RECONNECTING`. The watchdog does not compete with
-`CameraIngest` reconnects. A confirmed camera stall restarts only that camera
-through the Phase-9 `CameraRuntimeManager`, with a generation increment,
-cooldown, and bounded retry count. Preview failures use preview-only restart.
-One unhealthy camera degrades the aggregate runtime but does not fail it.
-
-Person, Pose, Stage3, Incident, and result-router workers remain healthy while
-idle if their heartbeats are fresh. A dead worker, stale heartbeat, or pending
-request whose completion stops progressing has a distinct reason. A fatal
-critical shared-worker condition causes controlled runtime failure; the Runtime
-Supervisor then applies its existing whole-runtime restart/backoff policy.
-Shared CUDA workers are not hot-replaced independently in Phase 10.
-While synchronous inference is in progress, its inference warning/failure
-deadlines take precedence over the loop heartbeat timeout. The first inference
-gets at least `HEALTH_STARTUP_GRACE_SEC` from request start for lazy CUDA warm-up;
-later requests use `INFERENCE_STALL_FAIL_SEC`. Cameras waiting on that shared
-inference remain degraded without a camera restart during this bounded window.
-Actual process death is always fatal for a critical shared worker.
-The Django-side Camera Registry Reconciler and Incident Dispatcher remain
-outside this AI runtime registry and are monitored by deployment/service
-management.
-
-The Supervisor's existing `/status` response adds `runtime_health`,
-`runtime_health_updated_at`, and `health_summary`. The detailed bounded snapshot
-is available from the authenticated endpoint:
-
-```powershell
-$headers = @{ Authorization = "Bearer $env:RUNTIME_SUPERVISOR_TOKEN" }
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8765/runtime/health" `
-  -Headers $headers |
-  ConvertTo-Json -Depth 10
-```
-
-When the runtime is stopped, detailed health is unavailable with
-`runtime_health=STOPPED`. A missing snapshot while running is `UNKNOWN`; a stale
-snapshot is explicitly marked `stale=true` and `DEGRADED` unless the last
-reported aggregate state was already `FAILED`.
-
-Health tuning is environment/config driven. The primary settings are
-`HEALTH_HEARTBEAT_INTERVAL_SEC`, `HEALTH_WATCHDOG_INTERVAL_SEC`,
-`HEALTH_STARTUP_GRACE_SEC`, `CAMERA_HEARTBEAT_TIMEOUT_SEC`,
-`CAMERA_FRAME_STALL_WARN_SEC`, `CAMERA_FRAME_STALL_FAIL_SEC`,
-`CAMERA_RECONNECT_GRACE_SEC`, `SHARED_WORKER_HEARTBEAT_TIMEOUT_SEC`,
-`INFERENCE_STALL_WARN_SEC`, `INFERENCE_STALL_FAIL_SEC`,
-`PREVIEW_HEARTBEAT_TIMEOUT_SEC`, `WATCHDOG_CAMERA_RESTART_COOLDOWN_SEC`, and
-`WATCHDOG_CAMERA_RESTART_LIMIT`. Defaults are conservative; see `.env.example`.
-
-## Capacity and backpressure (Phase 11)
-
-The Supervisor-managed dynamic runtime enables `FAIR_SCHEDULING_ENABLED=true`.
-Each shared Person/Pose worker receives one reserved pending FIFO position per
-stable camera slot. Stage3 reserves `STAGE3_PENDING_PER_CAMERA` positions per
-slot (default 1). Workers consume these FIFOs round-robin, then use the existing
-size/wait-bounded microbatch collector and shape grouping. Model counts do not
-change. Cameras retain one outstanding Person/Pose request; only a camera's own
-producer endpoints are passed to its processes on Windows spawn.
-
-Admission capacity is explicit: `DYNAMIC_CAMERA_SLOT_COUNT` positions per
-Person/Pose stage and slots times `STAGE3_PENDING_PER_CAMERA` for Stage3, plus
-the bounded active batch and each producer's current work. Legacy shared
-`person_request_queue_size`, `pose_request_queue_size`, and `stage3_queue_size`
-apply when fair scheduling is disabled; they do not override slot reservations.
-Increasing slot count reserves queue handles and payload capacity, not models.
-
-File inference remains ordered: a full slot defers its producer and accepted
-work waits for its result. Stage3 candidates are also ordered for both source
-types, so saturation does not discard incident evidence. Live ingest retains
-its existing latest-frame replacement policy. `LIVE_FRAME_MAX_AGE_SEC` and
-`LIVE_INFERENCE_MAX_AGE_SEC` (both default 2 seconds, 0 disables the age limit)
-shed stale live frames/requests/results. A shed inference returns an explicit
-outcome; it is never interpreted as a negative Person/Pose decision. An
-in-flight synchronous model call is not preempted; live age bounds determine
-whether its work remains useful when dispatching/receiving it.
-
-Cooperative capacity waits report `DEGRADED / queue_pressure` without camera
-restarts. Phase-10 shared-worker death, heartbeat, inference deadlines and
-first-call warm-up grace remain authoritative. File EOF drains admitted Stage3
-work, including active inference, while the parent continues health checks.
-The existing incident finalization wait then runs before clean completion.
-
-Health snapshots include per-stage and per-camera `capacity` counters:
-accepted, rejected_capacity, deferred_file, dropped_live, stale_generation,
-dispatches, and high_water. `CAPACITY_OVERLOAD_RATIO` (default 0.9) controls
-aggregate saturation warnings; it is not a restart trigger. Outstanding/high
-water observations include active work and a producer blocked in admission;
-they are not multiprocessing `qsize()` correctness checks. Slot counters reset
-on a new camera generation. Final `performance_summary.json` includes capacity
-statistics even when periodic health snapshots are disabled.
-
-These are fairness and bounded-memory guarantees, not a GPU throughput claim.
-Decoding, frame/ROI serialization, Stage3 clip payloads, per-camera processes,
-Windows queue handles and GPU service time remain real scale costs. A later phase
-should measure end-to-end latency, CPU/RAM/VRAM and sustained load on target
-hardware before choosing shared-memory transport or multi-GPU partitioning.
-
-## Phase 12: operational durability and retention
-
-Run cleanup at the Django service boundary (from the backend directory):
+Operational cleanup is opt-in at the ORM-aware Django boundary:
 
 ```powershell
 python manage.py run_operational_cleanup --once --dry-run
 python manage.py run_operational_cleanup --once
-# Optional long-running service, default interval 3600 seconds:
-python manage.py run_operational_cleanup
 ```
 
-Defaults: transient metrics/health/previews 7 days, stale owned `.tmp` files
-1 day, completed run configs/directories 30 days, closed Supervisor run logs
-14 days. Each pass examines at most 10,000 entries and removes at most 500
-files. These limits and ages use `RETENTION_*` in `.env.example`; zero days
-disables that category. Cleanup is opt-in: no scheduler or external service
-is installed automatically. No runtime code uses Django/ORM.
+Run cleanup from the backend directory. Active/current runs, recovery state,
+unconsumed outbox data and Incident-referenced evidence are protected. Evidence
+retention is indefinite by default; bounded transient cleanup and disk-pressure
+status do not replace storage planning. Disk pressure alone does not trigger
+watchdog restart storms.
 
-Run leases plus a Supervisor launch/maintenance lock exclude active writers.
-The current run is retained even after stopping. Only runs with a Phase-12
-`COMPLETED` marker are eligible; unknown, failed, pre-Phase-12 and abnormal
-termination runs stay untouched for operator recovery. Symlinks/junctions,
-unknown artifacts, recovery state, lock files and durable JSONL history are
-never deleted. Old empty directories are removed without recursive deletion.
-Closed run markers are kept until their Supervisor stdout/stderr logs expire.
-Supervisor event telemetry rotates at 8 MiB with 3 backups; it is operational
-telemetry, not incident history.
+Legacy single-camera developer tools remain available, but do not define the
+shared production topology:
 
-Incident-referenced files are protected regardless of incident state or
-`evidence_valid`. Evidence (including video temp segments) is retained
-indefinitely by default. Opting into `RETENTION_EVIDENCE_DAYS` has a minimum
-180-day age and additionally requires stopped runtime, stopped dispatcher,
-exclusive outbox writer lock, matching fully consumed cursor/file identity,
-no partial trailing record and no retryable ingest records. Referenced
-evidence is still never removed. Durable outbox/legacy history is neither
-deleted nor compacted, and dispatcher cursor semantics are unchanged.
+```powershell
+python -m fight.pipeline.run_live --motion-config fight/motion/configs/motion.yaml --show
+```
 
-Disk checks are cached for 30 seconds, warn below 5 GiB and become critical
-below 1 GiB (`DISK_*`, or corresponding lowercase runtime keys). Existing
-runtime health exposes `disk`, degrading aggregate health only; disk pressure
-does not produce worker/camera restart actions. Supervisor status exposes its
-own volume status plus compact cleanup counters. `scan_limited` or
-`delete_limited` indicate incomplete passes; review limits if repeatedly set.
-No file paths/source credentials are included in these operational statuses.
+## Real-inference characterization
 
-Outbox appends serialize writers, handle short writes, retain partial tail
-bytes with a newline boundary, and fsync before legacy output. Evidence is
-fsynced before publication. Failed persistence is fatal/explicit, including
-aggregator background failures, rather than a successful incident. Atomic
-Supervisor state and desired-camera writes flush/fsync before replacement
-(directory fsync on POSIX). Stale atomic-write temps can be overwritten on
-the next owned write; a failed replacement leaves prior state intact.
+Hardware: **NVIDIA GeForce RTX 3050 Laptop GPU, 6 GB; Intel Core i7-13700H;
+64 GB RAM; Windows**.
 
-Dispatcher, registry reconciler and cleanup commands have local cross-platform
-singleton locks, SIGINT/SIGTERM handling and interruptible bounded retry
-backoff. Use the same service/state directories for every instance on this
-host. Filesystem locks are local-host coordination, not distributed locking.
-Abnormal shutdown releases OS locks; it never deletes a lock inode.
+These are healthy, ordered local-file workload characterizations, not production
+capacity guarantees or sustained RTSP service-level claims. Fight and Speed
+workloads have been characterized up to 12 logical cameras on this hardware.
+That does not establish a universally supported camera count. No RTX 5090/other-GPU
+extrapolation or 200/300-camera real-inference capability is claimed.
 
-Remaining operational work: review legacy/aborted runs manually; archive
-durable incident history through a cursor-aware design; size storage for
-active run streams (never deleted by retention) and referenced evidence;
-monitor cleanup limits on very large directories. Network-filesystem/power-loss
-durability and GPU/scale sizing require deployment-specific validation.
+Aggregate throughput below is completed-file frames divided by runtime wall time
+(the harness's `aggregate_decode_effective_fps_full_run`), including startup and
+drain—not model requests per second or steady-state camera FPS. Shared latency
+distributions retain bounded samples; host/GPU sampling excludes the configured
+initial wall warm-up. Failed/incomplete runs are excluded from performance tables.
 
-## Deferred work
+### Speed-only
 
-The following work belongs to dedicated later phases:
+| Metric | 8 cameras | 12 cameras |
+|---|---:|---:|
+| Aggregate throughput, FPS | 82.70 | 89.25 |
+| Vehicle requests / delivered results | 1344 / 1344 | 2016 / 2016 |
+| Vehicle queue wait mean, ms | 77.19 | 125.50 |
+| Vehicle queue wait p95, ms | 119.28 | 256.63 |
+| Vehicle inference mean, ms | 29.13 | 29.89 |
+| Vehicle inference p95, ms | 42.27 | 51.55 |
+| CPU mean | 51.45% | 56.69% |
+| GPU mean | 22.47% | 26.01% |
+| GPU p95 | 43.3% | 42.0% |
+| GPU max | 45% | 53% |
+| Classification / recovery | HEALTHY / none | HEALTHY / none |
 
-- dashboard redesign;
-- incident table lazy media loading / video player UX;
-- operational incident interaction redesign;
-- preview UX and offline placeholders;
-- production media offload/Nginx;
-- Speed integration;
-- PostgreSQL migration;
-- production-scale capacity measurement and deployment sizing.
+With 50% more cameras, aggregate throughput increased only **7.92%**, while queue
+latency rose materially. Similar inference duration and relatively low sampled
+GPU utilization point toward shared Vehicle serialization/scheduling, arrival
+pressure and backpressure rather than simple GPU saturation. This does not prove
+IPC/memory-copy causality; sampled utilization can miss short GPU bursts. Vehicle
+queue wait includes admission and transport, not just time after enqueue.
+
+### Historical Fight-only
+
+| Cameras | Aggregate throughput, FPS |
+|---|---:|
+| 2 | 28.67 |
+| 4 | 49.89 |
+| 8 | 65.55 |
+| 12 | 76.80 |
+
+The healthy post-Phase-17 Fight-12 run completed **903 frames per camera, 10,836
+total**, without recovery, replay or restart. These are frame counts, not Person
+request counts: Person/Pose/Stage3 processed 5004/3732/72 respectively. Person queue
+p95 was about 206.9 ms, Pose queue p95 132.1 ms, GPU mean 57.5%, GPU p95 86%, and
+VRAM about 640 MiB. These historical runs precede the newer attribution/finalization
+changes and must not be treated as directly interchangeable microbatch baselines.
+
+### Mixed Fight + Speed: optional Person microbatch profile
+
+Production defaults remain `person_batch_enabled=false`,
+`person_batch_size=1`, `person_batch_max_wait_ms=0`. **Batch-2 / 5 ms is an optional
+characterized profile, not a global default or universal production recommendation.**
+
+All four comparison runs below were HEALTHY, with no recovery. They used eight
+logical cameras and the same traffic-file workload (678 frames per camera).
+Pose/Stage3 received no work on this traffic content, so this is not a full
+Fight-event/Pose/Stage3 contention test.
+
+| Pair / profile | Aggregate FPS | Wall time, s | Person queue mean, ms | Person queue p95, ms |
+|---|---:|---:|---:|---:|
+| A / OFF | 40.99 | 132.32 | 171.57 | 197.40 |
+| A / Batch-2, 5 ms | 45.15 | 120.12 | 105.22 | 132.13 |
+| B / OFF, after 19.1 | 42.370409 | 128.013870 | 166.882547 | 206.519370 |
+| B / Batch-2, 5 ms, after 19.1 | 43.578609 | 124.464735 | 102.568315 | 132.865525 |
+
+Pair A OFF Person inference mean was 29.67 ms. Pair A Batch-2 had actual batch
+size mean 1.83 and batch inference mean/p95 41.81/56.47 ms.
+
+Pair B OFF Person inference mean was 24.744726 ms with batching disabled.
+Pair B Batch-2 reported Person inference mean 45.442546 ms, size limit 2,
+maximum collection wait 5 ms, actual size mean/p95 1.988281/2, collection-wait
+mean 1.205650 ms, and batch inference mean/p95 47.651872/57.641125 ms.
+A batch processes approximately two requests: greater per-batch latency is not
+by itself a regression when throughput improves and request queueing falls.
+Per-request and per-batch retained distributions are distinct, not interchangeable.
+
+Arithmetic means across these two healthy comparison pairs, using the values
+printed above:
+
+| Metric | OFF mean | Batch-2 mean | Change relative to OFF |
+|---|---:|---:|---:|
+| Throughput, FPS | 41.6802045 | 44.3643045 | +6.4397% |
+| Wall time, s | 130.166935 | 122.2923675 | -6.0496% |
+| Person queue mean, ms | 169.2262735 | 103.8941575 | -38.6064% |
+| Mean of run-level queue p95 values, ms | 201.959685 | 132.4977625 | -34.3940% |
+
+The last row is a descriptive mean of two run-level statistics, **not a pooled
+p95**. Two comparison pairs do not establish statistical significance or a universal
+speedup. Pair A's displayed inputs are rounded; exact calculation conventions and
+local evidence identifiers are in the [benchmark notes](benchmarks/README.md#characterization-evidence-and-calculations).
+
+Batch-4 / 5 ms was also healthy, with actual batch mean about 3.68 and Person queue
+mean about 37.51 ms, but total throughput was 44.67 FPS versus Batch-2's 45.15 FPS
+in that experiment. Vehicle queue mean/p95 increased from about 39.19/103.19 ms
+to 76.96/168.36 ms. Batch-2 was the better tested mixed-system tradeoff on this
+hardware; reducing Person queue pressure alone was not the objective.
+
+### Post-19.1 real Windows validation
+
+Final Mixed-8 OFF and Batch-2 runs were both HEALTHY with no recovery. Each recorded:
+
+- zero `health_snapshot_write_failed` occurrences;
+- Person accepted/dispatched: 2600/2600; Vehicle accepted/dispatched: 1344/1344;
+- zero capacity rejections, `dropped_live` and `stale_generation` in those stages;
+- zero Person and Vehicle restarts.
+
+This is successful real-runtime validation consistent with the targeted regression
+tests, not proof that Windows sharing/permission failures can never recur.
+
+## Validation and scope
+
+```powershell
+python -m pytest -q
+python -m compileall fight benchmarks tests
+git diff --check
+```
+
+The suite includes deterministic health/lifecycle/accounting tests and Windows
+spawn integration tests; it is not a substitute for representative GPU, live/RTSP,
+long-soak or detection-quality validation. Benchmark outputs and runtime state
+remain local, ignored artifacts, not versioned source.
+
+Further work should follow measured bottlenecks: representative live/RTSP and
+long-running workloads, camera churn, mixed-workload recovery, storage sizing and
+target-hardware validation. Shared memory, additional inference workers, model
+tuning, PostgreSQL/deployment changes and UI redesign are separate scopes—not
+implied by these characterization results.

@@ -239,6 +239,7 @@ def build_performance_summary(
                     else worker_view.get("queue_wait_ms", summarize_values([]))
                 ),
                 "inference_ms": worker_view.get("inference_ms", summarize_values([])),
+                "result_enqueue_ms": worker_view.get("result_enqueue_ms", summarize_values([])),
                 "result_delivery_ms": summarize_values(
                     _merge_client_samples(
                         camera_rows,
@@ -271,6 +272,12 @@ def build_performance_summary(
         target["steady_state"] = steady_state
         target["warmup_requests"] = int(worker.get("warmup_requests", 0))
         target["batch"] = worker.get("batch", {}) or {}
+        # Preserve the actual worker distributions, separately from aggregated
+        # client latency views. Never merge or average worker percentiles.
+        target["worker_timings"] = {
+            "all_requests": worker.get("all_requests", {}),
+            "steady_state": worker.get("steady_state", {}),
+        }
         target["worker_queue_wait_inclusive_ms"] = worker.get(
             "queue_wait_ms",
             summarize_values([]),

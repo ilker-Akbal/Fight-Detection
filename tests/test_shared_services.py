@@ -53,6 +53,16 @@ def close(services, manager):
     services._close(services.incident_queue)
 
 
+def service_status_rows(manager):
+    rows = []
+    while True:
+        try:
+            rows.append(manager.report_queue.get_nowait().row)
+        except queue.Empty:
+            return [row for row in rows if row.get("detail") in {
+                "vehicle_service_restarting", "vehicle_service_failed", "fight_service_restarting"}]
+
+
 def test_capability_transitions_preserve_unrelated_processes_and_stable_slots():
     services, manager, registry, now = fixture()
     fight, speed = camera("fight", True, False), camera("speed", False, True)
@@ -126,6 +136,11 @@ def test_vehicle_recovery_replaces_transport_rejects_stale_work_and_never_replay
         old_health = services.bundles["vehicle"]["health"]
         services.processes()["vehicle"].terminate()
         services.tick()
+        failure = service_status_rows(manager)[-1]
+        assert {key: failure[key] for key in ("detail", "component", "reason", "component_failure",
+                                             "retries", "service_epoch", "exit_code")} == {
+            "detail": "vehicle_service_restarting", "component": "vehicle", "reason": "process_dead",
+            "component_failure": "vehicle_process_dead", "retries": 0, "service_epoch": 1, "exit_code": -15}
         assert both.speed_failed and file.speed_failed and not guard()
         assert services.critical_processes() == fight
         assert all(both.processes[name] is original[name] for name in ("ingest", "camera", "preview"))
@@ -170,6 +185,11 @@ def test_vehicle_stall_and_restart_exhaustion_are_bounded():
         now[0] += 1
         services.tick()
         assert "vehicle" not in services.processes()
+        failure = service_status_rows(manager)[-1]
+        assert failure["reason"] == "inference_stall"
+        assert failure["component_failure"] == "vehicle_inference_stall"
+        assert failure["exit_code"] is None  # Do not report the subsequent forced kill as the cause.
+        assert failure["retries"] == 0 and failure["service_epoch"] == 1
         for backoff in (2, 4):
             now[0] += backoff - .1
             services.tick()
@@ -179,6 +199,11 @@ def test_vehicle_stall_and_restart_exhaustion_are_bounded():
             services.processes()["vehicle"].terminate()
             services.tick()
         assert services.attempts == 2 and services.vehicle_failed
+        failures = service_status_rows(manager)
+        assert [row["retries"] for row in failures] == [1, 2]
+        assert [row["service_epoch"] for row in failures] == [2, 3]
+        assert all(row["reason"] == "process_dead" for row in failures)
+        assert failures[-1]["detail"] == "vehicle_service_failed"
         now[0] += 1000
         for _ in range(30):
             services.prepare([camera("speed", False, True)])
@@ -261,11 +286,53 @@ def test_start_failure_is_bounded_for_vehicle_and_critical_for_fight():
     try:
         reconcile(services, manager, [camera("speed", False, True)])
         assert manager.runtimes["speed"].speed_failed
+        initial = service_status_rows(manager)[-1]
+        assert initial["component_failure"] == "vehicle_start_failed"
+        assert initial["exit_code"] is None and initial["retries"] == 0
         now[0] += 2
         services.tick()
         assert services.vehicle_failed and services.attempts == 1 and not services.bundles
+        replacement = service_status_rows(manager)[-1]
+        assert replacement["component_failure"] == "vehicle_replacement_start_failed"
+        assert replacement["exit_code"] is None and replacement["retries"] == 1
         with pytest.raises(SharedServiceStartError):
             services.prepare([camera("fight", True, False)])
+    finally:
+        close(services, manager)
+
+
+def test_vehicle_heartbeat_failure_keeps_cause_and_fight_isolation(monkeypatch):
+    services, manager, registry, now = fixture()
+    try:
+        reconcile(services, manager, [camera("both")])
+        fight = services.critical_processes()
+        classify = registry._worker_health
+        def health(component, *args):
+            return ("FAILED", "heartbeat_timeout") if component == "vehicle" else classify(component, *args)
+        monkeypatch.setattr(registry, "_worker_health", health)
+        services.tick()
+        failure = service_status_rows(manager)[-1]
+        assert failure["component"] == "vehicle" and failure["reason"] == "heartbeat_timeout"
+        assert failure["exit_code"] is None
+        assert services.retry_at == now[0] + 2 and services.attempts == 0
+        assert services.critical_processes() == fight
+        assert all(process.is_alive() for process, _ in fight.values())
+    finally:
+        close(services, manager)
+
+
+def test_fight_worker_failure_preserves_pre_teardown_identity():
+    services, manager, registry, now = fixture()
+    try:
+        reconcile(services, manager, [camera("fight", True, False)])
+        process = services.processes()["pose"]
+        process.alive, process.exitcode = False, 7
+        services.tick()
+        failure = service_status_rows(manager)[-1]
+        assert failure["component"] == "pose" and failure["exit_code"] == 7
+        assert failure["component_failure"] == "pose_process_dead"
+        assert failure["reason"] == "pose_process_dead"
+        assert failure["retries"] == 0 and failure["service_epoch"] == 1
     finally:
         close(services, manager)
 

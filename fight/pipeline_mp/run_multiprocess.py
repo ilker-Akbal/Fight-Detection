@@ -1164,6 +1164,8 @@ def _run_dynamic(config: dict) -> int:
                                     "stage": "health_watchdog",
                                     "detail": "health_snapshot_write_failed",
                                     "error": type(exc).__name__,
+                                    "errno": getattr(exc, "errno", None),
+                                    "winerror": getattr(exc, "winerror", None),
                                 },
                             )
                         health_snapshot_write_failed = True
@@ -1217,7 +1219,9 @@ def _run_dynamic(config: dict) -> int:
         stop_event.set()
         final_capacity = {stage: admission.snapshot() for stage, admission in services.admissions().items()
                           if hasattr(admission, "snapshot")} if exit_code in {0, 13} else {}
-        services.close()
+        # Normal close drains shared inference/final summaries while Reporter is
+        # still consuming. Failure/recovery teardown must not enter that grace.
+        services.close(graceful=exit_code == 0)
         try:
             incident_queue.put(None, timeout=1.0)
         except Exception:
@@ -1238,9 +1242,9 @@ def _run_dynamic(config: dict) -> int:
                 ),
                 timeout=1.0,
             )
-            report_queue.put(None, timeout=1.0)
         except Exception:
             pass
+        _put_sentinel(report_queue, reporter, timeout=5.0)
         _terminate_process(reporter, timeout=5.0)
 
         wall_processing_sec = max(0.0, time.perf_counter() - run_started_monotonic)
