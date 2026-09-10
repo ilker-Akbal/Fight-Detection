@@ -1,115 +1,146 @@
 # Fight-Detection Architecture Contract
 
-## Document ownership
+## Document ownership and maintenance discipline
 
-This file is the architecture contract for the repository.
+This file is the architecture contract for the repository. It describes the **current Supervisor-managed production architecture**, the guarantees inherited from earlier phases, the failure and durability boundaries, the measurement model, and the work that is intentionally deferred.
 
-**Maintenance rule:** coding agents (including Codex) must **read** this file before architecture-affecting work, but must **not edit it unless the project owner explicitly asks them to**. The project owner and ChatGPT maintain this document from the committed repository state.
+**Maintenance rule:** coding agents (including Codex) must **read this file before architecture-affecting work but must not edit it unless the project owner explicitly asks them to**. The project owner and ChatGPT maintain this document from committed repository state.
 
-Current reference commit:
+Architecture refreshes must not be performed as a narrow “append the latest commit” exercise. Before changing this file, the maintainer should:
+
+1. read the whole current `ARCHITECTURE.md`,
+2. inspect the current `master` implementation of the affected ownership paths,
+3. compare the new code commit to the previous architecture baseline,
+4. review earlier phase guarantees that the change depends on,
+5. inspect focused tests as executable architecture contracts,
+6. remove or correct stale statements instead of leaving contradictory history,
+7. verify task-router, failure-domain, observability, durability and deferred-work sections remain mutually consistent,
+8. distinguish measured facts from estimates or future production assumptions.
+
+The purpose is that a coding agent should be able to read this document from a fresh context and make architecture-compatible decisions without reconstructing the project from chat history.
+
+Current code reference commit:
 
 ```text
-c3c019b2871dcd3891b24ef242a2c5e93fe9212f
-feat: add resilient fight service recovery
+022d2fd5a3a6cef4ece0ac1b7434b9b9493512a0
+feat: add capacity benchmark harness
 ```
 
-Phase 15 is committed on `master` and is the current architecture baseline.
+**Phase 16 is committed on `master` and is the current architecture/measurement baseline.** Phase 16 adds offline measurement infrastructure only; it does not change the production runtime topology.
 
 ---
 
-# 1. Core architecture rules
+# 1. System purpose and current architectural direction
 
-The system is split into four ownership planes:
+The repository is evolving from a single-purpose fight detector into a centralized multi-camera security platform in which Fight Detection and Speed Detection share infrastructure while preserving their own camera-local temporal state.
+
+The production direction is:
+
+```text
+Django / application control plane
+    -> Runtime Supervisor
+        -> one global run_multiprocess parent
+            -> one CameraIngest source/decode owner per physical camera
+            -> capability-managed shared inference services
+            -> camera-local Fight/Speed temporal consumers
+            -> runtime-global incident production
+    -> durable incident outbox
+    -> Django Incident Dispatcher
+    -> common Incident / routing / authorization domain
+```
+
+The design is deliberately **not** “one complete AI pipeline per camera”. Expensive/stateless model inference is shared; state that has camera-specific temporal meaning remains camera-local.
+
+The target scale is large multi-camera deployment, but **no production camera count is asserted by this contract**. Capacity is now measured through the Phase-16 benchmark system and must be validated on the actual production hardware and live workload.
+
+---
+
+# 2. Non-negotiable architecture invariants
+
+These rules are binding unless a future explicitly-scoped phase changes them and this document is subsequently refreshed from committed code.
+
+1. Runtime workers must not import or depend on Django ORM.
+2. Django/Gunicorn is the control/application plane, not the owner of AI child processes.
+3. Runtime Supervisor owns the global AI runtime lifecycle in the production path.
+4. `run_multiprocess` owns the multiprocessing topology below the Supervisor.
+5. One physical camera has one intended `CameraIngest` source/decode owner in the Supervisor-managed production runtime.
+6. Fight and Speed on the same physical camera share that ingest; they are capabilities of one camera entry, not duplicate source owners.
+7. Expensive/stateless inference models are shared services, not model-per-camera instances.
+8. Fight temporal tracking/pair/ROI/event state and Speed tracking/calibration/speed state remain camera-local where correctness depends on history.
+9. Shared inference services are capability-aware and should run only while the desired camera set requires them.
+10. Dynamic desired-state/capability changes should not require a global runtime restart solely because capabilities changed.
+11. Camera work is protected by stable slot + generation identity. Speed adds a consumer epoch. Reincarnated shared services use service epochs where required.
+12. Old/stale work must fail closed; it must not become a current incident after camera/service reconfiguration.
+13. Live and file workloads intentionally have different backpressure/recovery semantics.
+14. Correctness must not depend on OS `Queue.qsize()` or `Queue.empty()` observations. Parent-owned scheduler counters/acknowledgements may be correctness inputs when their semantics are controlled.
+15. Queueing, telemetry, recovery retry and operational scans must remain bounded.
+16. Windows `spawn` compatibility is a first-class runtime constraint.
+17. Runtime incident truth crosses into Django through the durable incident outbox; runtime workers do not write Incident ORM rows.
+18. Fight and Speed share the same Django Incident/routing domain.
+19. Optional service absence is healthy when that service is not currently required.
+20. Benchmarks must never be confused with production capacity claims: synthetic camera-equivalents are not real inference, and one GPU’s measurements are not extrapolated into another GPU’s camera count.
+21. Benchmark code must not mutate production model thresholds, source ownership, queue semantics or recovery behavior merely to improve benchmark numbers.
+22. PostgreSQL, Docker, Nginx, deployment/service packaging and UI redesign are frozen/deferred unless explicitly promoted into a future phase.
+23. Shared-memory frame transport is deferred until measurement shows ordinary multiprocessing frame transport is a meaningful bottleneck.
+
+---
+
+# 3. Current top-level production flow
 
 ```text
 Django / Web / DB
-    = control + application plane
-
-Runtime Supervisor
-    = owner of the global AI runtime process
-
-run_multiprocess
-    = runtime parent/orchestrator
-
-CameraIngest
-    = single physical source/decode owner per camera in production runtime
-```
-
-Primary invariants:
-
-1. Runtime workers must not import Django ORM.
-2. Django/Gunicorn must not own AI child processes.
-3. Runtime Supervisor owns the global AI runtime lifecycle.
-4. One physical camera must have one `CameraIngest` source/decode owner in the Supervisor-managed production runtime.
-5. Expensive/stateless inference models are shared services, not one model per camera.
-6. Shared inference services are capability-aware: they run only while current desired cameras require them.
-7. Temporal/tracking/calibration state remains camera-local where correctness requires it.
-8. Camera work is identified by stable slot + generation; Speed adds a consumer epoch; shared-service reincarnation adds a service epoch.
-9. Fight recovery must fence pre-failure Stage3 publication before replacement transport can become current.
-10. Live and file sources intentionally use different backpressure/recovery semantics.
-11. Runtime incident truth crosses into Django through the durable incident outbox.
-12. `Incident(type=FIGHT)` and `Incident(type=SPEED)` use the same Django incident/routing domain.
-13. Queue `qsize()`/`empty()` observations must not be correctness dependencies.
-14. Windows `spawn` compatibility is a first-class constraint.
-15. Optional service absence is not a health failure when that service is not required.
-16. Recovery is bounded. A failed service must not create unbounded restart storms.
-
----
-
-# 2. Top-level runtime flow
-
-```text
-Django
   |
-  | desired camera state
+  | Camera desired state + control requests
   v
 CameraRegistryReconciler
   |
   v
-RuntimeSupervisor
+Runtime Supervisor
   |
   | desired_cameras.json
   | run_config.supervisor-<run_id>.json
   v
 fight.pipeline_mp.run_multiprocess
   |
-  +--> Reporter                         (runtime-global)
-  +--> Incident worker / aggregator    (runtime-global)
+  +--> Reporter                              runtime-global
+  +--> Incident worker / IncidentAggregator runtime-global
   |
-  +--> SharedServices                  (capability + recovery owner)
+  +--> SharedServices                        parent-owned capability lifecycle
   |      |
   |      +--> Fight bundle, only when required
-  |      |      +--> Person worker
+  |      |      +--> shared Person worker
   |      |      +--> Person result router
-  |      |      +--> Pose worker/router when runtime.use_pose
-  |      |      +--> Stage3/X3D worker when runtime.use_stage3
+  |      |      +--> shared Pose worker + router when enabled
+  |      |      +--> shared Stage3/X3D worker when enabled
   |      |
   |      +--> Vehicle bundle, only when required
-  |             +--> shared Vehicle worker
+  |             +--> shared Vehicle worker/model
   |
   +--> CameraRuntimeManager
          |
          +--> CameraIngest(camera N)
          |      |
-         |      +--> fight_queue   (optional)
-         |      +--> speed_queue   (optional)
-         |      +--> preview_queue
+         |      +--> Fight frame channel     optional
+         |      +--> Speed frame channel     optional
+         |      +--> Preview frame channel
          |
-         +--> camera_worker(camera N)   (Fight enabled only)
-         +--> speed_worker(camera N)    (Speed enabled only)
+         +--> camera_worker(camera N)        Fight capability only
+         +--> speed_worker(camera N)         Speed capability only
          +--> camera_preview(camera N)
 ```
 
 Fight incident path:
 
 ```text
-camera_worker
-  -> shared Person / Pose / Stage3
-  -> Fight service-epoch tagged Stage3 result
+CameraIngest
+  -> camera_worker
+  -> shared Person
+  -> camera-local person/pair/ROI/temporal logic
+  -> shared Pose when required by runtime/config/state
+  -> shared Stage3/X3D candidate inference
   -> Incident worker
-  -> IncidentAggregator publication fence
-  -> evidence
-  -> durable incident outbox
+  -> IncidentAggregator
+  -> evidence + durable outbox
   -> Django Incident Dispatcher
   -> Incident(type=FIGHT)
   -> routing / ACK / escalation / resolve
@@ -118,46 +149,56 @@ camera_worker
 Speed incident path:
 
 ```text
-speed_worker
+CameraIngest
+  -> speed_worker
+  -> camera-local motion/tracking/calibration state
   -> shared Vehicle inference
-  -> camera-local tracking / calibration / speed estimation
-  -> violation evidence
-  -> durable incident outbox
+  -> camera-local speed/violation decision
+  -> evidence + durable outbox
   -> Django Incident Dispatcher
   -> Incident(type=SPEED)
   -> routing / ACK / escalation / resolve
 ```
 
-No second incident database or dispatcher exists for Speed.
+There is no parallel Speed incident database or separate Speed dispatcher in the production design.
 
 ---
 
-# 3. Process ownership
+# 4. Ownership planes
 
-## Django owns
+## 4.1 Django / application plane owns
 
-- `Camera`, `SpeedCameraConfig`, locations and security assignments.
-- Incident DB rows.
-- Incident routing rules and user actions.
-- Desired camera publication.
-- Runtime start/stop requests through the Supervisor client.
-- ORM-aware operational cleanup and retention checks.
-- Browser-facing read-only consumption of runtime-produced previews.
+- `streams.Camera` and camera configuration persisted in the application domain,
+- `SpeedCameraConfig`,
+- physical `Location` hierarchy,
+- security units, coverage and user assignments,
+- Incident ORM rows and audit/routing state,
+- desired-camera publication,
+- start/stop requests through the Runtime Supervisor client,
+- operator-facing status/preview/action endpoints,
+- ORM-aware retention decisions and evidence-reference protection,
+- the independent Incident Dispatcher service loop.
 
-## Django must not own
+Django may **observe** runtime state and consume runtime-produced preview/evidence. It must not become a hidden second AI runtime owner.
 
-- Person/Pose/Stage3/Vehicle inference model processes.
-- Runtime camera worker processes.
-- Runtime camera source reconnect loops.
-- A second physical camera connection while the common runtime owns the camera.
+## 4.2 Django must not own
 
-## Runtime Supervisor owns
+- shared Person/Pose/Stage3/Vehicle model processes,
+- per-camera runtime worker processes,
+- production RTSP reconnect loops,
+- a second source connection while the common runtime owns the camera,
+- runtime-local temporal truth,
+- direct runtime Incident creation through ORM.
+
+## 4.3 Runtime Supervisor owns
+
+Primary implementation:
 
 ```text
 fight/runtime_supervisor/core.py::RuntimeSupervisor
 ```
 
-It owns exactly one `fight.pipeline_mp.run_multiprocess` parent in normal Supervisor mode.
+It owns exactly one common `fight.pipeline_mp.run_multiprocess` parent in normal Supervisor mode.
 
 Supervisor states:
 
@@ -170,38 +211,36 @@ FAILED
 BACKOFF
 ```
 
-Local Supervisor state lives under `.runtime_supervisor/` and is operational state, not repository source data.
+Supervisor state includes run/config identity, runtime PID, restart information, desired-camera metadata, disk state and health projection. Local Supervisor state under `.runtime_supervisor/` is operational data, not repository source.
 
-## Runtime parent owns
+## 4.4 Runtime parent owns
+
+Primary implementation:
 
 ```text
 fight/pipeline_mp/run_multiprocess.py
 ```
 
-It owns:
+The dynamic path owns:
 
-- multiprocessing context (`spawn`),
-- capability-aware shared inference services,
-- shared-service recovery,
-- shared-service result routers,
-- health queue/registry/watchdog,
-- fair scheduling queues,
+- `multiprocessing.get_context("spawn")`,
+- slot-generation and Speed-epoch shared arrays,
+- Fight publication floor,
+- Incident and Reporter workers,
+- `SharedServices`,
 - `CameraRuntimeManager`,
-- desired-state reconciliation,
+- capability/service reconciliation,
+- desired-state polling,
+- health registry/watchdog/snapshot,
+- fair admission queues,
 - file EOF/drain/finalization,
-- Reporter and Incident worker.
+- global exit semantics.
 
-Capability/recovery lifecycle is delegated to:
-
-```text
-fight/pipeline_mp/shared_services.py::SharedServices
-```
-
-Reporter and Incident remain runtime-global services outside the recoverable Fight/Vehicle bundles.
+The parent is orchestration/ownership authority; it does not move camera-specific temporal state into a shared global tracker.
 
 ---
 
-# 4. Desired camera state
+# 5. Desired camera state contract
 
 Primary files:
 
@@ -210,9 +249,9 @@ fight/runtime_supervisor/camera_state.py
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
 ```
 
-Schema version is currently `1`.
+Desired state schema is currently version `1`.
 
-Canonical desired camera fields:
+Canonical camera fields include:
 
 ```text
 camera_id
@@ -224,7 +263,7 @@ use_speed_detection
 speed_config
 ```
 
-A runtime camera is active when:
+A camera is active for the common runtime when:
 
 ```text
 enabled == true
@@ -232,7 +271,7 @@ AND
 (use_fight_detection == true OR use_speed_detection == true)
 ```
 
-Supported modes:
+Supported capability combinations:
 
 ```text
 Fight-only
@@ -241,17 +280,13 @@ Fight + Speed
 neither -> not started
 ```
 
-Desired state includes a monotonic `revision` and durable `speed_paused` intent.
+Desired state has a monotonic revision. Runtime applies newer revisions in the existing parent; stale/equal revisions must not create duplicate lifecycle work.
 
-The registry publishes a Speed branch only when all of these are true:
+`speed_paused` is durable desired intent. Stopping Speed is not equivalent to killing the common Fight runtime.
 
-```text
-Camera.is_active
-Camera.use_speed_detection
-SpeedCameraConfig.enabled
-```
+The registry publishes a Speed branch only when the application-side Speed conditions are satisfied, including active camera and enabled Speed configuration.
 
-Speed config published to runtime contains only bounded required fields:
+Speed runtime configuration sent through desired state is bounded to required fields such as:
 
 ```text
 speed_limit_kmh
@@ -264,119 +299,15 @@ save_clip
 calibration_revision
 ```
 
-The calibration revision is based on calibration-file metadata so a calibration update can reconfigure the affected camera.
+Calibration revision is used so calibration changes can trigger the necessary camera-local reconfiguration.
 
-Enabled cameras must have distinct source strings. If Fight and Speed operate on the same physical source, they must be represented by one camera entry with both flags enabled rather than duplicate camera records using the same source.
+Enabled camera entries must not claim the same physical source independently. If Fight and Speed use one physical camera, one desired camera entry carries both flags.
 
-Desired revisions are applied inside the existing runtime parent. Capability changes must not require a global runtime restart merely because Fight or Speed demand changed.
-
----
-
-# 5. Dynamic camera lifecycle
-
-Primary implementation:
-
-```text
-fight/pipeline_mp/camera_lifecycle.py::CameraRuntimeManager
-```
-
-Per-camera runtime state includes:
-
-```text
-camera
-slot_id
-generation
-stop_event
-fight_queue
-preview_queue
-speed_queue
-speed_stop
-speed_epoch
-speed_failed
-speed_service_waiting
-speed_restarts
-fight_service_waiting
-processes
-state
-file_done
-restart_count
-```
-
-Process composition depends on camera capability:
-
-```text
-Fight-only:
-  ingest + camera_worker + preview
-
-Speed-only:
-  ingest + speed_worker + preview
-
-Fight + Speed:
-  ingest + camera_worker + speed_worker + preview
-```
-
-Camera restart identity includes:
-
-```text
-source
-use_fight_detection
-use_speed_detection
-serialized speed_config
-```
-
-Therefore changing source, detection-mode flags, Speed calibration/config, etc. restarts only the affected camera runtime. Cosmetic changes should not require a restart.
-
-The manager does not create a Speed consumer while the shared Vehicle service is unavailable.
-
-During Fight bundle recovery, affected Fight-capable cameras are explicitly suspended. Their generations are invalidated before old readers/transports are torn down. Eligible live cameras are restarted locally after the replacement Fight bundle exists. Speed-only cameras are not involved. A mixed Fight+Speed camera is restarted locally as one camera runtime, so its Speed consumer may be briefly interrupted even though the shared Vehicle service itself is preserved.
-
-Unsafe camera/source withdrawal fails closed; recovery must not create a duplicate physical source owner.
+Current desired-state validation exposes `MAX_CAMERAS = 512`. **This is a schema/registry bound, not evidence that 512 real cameras can be processed by one machine.** Runtime slot provisioning and actual inference/decode capacity remain separate concerns and must be measured.
 
 ---
 
-# 6. Identity: slot, generation, consumer epoch and service epoch
-
-Camera identity is protected by:
-
-```text
-(camera_id, slot_id, generation)
-```
-
-Rules:
-
-- stable result slots are reserved in the parent before child spawn,
-- camera restart increments generation,
-- Fight recovery invalidates affected camera generations before transport replacement,
-- camera removal invalidates the slot before teardown,
-- delayed results from old generations are rejected,
-- health events are generation-aware,
-- per-slot scheduling counters reset for new generations.
-
-Speed adds:
-
-```text
-consumer_epoch
-```
-
-A Speed consumer stop/restart increments the slot's Speed epoch. Vehicle requests/results carry both camera generation and consumer epoch. Durable Speed publication is guarded by generation + consumer epoch before outbox append.
-
-Shared-service reincarnation adds:
-
-```text
-service_epoch
-```
-
-`SharedServices` wraps the single bounded health channel with the current service epoch. Old Fight- or Vehicle-service health events are rejected after replacement.
-
-Fight Stage3 results additionally carry their Fight service epoch into the Incident worker. This identity is used by the Fight incident publication fence so buffered results from a failed service incarnation cannot later publish as current incidents.
-
-Vehicle transport and Fight transport are replaced on recovery rather than reusing queues/locks from the failed incarnation.
-
-Do not replace this identity model with `multiprocessing.Manager`, mutable fork-only routing, queues sent through other queues, or PID-only correctness.
-
----
-
-# 7. CameraIngest and source ownership
+# 6. CameraIngest and physical source ownership
 
 Primary implementation:
 
@@ -384,133 +315,141 @@ Primary implementation:
 fight/pipeline_mp/camera_ingest.py
 ```
 
-Production topology:
+Production source topology:
 
 ```text
                      +--> Fight consumer
-Physical camera ---> CameraIngest
+Physical source ---> CameraIngest
                      +--> Speed consumer
                      +--> Preview
 ```
 
-`camera_worker` and `speed_worker` do not open the centralized source themselves. RTSP/live reconnect ownership belongs to `CameraIngest`.
+`camera_worker` and `speed_worker` must not independently reopen the centralized production source. RTSP/live reconnect ownership belongs to `CameraIngest`.
 
-## Django Speed stream ownership after Phase 14
+File and live publishing intentionally differ:
 
-Primary files:
+- file Fight delivery is ordered/bounded and waits/defer rather than silently discarding required work,
+- live freshness can supersede old work,
+- preview is a bounded latest-view concern,
+- live reconnect uses bounded/exponential behavior owned by ingest.
+
+## Django browser preview ownership
+
+Primary common-runtime preview files include:
 
 ```text
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/common_preview.py
 Fight_backend_project/backend_frontend_project/speed_detection/views.py
 ```
 
-`speed_camera_stream` no longer opens `camera.source` with `cv2.VideoCapture` in the common-runtime path. It serves the atomically replaced JPEG produced under the active runtime's `previews/` directory through `common_preview`.
+The Speed dashboard common-runtime stream consumes atomically replaced JPEG preview output from the active runtime. It does not open `camera.source` with a second `cv2.VideoCapture` while Supervisor/common-runtime ownership is active.
 
-The preview helper:
+The preview helper validates active-run ownership/path boundaries, pins the stream to the active run, bounds JPEG reads, and fails closed when runtime ownership disappears or changes.
 
-- validates the active run against `PIPELINE_OUTPUT_BASE`,
-- validates the per-camera preview path stays under the run preview root,
-- pins the stream to the active run token,
-- closes when runtime ownership changes/disappears,
-- bounds JPEG reads to 8 MiB,
-- never opens a physical camera source.
-
-Supervisor/common-runtime ownership therefore fails closed if preview ownership is unavailable.
-
-Speed calibration follows the same ownership rule while Supervisor/common runtime is active or ownership is uncertain. A direct source-open fallback may exist only in the explicit legacy/non-Supervisor path when runtime state is cleanly `STOPPED`; it is not part of the production Supervisor-managed ownership model.
+A direct-source calibration/legacy fallback is only acceptable in an explicitly non-Supervisor, cleanly stopped legacy path. It is not part of the production ownership model.
 
 ---
 
-# 8. Fight inference ownership
-
-## Person
-
-```text
-camera_worker[N]
-  -> fair per-slot admission
-  -> shared Person worker
-  -> Person result router
-  -> per-slot result channel
-  -> camera_worker[N]
-```
-
-One shared Person model, not one per camera.
-
-## Pose
-
-```text
-camera_worker[N]
-  -> ROI
-  -> fair per-slot admission
-  -> shared Pose worker
-  -> Pose result router
-  -> per-slot result channel
-  -> camera-local PoseGate/history
-```
-
-Pose temporal interpretation remains camera-local.
-
-## Stage3 / X3D
-
-```text
-camera_worker
-  -> Stage3 candidate
-  -> fair bounded Stage3 admission
-  -> shared Stage3/X3D worker
-  -> FightIncidentChannel(service_epoch)
-  -> Incident worker
-```
-
-IncidentAggregator must not instantiate a second local Person/Pose model.
-
-The Fight shared bundle is demand-started by `SharedServices` and, as of Phase 15, supports bounded in-runtime replacement after confirmed recoverable Fight worker death/stall. Recovery is bundle-wide rather than per-model because the bundle owns coupled request/result transport and generation-sensitive consumers.
-
----
-
-# 9. Speed inference ownership
+# 7. Dynamic camera lifecycle
 
 Primary implementation:
 
 ```text
-fight/pipeline_mp/speed_worker.py
+fight/pipeline_mp/camera_lifecycle.py::CameraRuntimeManager
 ```
 
-`speed_worker` owns camera-local state:
+Per-camera runtime state includes the desired camera definition plus stable slot/generation, process stop controls, Fight/Preview/Speed channels, Speed epoch/recovery state, Fight-service waiting state, lifecycle/file completion and restart counters.
 
-- ROI/calibration,
-- motion gate,
-- tracker,
-- speed estimator,
-- violation decider,
-- evidence buffer/writer.
-
-It does **not** own a YOLO model.
-
-Vehicle inference topology:
+Normal process composition:
 
 ```text
-speed_worker[N]
-  -> FairRequestQueue per stable slot
-  -> shared vehicle_service_main
-  -> one lazy VehicleDetector model
-  -> per-slot VehicleResult queue
-  -> speed_worker[N]
+Fight-only:
+  CameraIngest + camera_worker + preview
+
+Speed-only:
+  CameraIngest + speed_worker + preview
+
+Fight + Speed:
+  CameraIngest + camera_worker + speed_worker + preview
 ```
 
-The Vehicle detector is lazily instantiated on first useful inference request inside the shared Vehicle service. Vehicle result payloads do not return frame pixels through the result queue.
+A camera-local restart may be required by source changes, capability flags or serialized Speed configuration changes. Cosmetic metadata should not restart inference ownership unnecessarily.
 
-Vehicle inference/model errors are service failures, not negative detections.
+Stable slot reservation exists so result-channel identity does not depend on a process PID. Camera removal invalidates its generation before teardown; re-add/restart advances generation.
 
-Speed's old standalone multiprocess runner code still exists for compatibility/history, but normal Django Speed control uses the common Runtime Supervisor and does not own a second Speed runtime process.
+During shared-service recovery the manager can temporarily withdraw affected consumers instead of globally restarting all cameras.
+
+- Vehicle recovery withdraws affected Speed consumers while Fight/ingest/preview can remain intact where safe.
+- Fight-bundle recovery withdraws affected Fight camera runtimes before Fight transport replacement. For a mixed Fight+Speed camera this currently means a camera-local restart and therefore a brief local Speed interruption; Speed-only cameras remain untouched.
+
+This mixed-camera interruption is a known optimization opportunity, not a correctness failure.
 
 ---
 
-# 10. Capability-aware shared-service lifecycle
+# 8. Identity and stale-work fencing
+
+## 8.1 Camera identity
+
+The base identity is:
+
+```text
+(camera_id, slot_id, generation)
+```
+
+Rules:
+
+- slots are stable reservations owned by the parent,
+- restart/removal invalidates old generation,
+- delayed Person/Pose/etc. results from old generation are rejected,
+- camera health events are generation-aware,
+- scheduler state is scoped to the slot/generation semantics.
+
+## 8.2 Speed consumer epoch
+
+Speed adds:
+
+```text
+consumer_epoch
+```
+
+Stopping/replacing a Speed consumer increments the slot’s Speed epoch. Vehicle work carries camera generation + Speed consumer epoch. Durable Speed publication is guarded so a delayed old Speed result cannot create a current violation after restart/reconfiguration.
+
+## 8.3 Shared service epoch
+
+Reincarnated shared services add:
+
+```text
+service_epoch
+```
+
+`SharedServices` tags bounded health events with the service incarnation. Old service-health events are ignored after replacement.
+
+Vehicle recovery replaces its request/result transport instead of reusing queues/locks owned by a failed incarnation.
+
+Fight recovery likewise replaces the Fight bundle transport. Person/Pose result channels and admissions are recreated; camera generations are invalidated before withdrawal.
+
+## 8.4 Fight durable-publication fence
+
+Fight recovery has an additional publication fence:
+
+```text
+fight_publication_floor
+```
+
+Stage3 results carry `service_epoch` into the Incident worker/Aggregator path. On confirmed Fight-service failure, the parent raises the publication floor **before** touching the failed transport. Buffered segments/results from an older Fight service incarnation cannot later finalize into a durable current incident.
+
+The aggregator checks the publication floor both when accepting state and immediately around durable publication. This protects against invalidation during expensive evidence finalization.
+
+Do not replace this identity/fencing model with PID-only checks, fork-only mutable state, unbounded Manager objects, or queues passed through queues.
+
+---
+
+# 9. Shared inference services and capability lifecycle
 
 Primary implementation:
 
 ```text
-fight/pipeline_mp/shared_services.py
+fight/pipeline_mp/shared_services.py::SharedServices
 ```
 
 Required capabilities are derived from the current enabled desired camera set:
@@ -520,79 +459,156 @@ fight   = any active camera with use_fight_detection
 vehicle = any active camera with use_speed_detection
 ```
 
-Current service groups:
+Service groups:
 
 ```text
 Fight bundle:
   person
   person_router
-  pose + pose_router       when runtime.use_pose
-  stage3                   when runtime.use_stage3
+  pose + pose_router       if runtime.use_pose
+  stage3                   if runtime.use_stage3
 
 Vehicle bundle:
   vehicle
 ```
 
-Runtime-global Incident and Reporter services are outside these capability bundles.
+Runtime-global `incident` and `reporter` are outside these capability bundles.
 
-Behavior:
+Expected states:
 
 ```text
 Fight-only desired set
-  -> Fight bundle runs
-  -> Vehicle service is disabled / absent
+  -> Fight bundle running
+  -> Vehicle disabled/absent
 
 Speed-only desired set
-  -> Vehicle service runs
-  -> Fight inference bundle is disabled / absent
+  -> Vehicle running
+  -> Fight inference bundle disabled/absent
 
 Fight + Speed desired set
-  -> both required bundles run
+  -> both required bundles running
 ```
 
-Capability transitions occur inside the same runtime parent:
+Transitions happen inside the same runtime parent. First capability demand can hot-start its bundle; last demand removal can stop that bundle without restarting unrelated capabilities.
 
-- first Speed camera can hot-start Vehicle without global runtime restart,
-- last Speed removal can stop Vehicle without disturbing Fight,
-- first Fight camera can hot-start the Fight bundle while Speed remains active,
-- last Fight removal drains acknowledged Fight work before stopping the Fight bundle,
-- unrelated bundle processes are preserved across capability transitions.
-
-Unused service bundles stop after a bounded idle grace. Default:
+Unused bundles have a bounded idle grace. Current default:
 
 ```text
 SHARED_SERVICE_IDLE_GRACE_SEC=5
 ```
 
-Fight shutdown additionally waits for owned fair-admission state and JoinableQueue acknowledgements so accepted work is not abandoned merely because the final Fight camera disappeared.
+Fight shutdown additionally drains acknowledged/owned admission work before stopping so accepted ordered work is not abandoned merely because the last Fight camera disappeared.
 
-Capability lifecycle is a property of the Supervisor-managed dynamic path. Legacy/static runtime paths are not the production reference.
+Configured-off Pose/Stage3 components are expected absence, not health failure.
 
 ---
 
-# 11. Shared-service recovery and failure isolation
+# 10. Fight inference ownership
 
-## Vehicle recovery
-
-Vehicle is optional to Fight.
-
-On confirmed Vehicle death/stall/start failure:
+## Person
 
 ```text
-Vehicle failure
-  -> mark shared Vehicle unavailable
-  -> withdraw affected Speed consumers
-  -> increment Speed consumer epochs
-  -> stop/close failed Vehicle transport
-  -> replace Vehicle request/result transport
-  -> increment Vehicle service epoch
-  -> bounded exponential-backoff restart
-  -> resume eligible live Speed consumers after recovery
+camera_worker[N]
+  -> fair per-slot Person admission
+  -> one shared Person inference worker/model
+  -> Person result router
+  -> per-slot result channel
+  -> camera_worker[N]
 ```
 
-Fight camera ingest, Fight workers, previews and incident infrastructure continue.
+Person detection is shared across cameras; downstream identity/temporal interpretation remains camera-local.
 
-Default controls:
+## Pose
+
+```text
+camera_worker[N]
+  -> selected ROI/candidate
+  -> fair per-slot Pose admission
+  -> one shared Pose worker/model
+  -> Pose router
+  -> per-slot result channel
+  -> camera-local PoseGate/history
+```
+
+Pose temporal history is not globalized across cameras.
+
+## Stage3 / X3D
+
+```text
+camera_worker[N]
+  -> bounded Stage3 candidate admission
+  -> one shared Stage3/X3D worker
+  -> Incident worker
+  -> IncidentAggregator
+```
+
+IncidentAggregator must not instantiate a second local Person/Pose model. Shared Stage3 output is incarnation-tagged for Fight recovery publication fencing.
+
+The production Fight decision thresholds/model configuration are not changed by Phase 16 measurement code.
+
+---
+
+# 11. Speed inference ownership
+
+Primary runtime worker:
+
+```text
+fight/pipeline_mp/speed_worker.py
+```
+
+`speed_worker` owns camera-local state such as:
+
+- ROI and calibration,
+- motion gating,
+- tracker state,
+- speed estimator state,
+- violation decision/cooldown,
+- evidence buffer/writer.
+
+It does **not** own its own YOLO Vehicle model.
+
+Vehicle topology:
+
+```text
+speed_worker[N]
+  -> bounded/fair per-slot Vehicle admission
+  -> shared vehicle_service_main
+  -> one lazily created VehicleDetector/model
+  -> per-slot VehicleResult channel
+  -> speed_worker[N]
+```
+
+Vehicle result payloads do not send full frame pixels back through the result queue.
+
+Vehicle inference/model errors are service failures, not “no detections”.
+
+Normal Django Speed control uses the common Runtime Supervisor. Older standalone Speed multiprocess helpers may remain for compatibility/history but are not the production ownership reference.
+
+---
+
+# 12. Shared-service recovery and failure isolation
+
+## 12.1 Vehicle recovery
+
+Vehicle is optional to Fight and has bounded in-runtime recovery.
+
+Confirmed Vehicle failure sequence:
+
+```text
+failure detected
+  -> mark Vehicle unavailable
+  -> withdraw affected Speed consumers
+  -> invalidate Speed consumer epochs
+  -> stop/close failed Vehicle bundle
+  -> replace Vehicle request/result transport
+  -> increment Vehicle service epoch
+  -> bounded exponential-backoff replacement
+  -> resume eligible LIVE Speed consumers
+```
+
+Fight processing and runtime-global incident infrastructure remain available when possible.
+
+Defaults:
 
 ```text
 VEHICLE_SERVICE_RESTART_LIMIT=3
@@ -600,11 +616,13 @@ VEHICLE_SERVICE_RESTART_BACKOFF_SEC=2
 VEHICLE_SERVICE_RESTART_MAX_BACKOFF_SEC=30
 ```
 
-Exhaustion leaves Vehicle in a failed optional-service state and requires operator intervention; it must not force a Fight-wide runtime failure solely because Vehicle is unavailable.
+Replacement-start failures consume the bounded service retry budget. Recovery exhaustion leaves Vehicle failed/degraded and requires operator intervention; it must not create an unbounded restart storm or force an otherwise healthy Fight bundle down solely because Speed’s optional Vehicle service is exhausted.
 
-## Fight bundle recovery
+File Speed consumers are not replayed after partial shared-service failure. Clean completed file work stays completed; partial/failed work remains incomplete/fail-closed.
 
-Recoverable Fight components:
+## 12.2 Fight bundle recovery
+
+Recoverable shared Fight components are:
 
 ```text
 person
@@ -614,34 +632,26 @@ pose_router
 stage3
 ```
 
-Incident and Reporter are deliberately **not** part of this recoverable bundle.
+Confirmed failure of one required/running component recovers the **whole Fight inference bundle**, not just one process, because the transport graph and result ownership form one incarnation boundary.
 
-On confirmed recoverable Fight worker death/stall:
+Sequence:
 
 ```text
-Fight component failure
-  -> raise Fight publication floor before transport teardown
-  -> invalidate generations for affected Fight-capable cameras
-  -> mark affected cameras fight_service_waiting
-  -> stop affected camera runtimes/source owners
-  -> stop the old Fight bundle
-  -> close/replace Fight request/result transport
-  -> increment Fight service epoch
-  -> bounded exponential-backoff restart
-  -> recreate required Fight bundle
-  -> restart eligible LIVE Fight-capable cameras locally
+Fight shared failure
+  -> raise fight_publication_floor
+  -> invalidate affected camera generations
+  -> mark affected Fight cameras waiting/reconnecting
+  -> withdraw affected camera runtimes/readers
+  -> close old Fight queues/results/admissions
+  -> stop old Fight bundle
+  -> bounded backoff
+  -> create fresh Fight transport/bundle with new service_epoch
+  -> restart/resume eligible LIVE affected cameras
 ```
 
-The global `run_multiprocess` parent remains the same when recovery succeeds.
+Speed-only camera runtimes and the shared Vehicle process preserve identity through Fight recovery. A mixed Fight+Speed camera currently restarts locally as the safe ownership unit, so its local Speed consumer can be interrupted briefly.
 
-Unrelated domains are preserved:
-
-- Vehicle service process is not replaced because Fight failed.
-- Speed-only cameras remain untouched.
-- Incident and Reporter process identities remain unchanged.
-- A mixed Fight+Speed camera is locally restarted, so its Speed consumer may be briefly interrupted, but Vehicle itself remains alive.
-
-Default controls:
+Defaults:
 
 ```text
 FIGHT_SERVICE_RESTART_LIMIT=3
@@ -649,80 +659,50 @@ FIGHT_SERVICE_RESTART_BACKOFF_SEC=2
 FIGHT_SERVICE_RESTART_MAX_BACKOFF_SEC=30
 ```
 
-With defaults, replacement attempts occur after approximately 2 / 4 / 8 seconds. Replacement-start failures consume the same bounded runtime-lifetime retry budget.
+The retry budget is bounded over the runtime lifetime and includes replacement-start failures.
 
-Fight recovery exhaustion escalates to the existing runtime-level failure path. Unsafe teardown/withdrawal also fails closed rather than risking duplicate source ownership.
+Fight recovery is deliberately stricter for unsafe states:
 
-## Fight publication fence
+- a Fight file source affected by a shared Fight failure is `fight_file_incomplete` and is not replayed,
+- unsafe camera withdrawal/teardown is fatal rather than risking duplicate source owners,
+- recovery retry exhaustion is global fatal,
+- initial Fight bundle startup failure is global fatal,
+- Incident and Reporter are not part of Fight bundle hot recovery and retain runtime-global failure semantics.
 
-Primary implementation:
+## 12.3 Runtime-global failures
 
-```text
-fight/pipeline_mp/shared_services.py::FightIncidentChannel
-fight/pipeline/incident_aggregator.py
-fight/pipeline_mp/incident_worker.py
-```
-
-Every Stage3 result from the Fight bundle is tagged with that Fight service epoch. A shared `fight_publication_floor` is advanced **before** failed Fight transport is replaced.
-
-The IncidentAggregator checks that floor:
-
-- when accepting Stage3 results,
-- when deciding whether buffered incident state remains current,
-- immediately before durable outbox/legacy JSONL publication under the shared floor lock.
-
-Therefore Stage3 output buffered before or during a failed incarnation cannot create a current incident after recovery.
-
-## File-source recovery rules
-
-Speed:
-
-- partially failed Speed file processing is not replayed after Vehicle recovery.
-
-Fight:
-
-- if a recoverable Fight service fails while an affected Fight file source is active, the run fails closed with `fight_file_incomplete`,
-- the file is not automatically replayed from frame 0,
-- the old partial camera runtime is not presented as clean completion.
-
-## Live-source recovery rules
-
-- eligible live Speed consumers can resume after Vehicle recovery,
-- eligible live Fight-capable cameras are locally restarted on fresh Fight transport after Fight bundle recovery,
-- generation/service-epoch fences reject stale work from the failed incarnation.
+`incident` and `reporter` are runtime-global. `run_multiprocess` explicitly checks their process liveness. Their confirmed death remains a global runtime stop/failure boundary rather than being silently reconstructed as a Fight-only optional service.
 
 ---
 
-# 12. Speed Django bridge
+# 13. Speed Django bridge
 
-Primary file:
+Primary compatibility/control facade:
 
 ```text
 Fight_backend_project/backend_frontend_project/services/speed_bridge/speed_runner.py
 ```
 
-Normal behavior:
+Normal common-runtime behavior:
 
 ```text
 start_speed_pipeline
-  -> require common Supervisor mode
+  -> require/use Supervisor-managed common runtime
   -> clear speed_paused
   -> reconcile desired cameras
-  -> start/use common runtime
+  -> start or reuse common runtime
 
 stop_speed_pipeline
-  -> set speed_paused = true
-  -> disable Speed branches
-  -> Fight remains available
+  -> persist speed_paused=true
+  -> remove/disable Speed demand
+  -> Fight remains independently available
 ```
 
-`CommonRuntimeProcess` is a read-only compatibility facade over common runtime status. It does not own a Popen child.
-
-Status is reconstructed from Supervisor/runtime state rather than depending on the Django process that originally handled the start request.
+`CommonRuntimeProcess` is a read-only compatibility facade over common runtime status; it must not become a second `Popen` runtime owner.
 
 ---
 
-# 13. Fair scheduling and bounded capacity
+# 14. Fair scheduling and bounded capacity
 
 Primary implementation:
 
@@ -730,17 +710,17 @@ Primary implementation:
 fight/pipeline_mp/scheduling.py::FairRequestQueue
 ```
 
-Structure:
+Conceptual shape:
 
 ```text
-slot 0 -> bounded FIFO
-slot 1 -> bounded FIFO
-slot 2 -> bounded FIFO
+slot 0 -> bounded pending work
+slot 1 -> bounded pending work
+slot 2 -> bounded pending work
 ...
         -> round-robin shared consumer
 ```
 
-Current fair stages:
+Fair/shared stages currently include:
 
 ```text
 Person
@@ -749,9 +729,12 @@ Stage3
 Vehicle
 ```
 
-Counters:
+Capacity/accounting fields include:
 
 ```text
+capacity
+pending_per_camera
+outstanding
 accepted
 rejected_capacity
 deferred_file
@@ -759,17 +742,20 @@ dropped_live
 stale_generation
 dispatches
 high_water
+per-slot counters
 ```
 
-A hot camera cannot consume another slot's reserved pending capacity. Fight and Speed admission paths are separate so one consumer cannot permanently starve the other through one common FIFO.
+The scheduler prevents one hot camera from monopolizing another slot’s reserved pending capacity. Fight and Speed use separate stage admissions rather than one undifferentiated FIFO.
 
-Correctness must not depend on OS queue `qsize()`/`empty()` observations. Internal owned counters/acknowledgements may be used where the runtime owns their semantics.
+For live workloads, explicit shedding can be correct; for ordered files, capacity pressure should defer/wait without silently converting missing work into a negative detection.
+
+`qsize()`/`empty()` on OS queues are telemetry/convenience observations only unless the queue is a custom parent-owned structure with explicit owned semantics. Correctness should use owned counters/acks/generation state.
 
 ---
 
-# 14. Live vs file semantics
+# 15. Live vs file semantics
 
-## Live / RTSP
+## LIVE / RTSP
 
 Priority:
 
@@ -777,18 +763,18 @@ Priority:
 freshness > completeness
 ```
 
-Rules:
+Expected behavior:
 
 - bounded queues,
-- stale live frames/inference may be explicitly shed,
-- shed/stale outcomes are not interpreted as negative detections,
-- `CameraIngest` owns reconnect,
-- camera-local Speed consumer recovery is bounded,
-- shared Vehicle recovery may resume eligible live Speed consumers,
-- shared Fight recovery may locally restart eligible live Fight-capable camera runtimes,
-- mixed Fight+Speed cameras may briefly interrupt their Speed consumer during Fight camera-local restart.
+- stale live frame/inference work may be explicitly shed/replaced,
+- dropped/stale work is not interpreted as a clean negative detection,
+- CameraIngest owns reconnect,
+- camera-local retries are bounded,
+- eligible live Speed consumers can resume after Vehicle recovery,
+- eligible live Fight cameras can resume after Fight bundle recovery,
+- unrelated cameras/services should survive local/recoverable failures.
 
-## File
+## FILE
 
 Priority:
 
@@ -796,43 +782,44 @@ Priority:
 correctness + ordering > freshness
 ```
 
-Rules:
+Expected behavior:
 
-- ordered work waits/defer rather than silently dropping required work,
-- admitted Stage3 work drains before normal final completion,
-- Speed frame/EOF delivery drains before clean completion,
-- normal non-looping EOF is not failure,
-- failed Speed file processing is not replayed after local/shared recovery,
-- Fight service failure during affected file processing is fatal/incomplete rather than replayed,
-- a partial failed file run must not be reported as clean success.
+- ordered work waits/defer rather than silently dropping required inference,
+- admitted Stage3 work drains before final completion,
+- Speed file delivery/EOF drains before clean completion,
+- normal non-looping EOF is not a failure,
+- partially failed Speed files are not replayed and called clean,
+- a Fight file touched by shared Fight service failure is explicitly incomplete/fatal for that run,
+- timeout/deadline truncation in benchmark mode is `INCOMPLETE`, not successful throughput.
 
 ---
 
-# 15. Health architecture
+# 16. Health architecture
 
-Primary implementation:
+Primary files:
 
 ```text
 fight/pipeline_mp/health.py
 fight/pipeline_mp/shared_services.py
+fight/pipeline_mp/run_multiprocess.py
 fight/runtime_supervisor/core.py
 ```
 
-Topology:
+Flow:
 
 ```text
-child processes
+child workers
   -> one bounded HealthEvent queue
   -> runtime parent
   -> HealthRegistry
   -> RuntimeWatchdog
   -> atomic runtime_health.json
-  -> Supervisor /runtime/health
+  -> Supervisor /runtime/health projection
 ```
 
-Health uses monotonic clocks for liveness/stall decisions.
+Health/liveness decisions use monotonic time where appropriate.
 
-Camera components:
+Camera components include:
 
 ```text
 camera_ingest
@@ -841,9 +828,7 @@ camera_preview
 speed_worker
 ```
 
-Camera status also exposes `fight_service_waiting` while Fight recovery has withdrawn a camera pending replacement transport.
-
-Shared worker records:
+Shared health records include:
 
 ```text
 person
@@ -855,7 +840,9 @@ incident
 vehicle
 ```
 
-Capability/recovery-managed worker records expose:
+Reporter is runtime-global process-liveness critical but is not required to appear as a normal inference worker record in the health snapshot.
+
+Capability-managed worker metadata includes:
 
 ```text
 required
@@ -876,77 +863,20 @@ failed
 
 Semantics:
 
-- not required + disabled => `HEALTHY / service_disabled`,
-- required + recovering Fight/Vehicle service => runtime may be `DEGRADED`,
-- confirmed recoverable Fight component failure is converted to service recovery rather than immediately forcing runtime failure,
-- Fight recovery exhaustion => required Fight service `FAILED` and runtime-level failure,
-- Vehicle recovery exhaustion => optional Vehicle service failed/degraded without forcing Fight-wide failure,
-- configured-off Pose/Stage3 absence is expected rather than a failure,
-- queue pressure may degrade health but must not trigger restart storms,
-- disk pressure may degrade health but is not itself a restart reason.
+- `required=false + disabled` => healthy `service_disabled`,
+- required/restarting => degraded rather than falsely healthy,
+- a recoverable Fight service fault is surfaced as degraded while the parent-owned bundle recovery proceeds; exhaustion becomes fatal,
+- Vehicle recovery/exhaustion is isolated from Fight-wide critical failure as described above,
+- configured-off optional Pose/Stage3 absence is expected,
+- queue pressure can degrade health without causing uncontrolled restart storms,
+- disk pressure can degrade health but is not itself a reason to thrash the runtime,
+- stale service-epoch health events cannot overwrite the current incarnation.
 
-Health stores current state only; transition history remains bounded.
-
----
-
-# 16. Failure domains
-
-## Camera / ingest failure
-
-A confirmed camera-local failure can restart the affected camera generation through `CameraRuntimeManager`.
-
-## Preview failure
-
-Preview is non-critical and may restart independently.
-
-## Speed consumer failure
-
-A local Speed consumer failure:
-
-```text
--> marks Speed failed for that camera
--> invalidates its consumer epoch
--> leaves Fight/ingest generation intact
-```
-
-Live local recovery remains bounded. File failures are not silently replayed.
-
-## Recoverable Fight shared-worker failure
-
-Recoverable set:
-
-```text
-person
-person_router
-pose
-pose_router
-stage3
-```
-
-Confirmed death/stall now enters bounded in-runtime Fight bundle recovery.
-
-Global failure still occurs for:
-
-```text
-Fight recovery exhaustion
-unsafe Fight camera/source withdrawal
-Fight file-source service failure (fight_file_incomplete)
-initial Fight service startup failure
-Incident worker failure
-Reporter failure
-```
-
-Incident and Reporter deliberately retain their runtime-global critical semantics.
-
-## Vehicle shared-worker failure
-
-Vehicle is non-critical to Fight and has its own bounded in-runtime recovery lifecycle.
+Current health snapshots are state snapshots, not a complete historical monitoring database.
 
 ---
 
 # 17. Incident durability boundary
-
-Runtime incident output uses the existing durable outbox.
 
 Primary files:
 
@@ -957,25 +887,27 @@ fight/pipeline_mp/incident_worker.py
 fight/pipeline_mp/speed_worker.py
 ```
 
-Outbox semantics:
+Runtime produces evidence and durable incident envelopes before Django ingestion.
 
-- append-only JSONL,
+Core durability semantics:
+
+- append-only outbox JSONL,
 - serialized writers,
-- partial-tail preservation,
 - flush/fsync before legacy success publication,
-- explicit failure on persistence errors.
+- partial-tail preservation,
+- explicit failure on persistence errors,
+- evidence durability before durable incident publication,
+- stale generation/epoch guards before current event publication.
 
-Speed event publication creates a normal outbox envelope containing the common incident identity plus Speed metadata such as measured speed, limit/tolerance/threshold data, generation and consumer epoch.
+Fight adds the service-incarnation publication floor described earlier. Speed durable publication uses camera generation + Speed consumer epoch protection.
 
-Durable Speed publication is generation/epoch guarded so stale work cannot create a current incident after reconfiguration/restart.
-
-Fight incident publication additionally uses the Phase-15 Fight service-epoch publication fence. Buffered Stage3 state whose epoch is below the current publication floor is discarded and cannot append a durable incident after a failed Fight service incarnation.
+Runtime does not directly create Django ORM Incident rows.
 
 ---
 
-# 18. Django incident domain
+# 18. Django incident/application domain
 
-Primary models:
+Primary models include:
 
 ```text
 incidents.models.Incident
@@ -986,7 +918,7 @@ incidents.models.IncidentIngestCursor
 incidents.models.IncidentIngestRecord
 ```
 
-Incident types:
+Incident types include:
 
 ```text
 FIGHT
@@ -994,25 +926,26 @@ SPEED
 OTHER
 ```
 
-Runtime does not write ORM rows directly.
-
-Flow:
+Application flow:
 
 ```text
-durable outbox
+durable runtime outbox
   -> run_incident_dispatcher
   -> incidents.services.ingest
-  -> Incident
-  -> routing / escalation
+  -> Incident ORM row
+  -> location/security routing
+  -> ACK / resolve / escalation / audit
 ```
 
-Camera deletion is protected by Incident references.
+Dispatcher consumption is a separate application service responsibility from global AI runtime ownership.
+
+Camera/evidence deletion must respect Incident references and retention protections.
 
 ---
 
-# 19. Location / authorization
+# 19. Location and authorization model
 
-Primary models:
+Primary application entities:
 
 ```text
 adminx.Location
@@ -1022,28 +955,30 @@ adminx.UserSecurityAssignment
 streams.Camera
 ```
 
-Conceptual scope:
+Conceptual authorization path:
 
 ```text
 User
   -> SecurityUnit assignment
   -> SecurityUnitCoverage
-  -> Location tree
+  -> Location hierarchy
   -> Camera.location
   -> incident/preview/action visibility
 ```
 
-Fight and Speed use the same authorization/location model.
+Fight and Speed share the same physical authorization/location domain.
 
-Legacy `Camera.faculty` exists only as compatibility; physical authorization should use `Camera.location` when assigned.
+Legacy `Camera.faculty` may exist for compatibility, but physical authorization should use `Camera.location` where assigned.
+
+Organizational access decisions belong in the Django/application layer, not in model workers.
 
 ---
 
-# 20. Runtime durability / retention
+# 20. Runtime durability, retention and operational state
 
-Phase-12 durability remains part of the architecture contract.
+Phase-12 durability remains binding.
 
-Primary files:
+Primary areas include:
 
 ```text
 fight/operations.py
@@ -1053,244 +988,655 @@ incidents/services/retention.py
 fight/runtime_supervisor/core.py
 ```
 
-Important rules:
+Rules:
 
-- atomic Supervisor/desired-state writes,
+- Supervisor/desired state is written durably/atomically where designed,
 - outbox/evidence durability is explicit,
-- cleanup is bounded,
-- current/active/unknown/abnormal runs fail closed against cleanup,
+- cleanup scans are bounded,
+- current/active/unknown/abnormal runs fail closed against unsafe cleanup,
 - Incident-referenced evidence is protected,
-- evidence is retained indefinitely by default,
-- optional evidence cleanup requires consumed durable outbox and offline/exclusive maintenance conditions,
-- disk pressure degrades health but does not cause restart storms.
+- evidence retention is indefinite by default unless explicitly configured,
+- optional evidence deletion requires the intended durable/outbox safety conditions,
+- disk pressure is observable and can degrade health without causing restart storms,
+- singleton service loops/locks protect long-running operational jobs.
 
-Operational/runtime directories are not source files and must not be committed:
+Generated runtime/benchmark content is not source code and must not be casually committed.
+
+Known local operational paths include:
 
 ```text
 .runtime_supervisor/
 Fight_backend_project/backend_frontend_project/media/camera_uploads/
 Fight_backend_project/backend_frontend_project/media/pipeline_runs/.run_locks/
 Fight_backend_project/backend_frontend_project/media/runtime_spool/
+benchmarks/results/
+benchmarks/.capacity.lock
 ```
 
-`media/camera_uploads/` contains local uploaded/demo camera media and is operational content, not Phase source code.
+`benchmarks/results/` can contain copied/hard-linked media, isolated Supervisor state, runtime logs, effective configs, evidence and outbox data. Treat it as local measurement output, not repository source.
 
 ---
 
-# 21. Production runtime vs legacy paths
+# 21. Phase-16 capacity benchmark subsystem
 
-This contract applies to the **Supervisor-managed dynamic runtime**.
+Phase 16 introduces an **offline measurement subsystem**, not another production runtime.
 
-Legacy/static paths remain for compatibility/testing. Do not infer production ownership from a legacy helper merely because it still exists.
+Primary files:
+
+```text
+benchmarks/__main__.py
+benchmarks/control_plane.py
+benchmarks/real_inference.py
+benchmarks/telemetry.py
+benchmarks/README.md
+tests/test_capacity_benchmarks.py
+```
+
+The package is deliberately separated from production imports. `benchmarks/__init__.py` identifies it as offline capacity measurement.
+
+## 21.1 Measurement taxonomy
+
+There are two distinct benchmark classes and their results must never be merged conceptually:
+
+```text
+REAL INFERENCE
+  = real Supervisor/runtime
+  + real local file decode
+  + real shared models/workers
+  + real queue/recovery/health behavior
+
+CONTROL PLANE / SYNTHETIC
+  = real parent-side state/lifecycle/scheduling structures
+  + inert/fake process/transport execution
+  - no model inference
+  - no real decode
+```
+
+A result such as “300 camera-equivalents passed synthetic control-plane checks” **does not mean 300 cameras can be inferred in production**.
+
+## 21.2 CLI contract
+
+Entry point:
+
+```text
+python -m benchmarks --help
+```
 
 Examples:
 
-- legacy direct runtime control in `fight_runner.py`,
-- old standalone Speed config/command builder helpers in `speed_runner.py`,
-- static `run_multiprocess` path,
-- direct calibration source-open fallback only in explicit non-Supervisor/cleanly stopped legacy mode.
+```powershell
+python -m benchmarks control_plane --counts 50 100 200 300 --workload mixed --warmup-sec 1 --duration-sec 5 --seed 17
 
-The user-reachable Speed dashboard stream is no longer an active duplicate-source exception: in the production/common-runtime path it consumes common runtime preview ownership.
+python -m benchmarks real_inference --counts 1 2 --workload fight --config <effective-config.json> --source fight/sample_2.mp4 --warmup-sec 5 --duration-sec 180
+```
 
-Normal architecture work should improve the Supervisor-managed dynamic path without unnecessarily rewriting legacy code unless legacy behavior violates active production ownership or causes regression.
+Supported real workload labels:
+
+```text
+fight
+speed
+mixed
+```
+
+`mixed` enables both capabilities on each benchmark camera and therefore exercises the single CameraIngest fan-out model.
+
+Counts must be distinct positive integers within the existing registry validation bound. The harness has no smaller hardcoded “capacity ceiling”; operators increase real counts manually while preserving machine safety.
+
+The CLI exposes bounded warmup/measurement/sample controls, deterministic seed and optional NVIDIA device selection.
+
+## 21.3 Real-inference isolation
+
+Real mode uses the common `RuntimeSupervisor` and `run_multiprocess`; it does not implement a fake performance pipeline.
+
+Important isolation rules:
+
+- requires an existing local effective/production-like config,
+- preserves detection/model thresholds and queue/recovery semantics,
+- forces local benchmark output/state paths,
+- requires ordered non-looping local file behavior,
+- uses `auto_restart=False` for isolated benchmark Supervisor behavior,
+- refuses to run if another common runtime is already active,
+- uses a benchmark singleton lock to prevent duplicate benchmark harnesses,
+- routes benchmark incident output into an isolated benchmark outbox rather than Django dispatcher/Incident DB,
+- rejects remote/credential-bearing benchmark inputs,
+- does not automatically download missing model weights.
+
+When several logical benchmark cameras reuse one local media file, the harness creates distinct hardlinks with copy fallback so desired-state source uniqueness remains valid. This is an **ordered shared-content file benchmark technique**, not a claim that separate physical RTSP cameras behave identically.
+
+## 21.4 Synthetic/control-plane scope
+
+Control-plane mode exercises production parent-side structures including:
+
+```text
+DesiredCameraState validation
+CameraRuntimeManager
+slot/generation handling
+HealthRegistry / snapshot serialization
+FairRequestQueue for Person/Pose/Stage3/Vehicle
+capability transition/reconcile logic
+```
+
+It uses inert process objects/in-memory bounded transport rather than spawning hundreds of model workers.
+
+The scenario checks:
+
+- initial reconcile,
+- deterministic remove/re-add subset,
+- stable unique slots,
+- generation advancement,
+- stale request fencing,
+- unchanged-camera identity preservation,
+- capability transition scope,
+- idempotent reconcile,
+- health evaluation/snapshot serialization,
+- round-robin scheduler fairness,
+- full-slot rejection/capacity accounting,
+- bounded retained telemetry.
+
+Synthetic timings intentionally exclude real process spawn, CUDA/model inference, image decode, RTSP pacing/loss and multiprocessing frame-copy cost.
+
+## 21.5 Telemetry and output
+
+Real benchmark telemetry can collect:
+
+```text
+host CPU utilization
+runtime process-tree RSS
+harness RSS
+host RAM
+NVIDIA GPU utilization when available
+NVIDIA VRAM used/total
+camera decoded/consumed progress
+Fight/Speed drops/reconnect/final health
+Person/Pose/Stage3/Vehicle capacity counters
+existing bounded latency summaries
+```
+
+NVIDIA telemetry is optional and uses bounded `nvidia-smi` subprocess calls. Missing/failing GPU telemetry must become unavailable data, not crash the benchmark. Explicit device selection is supported; GPU utilization alone never proves which GPU/model path is the bottleneck.
+
+Sampling tails are bounded in memory. Current default maximum retained samples is `256`; streamed CSV can contain the observation sequence without keeping it all in RAM.
+
+Generated result directory contains, at minimum:
+
+```text
+benchmark_summary.json
+runs.jsonl
+system_samples.csv
+```
+
+Real runs additionally contain isolated Supervisor/runtime state, logs/config/report artifacts and source links/copies.
+
+Machine-readable summary keeps:
+
+```text
+real_inference: [...]
+control_plane: [...]
+```
+
+as separate arrays.
+
+Exported summaries redact sensitive path/URL/credential information and identify local files/models by hashes/metadata where possible. Local effective configs inside the full result directory can still contain local paths, so the entire directory must be reviewed before external sharing.
+
+## 21.6 Unavailable metrics are explicit
+
+Phase 16 deliberately does not fabricate metrics it cannot derive reliably. Current known unavailable/limited areas include:
+
+```text
+Vehicle latency summary when no existing production metric exists
+reliable end-to-end incident latency
+steady-window camera FPS
+Speed completed-frame count distinct from sequence/progress semantics
+some Person/Pose raw inference_ms distributions depending on existing instrumentation
+```
+
+Zero samples means unavailable/no samples; it must not be interpreted as zero latency.
+
+## 21.7 Classification contract
+
+Real benchmark classifications are measurement labels, not product guarantees:
+
+```text
+HEALTHY
+PRESSURED
+SATURATED
+INCOMPLETE
+```
+
+Current default concepts:
+
+- `INCOMPLETE`: deadline/nonzero exit/missing required reports or samples/failed required consumer/observed recovery/failed runtime health/no frames,
+- `SATURATED`: significant live shedding, or heavy rejection together with actual live shedding,
+- `PRESSURED`: lower live shedding, significant rejection attempts or sampled queue occupancy near configured capacity,
+- `HEALTHY`: completed without those observed pressure criteria.
+
+Default thresholds implemented by the harness include approximately:
+
+```text
+pressure live-drop ratio      0.01
+saturation live-drop ratio    0.10
+pressure rejection ratio      0.10
+saturation rejection ratio    0.50
+queue pressure ratio          0.90
+```
+
+Ordered file retries/defer counters must not be mistaken for dropped live frames. High GPU utilization alone cannot set `SATURATED`.
+
+Diagnostic hints such as `gpu_bound_candidate`, `cpu_bound_candidate`, `queue_pressure` and `unknown` are hypotheses based on evidence, not proven root-cause conclusions.
 
 ---
 
-# 22. Phase-13 guarantees retained
+# 22. Phase-16 measured baseline and interpretation
+
+## 22.1 Synthetic/control-plane acceptance
+
+The accepted Phase-16 synthetic mixed scenarios were run at:
+
+```text
+50
+100
+200
+300
+```
+
+Observed representative results from the implementation acceptance:
+
+```text
+cameras   initial reconcile   health/snapshot p95   approx RSS delta
+50        6.31 ms             3.21 ms               3.37 MiB
+100       20.71 ms            6.04 ms               4.06 MiB
+200       15.06 ms            11.13 ms              7.90 MiB
+300       20.35 ms            8.23 ms               12.05 MiB
+```
+
+All synthetic slot/generation/bounded-storage/scheduler-fairness checks passed in that run.
+
+These values show that the **parent-side synthetic structures did not expose an immediate 300-entry control-plane wall in that test**. They do not include decode, CUDA inference, OS multiprocessing frame copy, RTSP behavior or real 300-camera process load, so they are not a production capacity claim.
+
+## 22.2 RTX 3050 one-camera real Fight smoke
+
+A post-implementation accepted real Fight smoke ran successfully on the development GPU:
+
+```text
+GPU: NVIDIA GeForce RTX 3050 6GB Laptop GPU
+camera_count: 1
+workload: fight
+runtime_exit_code: 0
+runtime_health: HEALTHY
+classification: HEALTHY
+frames decoded: 903
+aggregate full-run effective FPS: ~14.76
+Person: 417 accepted / 417 dispatched / 417 results
+Pose: 311 accepted / 311 dispatched / 311 results
+Stage3: 6 accepted / 6 dispatched / 6 results
+live admission drop ratio: 0
+rejection-attempt ratio: 0
+observed queue ratio peak: 0.03125
+```
+
+Representative host/GPU observations for this smoke:
+
+```text
+CPU mean ~12.84%, p95 ~19.75%, max ~32.4%
+GPU utilization mean ~13.02%, p95 ~42.5%, max ~67%
+GPU VRAM mean ~487.9 MiB, p95/max ~640 MiB
+runtime process-tree RSS mean ~3.79 GB, max ~4.98 GB
+```
+
+Representative existing latency summaries:
+
+```text
+Person queue wait p95 ~1.52 ms
+Person round trip p95 ~28.80 ms
+Pose queue wait p95 ~1.29 ms
+Pose round trip p95 ~33.80 ms
+Stage3 queue wait p95 ~160.27 ms
+Stage3 inference p95 ~624.04 ms, max ~808.67 ms
+```
+
+The reported full-run FPS includes startup/drain/EOF semantics and is **not steady-state live FPS**. A per-camera internal processing-rate field can have different semantics and must not be compared as if it were the same denominator.
+
+This run was a harness acceptance smoke, not a saturation search. Low average GPU usage does not establish unused production capacity by itself because workload gating/stage demand, file pacing and model activation affect utilization.
+
+## 22.3 Two-camera real Fight smoke
+
+A second post-implementation smoke was run with two logical Fight cameras and completed:
+
+```text
+classification: HEALTHY
+```
+
+No detailed two-camera summary has been promoted into this architecture contract, so no specific two-camera FPS/latency/VRAM values should be invented or inferred here.
+
+## 22.4 Native OpenMP environment observation
+
+The first real smoke attempt failed with Intel OpenMP Error #15 (`libiomp5md.dll already initialized`) and was correctly classified `INCOMPLETE`. The harness did **not** set the unsafe `KMP_DUPLICATE_LIB_OK=TRUE` workaround.
+
+Environment diagnosis found two filesystem locations for `libiomp5md.dll` (environment and base Anaconda paths), with identical observed SHA-256 content. Ordinary imports and CUDA allocation succeeded. After starting from a clean conda activation (`CONDA_SHLVL=1`) and running through `conda run -n torch_gpu --no-capture-output`, one-camera and two-camera Fight smokes completed `HEALTHY`.
+
+**Root cause is not proven.** Do not encode “nested conda definitely caused the failure” as architecture truth. The reliable operational lesson from current evidence is to benchmark from a clean inference environment and not hide native runtime conflicts with unsafe OpenMP overrides.
+
+## 22.5 What Phase 16 does NOT prove
+
+It does not prove:
+
+- production capacity on an RTX 5090,
+- 200–300 simultaneous real RTSP cameras,
+- sustained live-stream steady-state FPS,
+- full mixed Fight+Speed production saturation behavior,
+- network/jitter/reconnect behavior at campus scale,
+- whether NumPy frame IPC is or is not the next real bottleneck,
+- multi-GPU scaling.
+
+The benchmark harness now makes those questions measurable; it does not answer them in advance.
+
+---
+
+# 23. Historical performance observability context
+
+Earlier performance work introduced bounded timing/status instrumentation and established a historical development-machine baseline before later architecture phases.
+
+A previously recorded dense-file RTX 3050 characterization produced approximate aggregate rates:
+
+```text
+1 camera  ~21.29 FPS
+2 cameras ~41.56 FPS
+4 cameras ~59.58 FPS
+8 cameras ~68.73 FPS
+```
+
+That older experiment suggested queue latency began becoming important around several dense cameras. **These numbers are historical context only.** Runtime architecture, test workload, instrumentation and later phases have changed, so they must not be treated as the current Phase-16 capacity baseline or compared blindly to the new ordered-file benchmark.
+
+The correct process now is to use the Phase-16 harness with comparable configs/media/hardware and preserve raw result metadata.
+
+Shared-memory transport remains deferred until current measurement demonstrates IPC/frame-copy pressure as a meaningful limiting factor.
+
+---
+
+# 24. Production runtime vs legacy paths
+
+This architecture contract describes the **Supervisor-managed dynamic runtime**.
+
+Legacy/static/compatibility code may remain, including old direct-control or standalone Speed helpers. Presence of legacy files does not make them the current ownership model.
+
+Likewise, repository deployment files such as Docker/Nginx-related artifacts may exist historically. Their presence does not mean deployment architecture is currently being redesigned or accepted as production scope.
+
+When inspecting a legacy helper, agents must ask whether that path is reachable in the Supervisor-managed production flow before using it to infer ownership.
+
+Normal architecture work should improve the current dynamic path without gratuitously rewriting stable legacy code, unless a legacy path violates active production ownership or creates a user-reachable correctness/security problem.
+
+---
+
+# 25. Phase 1–12 foundation ledger
+
+The current architecture depends on foundations built before shared Speed integration. These guarantees remain relevant even though the exact code has evolved.
+
+## Phase 1 — Shared Person inference
+
+Established one shared Person inference service/model rather than one detector per camera, with camera-local Motion/stabilization/tracking/pair/ROI/event/prebuffer state and explicit request identity.
+
+## Phase 2 — Shared Pose inference
+
+Moved Pose inference into a shared service/router while keeping Pose temporal interpretation camera-local. Later stabilization removed accidental secondary model ownership from incident aggregation.
+
+## Phase 3 — Performance observability
+
+Added bounded performance timing/queue/inference/delivery telemetry and machine-readable summaries. This was the first evidence-led basis for discussing scale and later informed fair scheduling and the decision to defer shared-memory optimization.
+
+## Phase 4 — Microbatching
+
+Added latency-bounded FIFO microbatch capability for shared inference stages while preserving conservative defaults (batching effectively off/size 1 unless configured).
+
+## Phase 5 — Centralized CameraIngest
+
+Established one source/decode owner feeding Fight and Preview, later extended to Speed. File ordered delivery and live latest-frame behavior became explicit architectural policies.
+
+## Phase 6 — Runtime Supervisor
+
+Moved global runtime ownership out of request-serving Django processes into a standalone authenticated local Supervisor with durable state, PID/config tracking and Windows-aware stop handling.
+
+## Phase 7 — Physical organization/access scope
+
+Added Location/SecurityUnit/Coverage/UserAssignment and `Camera.location`, providing a common physical authorization model for camera/incident visibility.
+
+## Phase 8 — Durable incident/routing boundary
+
+Established runtime evidence + durable outbox -> independent Django Incident Dispatcher -> common Incident/routing/ACK/resolve/escalation domain. Runtime remained ORM-free.
+
+## Stabilization after Phase 8
+
+Removed duplicate/local incident inference ownership, hardened browser/media behavior, bounded file/report scans, corrected dispatcher cursor/partial-tail semantics, and strengthened clean EOF behavior.
+
+## Phase 9 — Dynamic camera lifecycle
+
+Added desired-state revisions, stable result slots, camera generations and in-parent camera add/remove/restart reconciliation without global runtime restart for ordinary camera changes.
+
+## Phase 10 — Health/watchdog
+
+Added bounded child health events, parent HealthRegistry/Watchdog, camera/worker state classification and atomic runtime health snapshots.
+
+## Phase 11 — Fair scheduling/capacity
+
+Added per-slot bounded admission and round-robin fairness. Live shedding and file defer semantics became explicit. Scheduler/accounting was designed for hundreds of slots without giving one camera an unbounded shared FIFO advantage.
+
+## Phase 12 — Operational durability/retention
+
+Added bounded cleanup/retention protections, runtime/run locks, disk-pressure health, serialized/fsynced durable writes and resilient singleton service-loop behavior.
+
+These are not optional historical curiosities: later phases assume these ownership and durability boundaries.
+
+---
+
+# 26. Phase 13 — Shared Speed integration guarantees
+
+Code baseline:
+
+```text
+418f65bf137cfb31aa92629ac8fe1e03a0a1c54a
+feat: integrate speed detection into shared runtime
+```
 
 Phase 13 established:
 
 ```text
 Fight-only / Speed-only / Fight+Speed camera modes
-single CameraIngest fan-out for runtime consumers
+single CameraIngest fan-out for Fight/Speed/Preview
 shared Vehicle inference model/service
-camera-local Speed tracking/calibration state
+camera-local Speed motion/tracking/calibration/speed state
+bounded Vehicle admission
 Speed generation + consumer-epoch stale-work rejection
-bounded Speed admission
-live shedding vs ordered file behavior
-Speed consumer failure isolation from Fight
+file fail-closed / live recovery distinction
 Speed durable outbox -> Incident(type=SPEED)
-common Supervisor start/stop/status for Speed
-speed_paused desired-state intent
+common Runtime Supervisor control/status for Speed
+speed_paused desired intent
 ```
 
-Focused tests:
-
-```text
-tests/test_speed_integration.py
-Fight_backend_project/backend_frontend_project/incidents/phase13_tests.py
-```
-
-Phase-13 validation baseline:
+Reported validation baseline at that phase:
 
 ```text
 135 passed, 1 skipped
 ```
 
+Later phases supersede its lifecycle/recovery limitations but preserve its ownership model.
+
 ---
 
-# 23. Phase-14 guarantees retained
+# 27. Phase 14 — Capability-aware lifecycle and Vehicle recovery guarantees
+
+Code baseline:
+
+```text
+7b395ef94f04b435862ab013f9226b0982de34b6
+feat: add capability-aware shared service lifecycle
+```
 
 Phase 14 established:
 
 ```text
-capability-aware shared service lifecycle
+SharedServices as parent capability lifecycle owner
 Fight-only without Vehicle process
-Speed-only without unnecessary Fight inference workers
+Speed-only without unnecessary Fight inference services
 same-runtime hot start/stop of capability bundles
-bounded idle grace / Fight drain before shutdown
+bounded idle grace
+Fight drain before ordinary capability shutdown
 Vehicle crash/stall/start-failure recovery
 Vehicle transport replacement on recovery
 bounded exponential Vehicle retry/backoff
 Vehicle service epoch health isolation
-live Speed resume after Vehicle recovery
-file Speed no-replay rule after partial failure
+eligible live Speed resume after recovery
+file Speed no-replay after partial failure
 optional-service-aware health
-Speed dashboard common-preview ownership
+Speed dashboard common-preview source ownership
 Supervisor-mode fail-closed duplicate-source protection
 ```
 
-Primary implementation:
-
-```text
-fight/pipeline_mp/shared_services.py
-fight/pipeline_mp/run_multiprocess.py
-fight/pipeline_mp/camera_lifecycle.py
-fight/pipeline_mp/health.py
-fight/pipeline_mp/speed_worker.py
-Fight_backend_project/backend_frontend_project/services/pipeline_bridge/common_preview.py
-Fight_backend_project/backend_frontend_project/speed_detection/views.py
-fight/runtime_supervisor/core.py
-```
-
-Focused tests:
-
-```text
-tests/test_shared_services.py
-Fight_backend_project/backend_frontend_project/speed_detection/phase14_tests.py
-```
-
-Final automated validation:
+Reported validation baseline:
 
 ```text
 148 passed, 1 skipped
-compileall passed
-Django check passed
-migration check passed
-git diff --check passed
-UI/template/static directories unchanged
 ```
 
-Live acceptance verified Fight-only Vehicle-disabled startup, same-runtime first-Speed hot-add, and same-runtime last-Speed hot-remove.
+Live acceptance verified same-runtime capability transitions and Vehicle disabled/running behavior. Phase 15 later generalized recovery for the Fight inference bundle.
 
 ---
 
-# 24. Phase-15 guarantees now present on master
+# 28. Phase 15 — Resilient Fight service recovery guarantees
 
-Phase 15 added bounded in-runtime recovery for the recoverable Fight inference bundle.
-
-Primary guarantees:
+Code baseline:
 
 ```text
-Person / Person router / Pose / Pose router / Stage3 failures recover as one Fight bundle
-Fight transport is replaced, not reused
-camera generations are invalidated before failed transport replacement
-Fight service epochs reject stale shared-worker health
-old generation Person results are rejected
-pre-failure Stage3 publication is fenced before durable incident output
-LIVE Fight cameras resume through camera-local restart
-Speed-only cameras are preserved
-Vehicle process identity is preserved across Fight recovery
-Incident and Reporter process identities remain unchanged
-mixed Fight+Speed camera may briefly restart locally but Vehicle remains alive
-Fight file-source service failure is fail-closed / no replay
-replacement-start failures consume the bounded recovery budget
-recovery exhaustion escalates to runtime failure
-Windows spawn recreation is covered by deterministic tests
+c3c019b2871dcd3891b24ef242a2c5e93fe9212f
+feat: add resilient fight service recovery
 ```
 
-Default Fight recovery controls:
+Phase 15 established:
 
 ```text
-FIGHT_SERVICE_RESTART_LIMIT=3
-FIGHT_SERVICE_RESTART_BACKOFF_SEC=2
-FIGHT_SERVICE_RESTART_MAX_BACKOFF_SEC=30
+bounded in-runtime recovery for Person/Person-router/Pose/Pose-router/Stage3
+whole Fight bundle transport replacement
+camera generation invalidation before withdrawal
+Fight service epochs
+Stage3 -> Incident service_epoch propagation
+fight_publication_floor durable publication fence
+LIVE affected Fight camera resume after replacement
+FILE Fight fail-closed / no replay
+bounded retry/backoff and replacement-start accounting
+Fight exhaustion/unsafe teardown/global Incident-Reporter failures remain fatal
+Vehicle and Speed-only identity preserved across Fight recovery
 ```
 
-Primary implementation:
+Focused tests include component-parametrized failure/recovery, old transport/result rejection, service-health epoch rejection, retry/start-failure exhaustion, file fail-closed behavior, publication invalidation during evidence finalization and Windows `spawn` recreation.
 
-```text
-fight/pipeline_mp/shared_services.py
-fight/pipeline_mp/camera_lifecycle.py
-fight/pipeline_mp/run_multiprocess.py
-fight/pipeline_mp/health.py
-fight/pipeline_mp/messages.py
-fight/pipeline_mp/incident_worker.py
-fight/pipeline/incident_aggregator.py
-fight/runtime_supervisor/core.py
-Fight_backend_project/backend_frontend_project/services/pipeline_bridge/fight_runner.py
-```
-
-Focused tests:
-
-```text
-tests/test_fight_service_recovery.py
-tests/test_shared_services.py
-```
-
-Final automated validation reported:
+Reported validation baseline:
 
 ```text
 162 passed, 1 skipped
-compileall passed
-Django check passed
-migration check passed
-git diff --check passed
-ARCHITECTURE.md unchanged by Codex
-UI/template/static directories unchanged
 ```
 
-Live acceptance additionally verified:
-
-```text
-Fight-only startup
-  -> Fight bundle runs and processes real work
-  -> Vehicle remains HEALTHY / service_disabled
-  -> stable runtime health becomes HEALTHY
-
-Speed-only convergence
-  -> desired camera set converges to only the Speed camera
-  -> Fight bundle becomes HEALTHY / service_disabled after grace
-  -> Vehicle remains required/running and processes real work
-  -> runtime remains HEALTHY before normal file EOF shutdown
-```
-
-Manual random child-process killing was not required for acceptance because deterministic tests cover each recoverable Fight component, health-confirmed hangs, retry exhaustion, stale health/results, publication fencing, file fail-closed behavior, same-parent recovery and Windows-spawn recreation.
-
-Remaining Phase-15-specific debt:
-
-- production GPU/scale validation of recovery behavior,
-- reducing the brief Speed interruption on a mixed Fight+Speed camera during Fight bundle recovery if later justified.
+Live acceptance also confirmed Fight-only real inference health and Speed-only convergence with Fight bundle disabled after grace while Vehicle/Speed remained healthy.
 
 ---
 
-# 25. Task router
+# 29. Phase 16 — Capacity benchmark harness guarantees
 
-## Dynamic camera + capability lifecycle
+Code baseline:
 
 ```text
+022d2fd5a3a6cef4ece0ac1b7434b9b9493512a0
+feat: add capacity benchmark harness
+```
+
+Phase 16 changed only benchmark/test source files; production runtime code and `ARCHITECTURE.md` were intentionally unchanged in the code commit.
+
+Added source files:
+
+```text
+benchmarks/.gitignore
+benchmarks/README.md
+benchmarks/__init__.py
+benchmarks/__main__.py
+benchmarks/control_plane.py
+benchmarks/real_inference.py
+benchmarks/telemetry.py
+tests/test_capacity_benchmarks.py
+```
+
+Guarantees:
+
+```text
+real inference and synthetic control-plane results remain explicitly separate
+real mode reuses the actual Supervisor/runtime rather than a fake inference loop
+synthetic mode reuses real parent-side lifecycle/health/scheduler structures with inert processes
+bounded host/GPU telemetry
+optional nvidia-smi fallback
+result/source/config redaction and hashing
+isolated benchmark state/outbox/results
+no concurrent production runtime or duplicate benchmark harness
+HEALTHY/PRESSURED/SATURATED/INCOMPLETE classification
+classification does not use GPU utilization alone
+no production threshold/queue/recovery/source-ownership mutation
+no automatic stress sweep
+registry bound is not advertised as real capacity
+generated benchmark outputs are git-ignored
+```
+
+Focused tests cover:
+
+```text
+CLI/config validation
+distributions and bounded sampler
+missing/optional GPU telemetry
+real/synthetic output separation and redaction
+classification semantics
+real workload isolation/identity without threshold mutation
+300-camera-equivalent lifecycle/generation/fairness/capacity checks
+isolated Speed failure not being mislabeled as success
+```
+
+Reported automated validation after implementation:
+
+```text
+Phase-16 focused tests: 8 passed
+full pytest: 170 passed, 1 skipped
+compileall: passed
+Django check: passed
+makemigrations --check: passed
+git diff --check: passed
+UI/template/static: unchanged
+production tracked code outside benchmarks/tests: unchanged
+```
+
+Post-implementation manual acceptance then produced successful one-camera and two-camera real Fight smokes from a clean inference environment. These smokes validate the harness path; they do not establish production saturation limits.
+
+---
+
+# 30. Task router for future coding agents
+
+Use this section to avoid broad repository scans when a task has a clear ownership domain. Read this document first, then inspect the relevant current files before editing.
+
+## Runtime Supervisor / desired state
+
+```text
+fight/runtime_supervisor/core.py
+fight/runtime_supervisor/camera_state.py
+fight/runtime_supervisor/locking.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/fight_runner.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
+```
+
+## Dynamic camera lifecycle / capability ownership
+
+```text
+fight/pipeline_mp/run_multiprocess.py
 fight/pipeline_mp/camera_lifecycle.py
 fight/pipeline_mp/shared_services.py
 fight/pipeline_mp/generation.py
-fight/pipeline_mp/run_multiprocess.py
 fight/runtime_supervisor/camera_state.py
-Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
 tests/test_dynamic_camera_lifecycle.py
 tests/test_shared_services.py
 tests/test_fight_service_recovery.py
 ```
 
-## Fight inference / recovery
+## Fight inference
 
 ```text
 fight/pipeline_mp/camera_worker.py
@@ -1299,14 +1645,11 @@ fight/pipeline_mp/pose_worker.py
 fight/pipeline_mp/stage3_worker.py
 fight/pipeline_mp/shared_services.py
 fight/pipeline_mp/messages.py
-fight/pipeline_mp/incident_worker.py
-fight/pipeline/incident_aggregator.py
 fight/pipeline_mp/scheduling.py
-tests/test_fight_service_recovery.py
-tests/test_shared_services.py
+fight/pipeline/incident_aggregator.py
 ```
 
-## Speed integration / recovery
+## Speed integration / Vehicle recovery
 
 ```text
 fight/pipeline_mp/speed_worker.py
@@ -1315,7 +1658,6 @@ fight/pipeline_mp/camera_lifecycle.py
 fight/pipeline_mp/shared_services.py
 fight/pipeline_mp/run_multiprocess.py
 fight/pipeline_mp/health.py
-fight/runtime_supervisor/camera_state.py
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/common_preview.py
 Fight_backend_project/backend_frontend_project/services/speed_bridge/speed_runner.py
@@ -1324,10 +1666,19 @@ HizTespiti/speed/src/*
 HizTespiti/yolo/src/vehicle_detector.py
 tests/test_speed_integration.py
 tests/test_shared_services.py
-Fight_backend_project/backend_frontend_project/speed_detection/phase14_tests.py
 ```
 
-## Health/watchdog
+## Source ownership / preview
+
+```text
+fight/pipeline_mp/camera_ingest.py
+fight/pipeline_mp/camera_preview.py
+fight/pipeline_mp/camera_lifecycle.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/common_preview.py
+Fight_backend_project/backend_frontend_project/speed_detection/views.py
+```
+
+## Health / recovery
 
 ```text
 fight/pipeline_mp/health.py
@@ -1341,7 +1692,7 @@ tests/test_shared_services.py
 tests/test_fight_service_recovery.py
 ```
 
-## Backpressure/fairness
+## Fair scheduling / backpressure
 
 ```text
 fight/pipeline_mp/scheduling.py
@@ -1352,17 +1703,7 @@ fight/pipeline_mp/speed_worker.py
 tests/test_capacity_scheduling.py
 ```
 
-## Source ownership / preview
-
-```text
-fight/pipeline_mp/camera_ingest.py
-fight/pipeline_mp/camera_preview.py
-Fight_backend_project/backend_frontend_project/services/pipeline_bridge/common_preview.py
-Fight_backend_project/backend_frontend_project/speed_detection/views.py
-Fight_backend_project/backend_frontend_project/speed_detection/phase14_tests.py
-```
-
-## Incidents/durability
+## Incident durability / dispatcher
 
 ```text
 fight/pipeline/incident_outbox.py
@@ -1372,10 +1713,9 @@ fight/pipeline_mp/speed_worker.py
 incidents/services/ingest.py
 incidents/services/retention.py
 incidents/models.py
-tests/test_fight_service_recovery.py
 ```
 
-## Authorization/location
+## Location / authorization
 
 ```text
 adminx/models.py
@@ -1384,74 +1724,153 @@ services/access_scope.py
 incidents/models.py
 ```
 
----
-
-# 26. Cross-phase invariants checklist
-
-Before accepting architecture-affecting changes, verify all relevant items:
+## Operational durability / retention
 
 ```text
-[ ] one runtime source/decode owner per physical camera
-[ ] Django stream/calibration paths do not steal source ownership in Supervisor mode
-[ ] no runtime Django ORM imports
-[ ] Supervisor still owns global AI runtime lifecycle
-[ ] model sharing preserved; no model-per-camera regression
-[ ] shared services start only when current capabilities require them
-[ ] optional disabled services remain healthy
-[ ] camera slot/generation stale protection preserved
-[ ] Speed consumer epoch protection preserved
-[ ] Fight/Vehicle service-epoch isolation preserved
-[ ] Fight publication floor fences failed Stage3 incarnations
-[ ] Fight recovery invalidates generations before replacement transport
-[ ] Fight retry/backoff remains bounded; no restart storms
-[ ] Vehicle recovery does not unnecessarily kill Fight
-[ ] Vehicle retry/backoff remains bounded; no restart storms
-[ ] Incident/Reporter remain runtime-global unless explicitly redesigned
-[ ] failed/partial file Speed work is not replayed as clean success
-[ ] failed/partial file Fight work is not replayed as clean success
-[ ] live freshness / file ordering semantics preserved
-[ ] no qsize()-based correctness
-[ ] bounded queues / bounded telemetry
-[ ] Windows spawn compatibility
-[ ] durable outbox before Incident DB import
-[ ] Speed uses Incident(type=SPEED), not a parallel incident store
-[ ] retention/disk-pressure semantics preserved
-[ ] no UI/template/static redesign during backend-only phases
-[ ] PostgreSQL untouched unless explicitly in scope
-[ ] Docker/deployment/Nginx untouched unless explicitly in scope
+fight/operations.py
+fight/retention.py
+fight/service_loop.py
+fight/runtime_supervisor/core.py
+incidents/services/retention.py
+```
+
+## Capacity benchmark / scale characterization
+
+```text
+benchmarks/README.md
+benchmarks/__main__.py
+benchmarks/real_inference.py
+benchmarks/control_plane.py
+benchmarks/telemetry.py
+tests/test_capacity_benchmarks.py
+
+# Read with the production structures it exercises:
+fight/runtime_supervisor/camera_state.py
+fight/runtime_supervisor/core.py
+fight/pipeline_mp/run_multiprocess.py
+fight/pipeline_mp/camera_lifecycle.py
+fight/pipeline_mp/shared_services.py
+fight/pipeline_mp/scheduling.py
+fight/pipeline_mp/health.py
+```
+
+Do not modify production code merely because a benchmark metric is inconvenient. First determine whether the measurement is missing, the workload is unsuitable, or a true production bottleneck is demonstrated.
+
+---
+
+# 31. Cross-phase acceptance checklist
+
+Before accepting any architecture-affecting change, verify every relevant item rather than only the new feature’s happy path.
+
+```text
+[ ] ARCHITECTURE.md was read first and coding agent did not edit it
+[ ] current production ownership path was inspected, not inferred from legacy helpers
+[ ] one Runtime Supervisor still owns the global AI runtime
+[ ] one CameraIngest remains the intended source/decode owner per physical camera
+[ ] Fight+Speed on one source still use one camera entry/fan-out
+[ ] no runtime Django ORM dependency was introduced
+[ ] no model-per-camera regression was introduced
+[ ] camera-local temporal/calibration state stayed local where required
+[ ] shared services start only when desired capabilities require them
+[ ] ordinary capability transitions do not globally restart the runtime
+[ ] optional disabled services remain healthy/service_disabled
+[ ] stable slot/generation stale-result protection is preserved
+[ ] Speed consumer epoch protection is preserved
+[ ] shared-service epoch protection is preserved
+[ ] Fight publication floor still blocks old-incarnation durable incidents
+[ ] Fight recovery replaces the whole Fight transport/bundle safely
+[ ] Fight retry/backoff is bounded; no restart storm
+[ ] Vehicle recovery replaces Vehicle transport safely
+[ ] Vehicle retry/backoff is bounded and isolated from Fight
+[ ] unsafe teardown prefers fail-closed over duplicate source ownership
+[ ] file Fight/Speed partial failures are not replayed as clean success
+[ ] live freshness semantics remain distinct from ordered-file semantics
+[ ] fair per-slot scheduling/capacity remains bounded
+[ ] no correctness dependency on OS qsize()/empty()
+[ ] health events/snapshots remain bounded and epoch-aware
+[ ] Incident/Reporter runtime-global failure semantics remain explicit
+[ ] durable outbox remains the runtime->Django truth boundary
+[ ] Speed still creates Incident(type=SPEED) in the common incident domain
+[ ] location/security authorization remains application-layer
+[ ] retention/disk-pressure protections remain fail-safe/bounded
+[ ] Windows spawn compatibility is tested for multiprocessing changes
+[ ] benchmark and production result semantics are not mixed
+[ ] synthetic camera-equivalent counts are not called real capacity
+[ ] measurements from one GPU are not extrapolated into another GPU camera count
+[ ] benchmark code does not change production thresholds/queue/recovery behavior
+[ ] unavailable metrics remain unavailable rather than fabricated
+[ ] generated runtime/benchmark artifacts are not staged
+[ ] UI/template/static remains unchanged during backend-only phases
+[ ] PostgreSQL remains untouched unless explicitly promoted
+[ ] Docker/Nginx/deployment packaging remains untouched unless explicitly promoted
+[ ] shared-memory transport is introduced only after measurement justifies it
 ```
 
 ---
 
-# 27. Remaining debt / future backend work
+# 32. Current deferred work and frozen scope
 
-No next phase is fixed by this document. Promote one explicitly before implementation.
+Phase 16 supplies measurement infrastructure; it does **not** finish production-scale qualification.
 
-Current backend-focused remaining work:
+## Backend/runtime work still worth promoting deliberately
 
-- production-scale CPU/RAM/VRAM/latency/throughput characterization,
-- GPU stress/scale validation of mixed Fight + Speed workloads,
-- reusable capacity benchmark harness for 1/2/4/8/... real inference workloads,
-- control-plane/runtime scaling tests for large camera-slot counts independent of GPU model throughput,
-- shared-memory transport only if measurement proves NumPy IPC/copy is a bottleneck,
-- soak/chaos validation for long-running runtime behavior,
-- production GPU validation of Vehicle and Fight recovery,
-- possible reduction of mixed-camera Speed interruption during Fight recovery,
-- Fight model quality hardening on broader real-camera/hard-negative data,
-- Speed measurement accuracy validation and calibration robustness,
-- production storage sizing and cleanup-scan observability,
-- durable incident-history archival/compaction,
-- legacy/aborted-run operator tooling.
+- real inference scaling sweeps using the Phase-16 harness on comparable Fight-only, Speed-only and mixed workloads,
+- production-target GPU validation on the actual RTX 5090-class system rather than extrapolation from the RTX 3050,
+- sustained live/RTSP scale tests with realistic FPS/resolution/network behavior,
+- long soak tests covering camera churn, EOF/reconnect, capability changes and recovery,
+- deliberate chaos/failure tests on real spawned workers when safe worker identity/control is available,
+- measured analysis of CameraIngest decode cost and multiprocessing NumPy frame-copy/IPC cost,
+- shared-memory frame transport **only if** those measurements show it is justified,
+- mixed Fight+Speed recovery refinement to reduce the current camera-local Speed interruption during Fight bundle recovery if operationally valuable,
+- Fight decision-quality validation on a representative field dataset,
+- Speed accuracy/calibration validation on representative camera geometry/traffic,
+- incident duplicate/temporal semantics validation in realistic field sequences,
+- trend/long-horizon observability beyond current bounded health snapshots,
+- evidence/storage sizing and cleanup-scan observability,
+- operator tooling for abnormal/legacy/aborted runs,
+- multi-GPU partitioning only after single-node bottlenecks are measured.
 
-Explicitly deferred for later discussion; do **not** pull these into backend-hardening phases by default:
+## Explicitly frozen/deferred for now
+
+Do not absorb these into a backend phase by default:
 
 ```text
 PostgreSQL migration
-Docker
+Docker redesign
 Nginx/media offload
 production deployment/service packaging
-UI/UX redesign
-multi-GPU deployment topology
+frontend/dashboard redesign
+incident UX redesign
+preview/offline UX redesign
 ```
 
-The current priority is to make the backend/runtime excellent first. Deployment/database packaging decisions remain separate until explicitly promoted with their own acceptance criteria.
+Existing files related to these areas may remain in the repository. Their existence is not authorization to expand scope.
+
+---
+
+# 33. Capacity qualification strategy from this baseline
+
+The next capacity work should be evidence-driven.
+
+On the current development machine, increase real workload counts manually only while the machine remains safe and measurements remain interpretable. Use identical configs/media where comparative analysis requires it. Record:
+
+```text
+aggregate/full-run rate
+per-camera completion/progress
+Person/Pose/Stage3/Vehicle admission + latency
+CPU/RAM
+GPU utilization/VRAM
+queue occupancy/high-water/drop/rejection/defer
+runtime health/recovery
+```
+
+When production hardware becomes available, run the **same harness and comparable workload definitions** on that machine. The production question is not “how many times faster is a 5090 than a 3050?”; it is:
+
+```text
+At what camera/workload point does measured service quality become PRESSURED,
+SATURATED or INCOMPLETE, and which resource/queue/decode/IPC signal moves first?
+```
+
+If GPU/model inference saturates first, optimize/model-partition based on that evidence. If CPU/decode/IPC/serialization pressure appears first, target that subsystem. Shared-memory or multi-GPU work should follow measured causality rather than assumption.
+
+No camera-count claim belongs in this architecture contract until it is backed by a clearly described real workload, hardware, configuration and acceptance criterion.
