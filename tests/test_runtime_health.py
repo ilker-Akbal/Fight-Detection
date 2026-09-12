@@ -66,6 +66,10 @@ class FakeContext:
     Event = threading.Event
 
     @staticmethod
+    def Array(_type, size, lock=True):
+        return [0] * size
+
+    @staticmethod
     def Queue(maxsize=0):
         return queue.Queue(maxsize=maxsize)
 
@@ -359,8 +363,8 @@ class RuntimeHealthTests(unittest.TestCase):
         alive["A"]["preview"] = True
         alive["A"]["camera"] = False
         actions, _ = self.evaluate(alive, {"person": True})
-        self.assertEqual(actions[0]["action"], "restart_camera")
-        self.assertEqual(self.registry.cameras["A"]["health"], FAILED)
+        self.assertEqual(actions[0]["action"], "restart_fight")
+        self.assertEqual(self.registry.cameras["A"]["health"], DEGRADED)
         self.assertEqual(self.registry.runtime_health, DEGRADED)
 
     def test_preview_publish_stall_is_noncritical_even_with_fresh_heartbeat(self):
@@ -501,13 +505,13 @@ class RuntimeWatchdogTests(unittest.TestCase):
     def test_camera_restart_uses_manager_generation_and_cooldown(self):
         old = self.manager.runtimes["A"]
         old.file_eof_event.set()  # A marker cannot grant a live source an EOF exemption.
-        old.processes["camera"].alive = False
+        old.processes["ingest"].alive = False
         self.watchdog.tick(self.manager, {})
         restarted = self.manager.runtimes["A"]
         self.assertEqual(restarted.generation, old.generation + 1)
         self.assertEqual(len(self.processes), 6)
 
-        restarted.processes["camera"].alive = False
+        restarted.processes["ingest"].alive = False
         self.clock.advance(1)
         self.watchdog.tick(self.manager, {})
         self.assertIs(self.manager.runtimes["A"], restarted)
@@ -568,13 +572,13 @@ class RuntimeWatchdogTests(unittest.TestCase):
                 rows.append(self.watchdog.report_queue.get_nowait().row)
             self.assertFalse(any(row["detail"] == "camera_watchdog_restart_requested" for row in rows))
 
-    def test_unexpected_file_consumer_exits_still_restart(self):
+    def test_unexpected_file_consumer_exits_fail_closed_without_replay(self):
         with tempfile.TemporaryDirectory() as temp:
             source = Path(temp) / "clip.mp4"
             source.touch()
             for observer in ("manager", "watchdog"):
                 for eof, code, looping in ((False, 0, False), (False, 9, False),
-                                           (True, 9, False), (True, 0, True)):
+                                           (True, 9, False)):
                     with self.subTest(observer=observer, eof=eof, code=code, looping=looping):
                         self.manager.reconcile([])
                         self.manager.runtime_config["loop_file_sources"] = looping
@@ -589,12 +593,11 @@ class RuntimeWatchdogTests(unittest.TestCase):
                         else:
                             self.watchdog.tick(self.manager, {})
                         replacement = self.manager.runtimes["file"]
-                        self.assertIsNot(replacement, item)
+                        self.assertIs(replacement, item)
                         self.assertFalse(item.file_done)
-                        self.assertGreater(replacement.generation, item.generation)
-                        self.assertFalse(replacement.file_eof_event.is_set())
-                        item.file_eof_event.set()  # Late old-generation publication cannot leak.
-                        self.assertFalse(self.manager.file_eof_reached(replacement))
+                        self.assertTrue(item.fight_failed)
+                        item.file_eof_event.set()
+                        self.assertTrue(item.fight_failed)  # Late EOF cannot erase failure.
 
     def test_preview_restart_is_isolated_and_camera_removal_cleans_watchdog_state(self):
         runtime = self.manager.runtimes["A"]
@@ -621,10 +624,10 @@ class RuntimeWatchdogTests(unittest.TestCase):
             queue.Queue(),
             monotonic=self.clock,
         )
-        self.manager.runtimes["A"].processes["camera"].alive = False
+        self.manager.runtimes["A"].processes["ingest"].alive = False
         watchdog.tick(self.manager, {})
         restarted = self.manager.runtimes["A"]
-        restarted.processes["camera"].alive = False
+        restarted.processes["ingest"].alive = False
         self.clock.advance(1)
         watchdog.tick(self.manager, {})
         self.assertIs(self.manager.runtimes["A"], restarted)

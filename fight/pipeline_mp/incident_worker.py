@@ -132,6 +132,8 @@ def incident_process_main(
                         pose_score_max=msg.pose_score_max,
                         pose_score_mean=msg.pose_score_mean,
                         service_epoch=msg.service_epoch,
+                        slot_id=msg.slot_id,
+                        consumer_epoch=msg.consumer_epoch,
                     )
                 )
                 completed_count += 1

@@ -42,6 +42,7 @@ class CameraFrame:
     source_width: int = 0
     source_height: int = 0
     source_frame_count: int = 0
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -53,6 +54,7 @@ class CameraIngestSignal:
     captured_monotonic: float = field(default_factory=time.perf_counter)
     captured_wall_time: float = field(default_factory=time.time)
     error: str | None = None
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -72,6 +74,7 @@ class PersonInferenceRequest:
     slot_id: int = -1
     source_is_file: bool = True
     max_age_sec: float = 0.0
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -93,6 +96,7 @@ class PersonInferenceResult:
     worker_request_index: int = 0
     slot_id: int = -1
     outcome: str = "accepted"
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -112,6 +116,7 @@ class PoseInferenceRequest:
     slot_id: int = -1
     source_is_file: bool = True
     max_age_sec: float = 0.0
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -133,6 +138,7 @@ class PoseInferenceResult:
     worker_request_index: int = 0
     slot_id: int = -1
     outcome: str = "accepted"
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -152,6 +158,7 @@ class Stage3Job:
     created_monotonic: float = field(default_factory=time.perf_counter)
     generation: int = 0
     slot_id: int = -1
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -170,6 +177,7 @@ class Stage3ResultMessage:
     generation: int = 0
     slot_id: int = -1
     service_epoch: int = 0
+    consumer_epoch: int = 0
 
 
 @dataclass

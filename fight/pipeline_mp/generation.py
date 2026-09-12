@@ -16,7 +16,8 @@ def is_current_generation(message, slot_generations) -> bool:
     if slot_id < 0:
         return True
     current = current_slot_generation(slot_generations, slot_id)
-    return current is not None and int(getattr(message, "generation", -1)) == current
+    return (current is not None and int(getattr(message, "generation", -1)) == current
+            and (not hasattr(slot_generations, "allows") or slot_generations.allows(message)))
 
 
 def set_slot_generation(slot_generations, slot_id: int, generation: int) -> None:

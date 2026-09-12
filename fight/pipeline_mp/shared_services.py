@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from fight.pipeline_mp.common import is_file_source
 from fight.pipeline_mp.health import HealthPolicy, HealthRegistry
 from fight.pipeline_mp.scheduling import FairRequestQueue
+from fight.pipeline_mp.fight_identity import FightGenerations
 
 
 class SharedServiceStartError(RuntimeError):
@@ -32,6 +33,18 @@ class FightIncidentChannel:
 
     def put(self, result, *args, **kwargs):
         self.channel.put(replace(result, service_epoch=self.epoch), *args, **kwargs)
+
+
+@dataclass
+class ServiceReportChannel:
+    channel: object
+    epoch: int
+
+    def put(self, message, *args, **kwargs):
+        self.channel.put(replace(message, row={**message.row, "service_epoch": self.epoch}), *args, **kwargs)
+
+    def put_nowait(self, message):
+        self.put(message, block=False)
 
 
 def required_capabilities(cameras):
@@ -71,7 +84,7 @@ class SharedServices:
         self.retry_max = max(self.retry_base, float(self.runtime.get("vehicle_service_restart_max_backoff_sec", 30)))
         self.attempts, self.vehicle_epoch = 0, 0
         self.fight_epoch = 0
-        self.publication_floor = publication_floor if publication_floor is not None else self.ctx.Array("q", 1, lock=True)
+        self.publication_floor = publication_floor if publication_floor is not None else manager.fight_publication_floor
         self.fight_attempts = 0
         self.fight_retry_at = None
         self.fight_failed = False
@@ -109,9 +122,15 @@ class SharedServices:
         bundle["processes"][component] = self.start_process(component, target, args)
         self.registry.register_worker(component)
         self.registry.workers[component].update(required=True, service_state="starting",
-            service_epoch=self.vehicle_epoch if component == "vehicle" else self.fight_epoch)
+            service_epoch=self.vehicle_epoch if component == "vehicle" else self.fight_epoch,
+            pid=getattr(bundle["processes"][component], "pid", None))
+        self.manager._status("shared_service_started", component=component,
+            service_epoch=self.registry.workers[component]["service_epoch"],
+            pid=self.registry.workers[component]["pid"])
 
     def _start(self, kind):
+        if self.manager.stopping:
+            return
         bundle = {"processes": {}, "queues": [], "admissions": {}, "stop": self.ctx.Event()}
         self.bundles[kind] = bundle  # Cleanup also covers a partially failed spawn.
         if kind == "vehicle":
@@ -121,6 +140,8 @@ class SharedServices:
         bundle["health"] = ServiceHealthChannel(self.health_queue,
             self.vehicle_epoch if kind == "vehicle" else self.fight_epoch)
         manager, cfg, stop = self.manager, self.config, bundle["stop"]
+        reports = ServiceReportChannel(manager.report_queue,
+                                       self.vehicle_epoch if kind == "vehicle" else self.fight_epoch)
         generations, health = manager.slot_generations, bundle["health"]
         if kind == "vehicle":
             from fight.pipeline_mp.speed_worker import vehicle_service_main
@@ -128,34 +149,36 @@ class SharedServices:
             manager.vehicle_results = {slot: self._queue(bundle) for slot in range(self.slots)}
             self._spawn(bundle, "vehicle", vehicle_service_main, (cfg, manager.vehicle_requests,
                 manager.vehicle_results, stop, generations, manager.speed_epochs, health,
-                None, manager.report_queue, self.vehicle_epoch))
+                None, reports, self.vehicle_epoch))
             manager.speed_service_available = True
         else:
             from fight.pipeline_mp.person_worker import person_inference_process_main, person_result_router_main
             from fight.pipeline_mp.pose_worker import pose_inference_process_main, pose_result_router_main
             from fight.pipeline_mp.stage3_worker import stage3_process_main
+            generations = FightGenerations(generations, self.publication_floor)
             manager.person_request_queue = self._admission(bundle, "person", 1)
             person_results = self._queue(bundle, int(self.runtime.get("person_result_queue_size", self.slots)), True)
             manager.person_result_channels = {slot: self._queue(bundle, int(self.runtime.get("person_camera_result_queue_size", 2)))
                                               for slot in range(self.slots)}
             self._spawn(bundle, "person_router", person_result_router_main, (cfg, person_results,
-                manager.person_result_channels, manager.report_queue, stop, generations, health))
+                manager.person_result_channels, reports, stop, generations, health))
             self._spawn(bundle, "person", person_inference_process_main, (cfg, manager.person_request_queue,
-                person_results, manager.report_queue, stop, generations, health))
+                person_results, reports, stop, generations, health))
             if self.runtime.get("use_pose", True):
                 manager.pose_request_queue = self._admission(bundle, "pose", 1)
                 pose_results = self._queue(bundle, int(self.runtime.get("pose_result_queue_size", self.slots)), True)
                 manager.pose_result_channels = {slot: self._queue(bundle, int(self.runtime.get("pose_camera_result_queue_size", 2)))
                                                 for slot in range(self.slots)}
                 self._spawn(bundle, "pose_router", pose_result_router_main, (cfg, pose_results,
-                    manager.pose_result_channels, manager.report_queue, stop, generations, health))
+                    manager.pose_result_channels, reports, stop, generations, health))
                 self._spawn(bundle, "pose", pose_inference_process_main, (cfg, manager.pose_request_queue,
-                    pose_results, manager.report_queue, stop, generations, health))
+                    pose_results, reports, stop, generations, health))
             if self.runtime.get("use_stage3", True):
                 manager.stage3_queue = self._admission(bundle, "stage3", max(1, int(self.runtime.get("stage3_pending_per_camera", 1))))
                 self._spawn(bundle, "stage3", stage3_process_main, (cfg, manager.stage3_queue,
-                    FightIncidentChannel(self.incident_queue, self.fight_epoch), manager.report_queue, stop, generations, health))
+                    FightIncidentChannel(self.incident_queue, self.fight_epoch), reports, stop, generations, health))
             manager.fight_service_available = True
+            manager.fight_service_epoch = self.fight_epoch
 
     @staticmethod
     def _close(channel):
@@ -248,7 +271,7 @@ class SharedServices:
     def _withdraw_speed(self):
         self.manager.speed_service_available = False
         for item in self.manager.runtimes.values():
-            if item.speed_stop is not None and not item.file_done:
+            if item.camera["use_speed_detection"] and item.speed_stop is not None and not item.file_done:
                 process = item.processes.get("speed")
                 if (is_file_source(item.camera["source"]) and process is not None
                         and not process.is_alive() and process.exitcode == 0):
@@ -272,6 +295,8 @@ class SharedServices:
 
     def prepare(self, cameras):
         """Start dependencies BEFORE camera reconcile; stop only afterwards in tick."""
+        if self.manager.stopping:
+            return
         self.required = required_capabilities(cameras)
         for kind, required in self.required.items():
             if required:
@@ -315,6 +340,8 @@ class SharedServices:
         return self.draining.is_set()
 
     def tick(self):
+        if self.manager.stopping:
+            return
         if self.manager.health_queue is not None:
             self.registry.sync_cameras(self.manager.get_camera_status())
         self.registry.drain(self.health_queue, max(64, int(self.runtime.get("health_event_drain_limit", 2048))))
@@ -353,7 +380,7 @@ class SharedServices:
                 # Service recovery has its own bounded budget, independent of local
                 # consumer failures. Files are never resumed after partial failure.
                 for item in self.manager.runtimes.values():
-                    if item.speed_service_waiting and not item.file_done and not is_file_source(item.camera["source"]):
+                    if item.camera["use_speed_detection"] and item.speed_service_waiting and not item.file_done and not is_file_source(item.camera["source"]):
                         try:
                             self.manager._spawn_speed(item)
                         except Exception:

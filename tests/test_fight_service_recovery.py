@@ -8,6 +8,7 @@ import pytest
 
 from fight.pipeline.incident_aggregator import IncidentAggregator, Stage3Result
 from fight.pipeline_mp.generation import is_current_generation
+from fight.pipeline_mp.fight_identity import FightGenerations
 from fight.pipeline_mp.health import HealthEmitter, HealthPolicy
 from fight.pipeline_mp.messages import PersonInferenceResult, Stage3ResultMessage
 from fight.pipeline_mp.person_worker import route_person_result
@@ -27,14 +28,19 @@ def test_fight_component_death_replaces_bundle_and_preserves_speed(component):
         speed = manager.runtimes["speed"]
         old = manager.runtimes["both"]
         old_generation, slot = old.generation, old.slot_id
-        old_request = request(slot, generation=old_generation)
+        old_epoch = old.fight_epoch
+        identities = {cid: dict(item.processes) for cid, item in manager.runtimes.items()}
+        speed_epoch = old.speed_epoch
+        old.processes["speed"].state_marker = {"track": 123, "cooldown": 456}
+        old_request = replace(request(slot, generation=old_generation), consumer_epoch=old_epoch)
+        guard = FightGenerations(manager.slot_generations, manager.fight_publication_floor)
         old_channels = manager.person_result_channels
         old_admission = manager.person_request_queue
         old_health = services.bundles["fight"]["health"]
         originals[component].terminate()
         services.tick()
         assert manager.runtimes["both"].fight_service_waiting
-        assert not is_current_generation(old_request, manager.slot_generations)
+        assert not is_current_generation(old_request, guard)
         assert manager.runtimes["speed"] is speed
         assert services.processes() == {"vehicle": originals["vehicle"]}
         registry.sync_cameras(manager.get_camera_status())
@@ -46,7 +52,16 @@ def test_fight_component_death_replaces_bundle_and_preserves_speed(component):
         now[0] += 2
         services.tick()
         current = manager.runtimes["both"]
-        assert current.slot_id == slot and current.generation > old_generation
+        assert current is old and current.slot_id == slot and current.generation == old_generation
+        assert current.fight_epoch > old_epoch and current.speed_epoch == speed_epoch
+        for cid, before in identities.items():
+            for name, process in before.items():
+                if name != "camera":
+                    assert manager.runtimes[cid].processes[name] is process and process.is_alive()
+                else:
+                    assert manager.runtimes[cid].processes[name] is not process and not process.is_alive()
+        assert current.processes["speed"].state_marker == {"track": 123, "cooldown": 456}
+        assert not current.speed_failed
         assert not current.fight_service_waiting
         assert services.processes()["vehicle"] is originals["vehicle"]
         assert manager.runtimes["speed"] is speed
@@ -55,9 +70,9 @@ def test_fight_component_death_replaces_bundle_and_preserves_speed(component):
         HealthEmitter(old_health, component="person", component_type="shared_worker").emit("inference_completed", force=True, progress=999)
         services.tick()
         assert registry.workers["person"]["progress"] == 0
-        stale = SimpleNamespace(slot_id=slot, generation=old_generation, camera_id="both")
+        stale = SimpleNamespace(slot_id=slot, generation=old_generation, camera_id="both", consumer_epoch=old_epoch)
         routed, reason = route_person_result(stale, manager.person_result_channels,
-            timeout_sec=.1, slot_generations=manager.slot_generations)
+            timeout_sec=.1, slot_generations=guard)
         assert not routed and reason == "stale_generation"
         assert registry.snapshot("run")["workers"]["person"]["restart_count"] == 1
     finally:
@@ -114,7 +129,8 @@ def test_file_fight_failure_is_fatal_without_replay(tmp_path):
         now[0] += 100
         services.tick()
         assert manager.runtimes["file"] is old and not old.file_done
-        assert not old.processes and not any(process.is_alive() for process in processes)
+        assert old.fight_failed and "camera" not in old.processes
+        assert all(old.processes[name].is_alive() for name in ("ingest", "preview"))
         registry.evaluate(HealthPolicy())
         assert registry.runtime_health == "FAILED" and services.fight_attempts == 0
     finally:
@@ -122,31 +138,34 @@ def test_file_fight_failure_is_fatal_without_replay(tmp_path):
 
 
 @pytest.mark.parametrize("invalidate_during_encode", [False, True])
-def test_buffered_incident_from_failed_incarnation_cannot_publish(tmp_path, monkeypatch, invalidate_during_encode):
-    floor = mp.get_context("spawn").Array("q", [0])
+@pytest.mark.parametrize("boundary", ["service", "consumer"])
+def test_buffered_incident_from_failed_incarnation_cannot_publish(tmp_path, monkeypatch, invalidate_during_encode, boundary):
+    floor = mp.get_context("spawn").Array("q", [0, 0])
+    floor_index = 0 if boundary == "service" else 1
     agg = IncidentAggregator(str(tmp_path / "incidents"), run_id="test", publication_floor=floor,
         stale_finalize_sec=999, sweep_interval_sec=999)
     part = tmp_path / "part.mp4"
     part.write_bytes(b"fixture")
-    result = Stage3Result("cam", "0", "event", 10, 12, str(part), .99, "fight", .9, .9, service_epoch=1)
+    result = Stage3Result("cam", "0", "event", 10, 12, str(part), .99, "fight", .9, .9,
+                          service_epoch=1, consumer_epoch=1, slot_id=0)
     def encode(parts, output):
         output.write_bytes(b"fixture")
         if invalidate_during_encode:
             with floor.get_lock():
-                floor[0] = 2
+                floor[floor_index] = 2
         return True
     monkeypatch.setattr(agg, "_concat_mp4s", encode)
     monkeypatch.setattr(agg, "_add_ai_overlay_to_clip", lambda *_: True)
     try:
         agg.submit(result)
         if not invalidate_during_encode:
-            floor[0] = 2
+            floor[floor_index] = 2
         agg.finalize("cam", force=True)
         assert not agg.outbox_path.exists() and not agg.incidents_jsonl.exists()
         agg.submit(result)
         assert "cam" not in agg.by_camera
         monkeypatch.setattr(agg, "_concat_mp4s", lambda _, output: bool(output.write_bytes(b"fixture")))
-        agg.submit(replace(result, service_epoch=2, event_id="current"))
+        agg.submit(replace(result, service_epoch=2, consumer_epoch=2, event_id="current"))
         agg.finalize("cam", force=True)
         assert agg.outbox_path.is_file() and agg.incidents_jsonl.is_file()
     finally:
@@ -163,7 +182,7 @@ def fake_person(config, requests, results, report, stop, generations, health):
             if is_current_generation(item, generations):
                 results.put(PersonInferenceResult(camera_id=item.camera_id, generation=item.generation,
                     request_id=item.request_id, frame_idx=item.frame_idx,
-                    detections=[], slot_id=item.slot_id), timeout=1)
+                    detections=[], slot_id=item.slot_id, consumer_epoch=item.consumer_epoch), timeout=1)
         finally:
             requests.task_done()
 
@@ -185,7 +204,8 @@ def test_recreated_fight_transport_works_under_windows_spawn():
         reconcile(services, manager, [camera("fight", True, False)])
         for incarnation in (1, 2):
             item = manager.runtimes["fight"]
-            manager.person_request_queue.put(request(item.slot_id, generation=item.generation), timeout=1)
+            manager.person_request_queue.put(replace(request(item.slot_id, generation=item.generation),
+                                                    consumer_epoch=item.fight_epoch), timeout=1)
             result = manager.person_result_channels[item.slot_id].get(timeout=10)
             assert result.generation == item.generation
             if incarnation == 1:

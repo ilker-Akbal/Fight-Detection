@@ -302,3 +302,65 @@ This is successful real Windows runtime validation consistent with targeted
 sharing-error regression tests, not a guarantee that permission/disk failures
 cannot recur. The earlier incomplete `phase19-mixed8-baseline` is excluded from
 the performance comparison.
+
+## Live Fight recovery qualification (Phase 20/21)
+
+Shared Fight failure now withdraws only Fight consumers. The parent fences the
+failed service's durable publication first, pauses Fight fan-out, fences failed
+consumer incarnations, stops those consumers, and replaces the Fight bundle on
+its existing bounded backoff. Eligible LIVE consumers then attach to current
+transport. Ingest, Preview, mixed-camera Speed state, Vehicle, camera generation
+and Speed epoch remain unchanged. Camera-local Fight failure uses the existing
+`watchdog_camera_restart_limit` (default 3) and
+`watchdog_camera_restart_cooldown_sec` (default 120), independently of shared
+service retry accounting. Exhaustion leaves Fight failed/degraded, not Speed.
+An unsafe consumer/frame-transport withdrawal fails closed rather than creating
+a duplicate reader/source. FILE failures stay incomplete/no-replay; authoritative
+EOF and clean exits still govern successful drain.
+
+Both branch queues are allocated once per source and gated independently; a
+disabled branch is not offered frames. Fight epochs are parent-owned per slot,
+carried through requests/results, frames, health and reports. Failed-consumer
+publication floors also protect buffered Incident segments. Healthy ordinary
+withdrawal does not invalidate admitted incident work and retains Phase-19
+bounded shared-worker finalization. New Fight evidence IDs include generation
+and consumer incarnation. Summary client timings retain the latest incarnation
+per camera, and worker summaries the latest service epoch; these are not pooled
+pre/post-recovery populations. Benchmark classification is unchanged.
+
+Automated spawn tests use generated frames and stub detectors. They qualify
+process/transport ownership and state survival, **not real RTSP/network behavior**.
+Use the following manual procedure on an isolated development runtime with a
+real live source and its existing valid Speed calibration (never production
+credentials in scripts or committed configs):
+
+1. Start one mixed Fight+Speed camera through the existing Supervisor workflow,
+   with batching OFF, health enabled and a new run/output directory. Do not run
+   the ordered-file benchmark as a substitute for this test.
+2. In that run's `camera_status.jsonl`, record `camera_started.pids` and the
+   `shared_service_started` rows (component, PID, service epoch). Record camera
+   generation, `fight.epoch`, `speed.epoch`, progress and reconnect count from
+   `runtime_health.json`. Confirm exactly one ingest child for this camera.
+3. Wait until Person is idle (completed work, no outstanding admission). Verify
+   its latest `shared_service_started` PID still belongs to this isolated
+   runtime. Use the OS development process tool to terminate **only that Person
+   child** (on Windows, `Stop-Process -Id <verified-Person-PID> -Force`). Never
+   terminate a PID copied from an old run or the Supervisor/runtime parent.
+4. Check `fight_service_restarting` retains the concrete cause/exit code and
+   `fight_consumer_suspended`/`fight_consumer_resumed` carry generation, consumer
+   epoch, service epoch and PIDs. Only Fight child/service identities change.
+   Ingest, Speed, Preview and Vehicle PIDs must stay stable; Speed progress must
+   increase throughout, without `speed_consumer_failed`. Verify Fight progress
+   resumes, with no second source owner and no generation/Speed-epoch advance.
+5. Temporarily interrupt just the test source/network. Observe ingest-owned
+   `source_offline`/`reconnecting`, bounded backoff, and no competing Fight or
+   Vehicle replacement merely because frames stopped. Restore the source;
+   verify frame, Fight and Speed progress return. A genuinely blocked capture
+   may require source-level watchdog recovery; record that separately.
+6. Remove Fight capability while retaining Speed, then re-enable Fight through
+   the existing desired-camera registry. Repeat during Fight recovery backoff.
+   Confirm no source/Speed/Preview restart or removed-camera resurrection. A
+   source change is different: it must create a new camera generation.
+7. Stop through Supervisor during a recovery backoff. Confirm no replacement
+   starts after stop, no reopened source, and no child left running. Preserve
+   logs as qualification evidence; do not overwrite older result directories.

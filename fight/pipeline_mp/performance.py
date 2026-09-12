@@ -142,7 +142,7 @@ def make_timing_collectors(runtime: dict, names: Iterable[str]) -> dict[str, Bou
 
 def _last_summary(rows: list[dict], stage: str) -> dict:
     matches = [row for row in rows if row.get("stage") == stage and row.get("detail") == "summary"]
-    return dict(matches[-1]) if matches else {}
+    return dict(max(enumerate(matches), key=lambda entry: (entry[1].get("service_epoch", 0), entry[0]))[1]) if matches else {}
 
 
 def _merge_client_samples(
@@ -189,6 +189,15 @@ def build_performance_summary(
         for row in status_rows
         if row.get("stage") == "camera_summary" and row.get("detail") == "completed"
     ]
+    # A replacement Fight consumer starts a new timing population. Retain the
+    # newest incarnation per source instead of pooling old and resumed samples.
+    latest_camera = {}
+    for row in camera_rows:
+        cid = row.get("camera_id")
+        identity = lambda value: (value.get("generation", 0), value.get("consumer_epoch", 0))
+        if cid not in latest_camera or identity(row) >= identity(latest_camera[cid]):
+            latest_camera[cid] = row
+    camera_rows = list(latest_camera.values())
     person_worker = _last_summary(status_rows, "person_inference")
     pose_worker = _last_summary(status_rows, "pose_inference")
     stage3_worker = _last_summary(status_rows, "stage3")

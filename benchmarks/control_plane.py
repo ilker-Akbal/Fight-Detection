@@ -104,10 +104,18 @@ def run_control(count, *, seed=17, max_samples=256, workload="mixed", duration=1
         transitioned[0]["use_speed_detection"] = not cameras[0]["use_speed_detection"]
         transitioned[0]["use_fight_detection"] = True
         first = manager.runtimes[cameras[0]["camera_id"]]
+        first_generation = first.generation
+        first_processes = dict(first.processes)
         peer_objects = {cid: item for cid, item in manager.runtimes.items() if cid != first.camera_id}
         measure("capability_transition_ms", lambda: manager.reconcile(transitioned, revision=4))
         replacement = manager.runtimes[first.camera_id]
-        transition_safe = (replacement.slot_id == first.slot_id and replacement.generation > first.generation
+        transition_safe = (replacement is first and replacement.generation == first_generation
+                           and all(replacement.processes[name] is first_processes[name]
+                                   for name in ("ingest", "preview"))
+                           and ("camera" not in first_processes or
+                                replacement.processes["camera"] is first_processes["camera"])
+                           and ("speed" in replacement.processes) == transitioned[0]["use_speed_detection"]
+                           and ("speed" not in first_processes or not first_processes["speed"].is_alive())
                            and all(manager.runtimes[cid] is item for cid, item in peer_objects.items()))
         registry = HealthRegistry(monotonic=lambda: 100, transition_limit=max_samples, max_cameras=count)
         registry.sync_cameras(manager.get_camera_status())
@@ -117,7 +125,9 @@ def run_control(count, *, seed=17, max_samples=256, workload="mixed", duration=1
         for item in manager.runtimes.values():
             for component in ("camera_ingest", "camera_worker", "speed_worker"):
                 registry.handle(HealthEvent(component, "camera", "frame_progress", 100,
-                    camera_id=item.camera_id, slot_id=item.slot_id, generation=item.generation, progress=1))
+                    camera_id=item.camera_id, slot_id=item.slot_id, generation=item.generation, progress=1,
+                    consumer_epoch=item.fight_epoch if component == "camera_worker" else
+                                   item.speed_epoch if component == "speed_worker" else 0))
         measurements = deque(maxlen=max_samples)
         cycles = 0
         # Positive sleep keeps long synthetic measurements from becoming a busy loop.

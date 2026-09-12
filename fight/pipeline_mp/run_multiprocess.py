@@ -964,7 +964,7 @@ def _run_dynamic(config: dict) -> int:
     health_queue = ctx.Queue(maxsize=max(64, int(runtime.get("health_queue_size", 4096)))) if health_enabled else None
     slot_generations = ctx.Array("q", slot_count, lock=True)
     speed_epochs = ctx.Array("q", slot_count, lock=True)
-    fight_publication_floor = ctx.Array("q", 1, lock=True)
+    fight_publication_floor = ctx.Array("q", slot_count + 1, lock=True)
     config["cameras"] = initial_cameras
     write_json(output_dir / "run_config.effective.json", config)
 
@@ -996,6 +996,8 @@ def _run_dynamic(config: dict) -> int:
         terminate_process=_terminate_process,
         close_queue=_close_queue,
         speed_epochs=speed_epochs,
+        fight_publication_floor=fight_publication_floor,
+        global_stop=stop_event,
     )
     desired_path = str(runtime.get("desired_camera_state_path") or "").strip()
     desired_store = DesiredCameraStateStore(desired_path) if desired_path else None
@@ -1023,6 +1025,7 @@ def _run_dynamic(config: dict) -> int:
         )
         snapshot_store = HealthSnapshotStore(health_snapshot_path)
     from fight.pipeline_mp.shared_services import SharedServices, SharedServiceStartError
+    from fight.pipeline_mp.camera_lifecycle import CameraLifecycleError
     services = SharedServices(manager, incident_queue, _start_process, _terminate_process, health_registry,
                               publication_floor=fight_publication_floor)
     watchdog_interval = max(0.25, float(runtime.get("health_watchdog_interval_sec", 1.0)))
@@ -1095,7 +1098,7 @@ def _run_dynamic(config: dict) -> int:
                             "detail": "desired_state_invalid_ignored",
                         },
                     )
-                except SharedServiceStartError:
+                except (SharedServiceStartError, CameraLifecycleError):
                     raise
                 except Exception as exc:
                     _put_status(
@@ -1186,7 +1189,7 @@ def _run_dynamic(config: dict) -> int:
                     time.sleep(poll_interval)
                     continue
                 graceful_file_finish = True
-                if any(item.speed_failed for item in manager.runtimes.values()):
+                if any(item.speed_failed or item.fight_failed for item in manager.runtimes.values()):
                     exit_code = 13
                     graceful_file_finish = False
                 _put_status(
@@ -1208,7 +1211,7 @@ def _run_dynamic(config: dict) -> int:
                 stop_event.set()
                 break
             time.sleep(poll_interval)
-    except SharedServiceStartError:
+    except (SharedServiceStartError, CameraLifecycleError):
         exit_code = 10
         stop_event.set()
     except KeyboardInterrupt:

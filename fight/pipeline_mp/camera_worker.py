@@ -200,6 +200,7 @@ class CameraProcessRunner:
         self.report_queue = report_queue
         self.stop_event = stop_event
         self.generation = int(generation)
+        self.consumer_epoch = int(getattr(person_request_queue, "epoch", 0))
         self.slot_id = int(slot_id)
         self.started_monotonic = time.perf_counter()
         self.frame_queue = frame_queue
@@ -581,6 +582,8 @@ class CameraProcessRunner:
         self.counters["events_opened"] += 1
         self.event_counter += 1
         event_id = f"{self.camera_id}_{self.event_counter:06d}"
+        if getattr(self, "consumer_epoch", 0):
+            event_id = f"{self.camera_id}_g{self.generation}_f{self.consumer_epoch}_{self.event_counter:06d}"
 
         prebuffer_frames = int(self.runtime.get("prebuffer_frames", 24))
         raw_seed_frames = list(seed_frames or [])

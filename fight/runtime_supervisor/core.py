@@ -694,6 +694,7 @@ class RuntimeSupervisor:
             camera_fields = {
                 "fight_service_waiting",
                 "speed",
+                "fight",
                 "capacity",
                 "generation",
                 "slot_id",

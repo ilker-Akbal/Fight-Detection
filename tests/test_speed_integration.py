@@ -163,7 +163,8 @@ def test_camera_modes_reconfigure_and_consumer_failure_are_isolated(tmp_path):
     manager.reconcile(cameras)
     assert not guard()
     assert manager.runtimes["both"].slot_id == original_slot
-    assert manager.runtimes["both"].generation == original_generation + 1
+    assert manager.runtimes["both"].generation == original_generation
+    assert both.processes["ingest"] is original["ingest"] and both.processes["camera"] is original["camera"]
     manager.stop_all()
 
 

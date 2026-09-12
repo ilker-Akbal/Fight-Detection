@@ -3,6 +3,8 @@ from __future__ import annotations
 import queue
 import json
 import time
+import threading
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -13,6 +15,7 @@ from fight.pipeline_mp.common import is_file_source, now_str, redact_source
 from fight.pipeline_mp.generation import set_slot_generation
 from fight.pipeline_mp.messages import ReportMessage
 from fight.pipeline_mp.speed_worker import speed_process_main, SpeedProcessor
+from fight.pipeline_mp.fight_identity import FightChannel
 
 
 STARTING = "STARTING"
@@ -21,6 +24,10 @@ RECONNECTING = "RECONNECTING"
 STOPPING = "STOPPING"
 STOPPED = "STOPPED"
 FAILED = "FAILED"
+
+
+class CameraLifecycleError(RuntimeError):
+    """Unsafe withdrawal: do not attach a second consumer to suspect transport."""
 
 
 def runtime_camera(camera: dict) -> dict:
@@ -56,6 +63,13 @@ class CameraRuntime:
     file_done: bool = False
     file_eof_event: Any = None
     fight_service_waiting: bool = False
+    fight_pause: Any = None
+    fight_stop: Any = None
+    fight_epoch: int = 0
+    fight_failed: bool = False
+    fight_failure_reason: str = ""
+    fight_restarts: int = 0
+    fight_last_restart: float = -1e30
     last_restart_at: float = 0.0
     restart_count: int = 0
     speed_queue: Any = None
@@ -90,6 +104,8 @@ class CameraRuntimeManager:
         vehicle_requests=None,
         vehicle_results=None,
         speed_epochs=None,
+        fight_publication_floor=None,
+        global_stop=None,
         process_factory: Callable | None = None,
         terminate_process: Callable | None = None,
         close_queue: Callable | None = None,
@@ -108,7 +124,13 @@ class CameraRuntimeManager:
         self.health_queue = health_queue
         self.vehicle_requests = vehicle_requests
         self.vehicle_results = vehicle_results or {}
-        self.speed_epochs = speed_epochs
+        self.speed_epochs = speed_epochs if speed_epochs is not None else ctx.Array("q", len(slot_generations), lock=True)
+        self.fight_epochs = ctx.Array("q", len(slot_generations), lock=True)
+        self.fight_publication_floor = (fight_publication_floor if fight_publication_floor is not None
+                                        else ctx.Array("q", len(slot_generations) + 1, lock=True))
+        self.global_stop = global_stop
+        self._stopping = False
+        self.fight_service_epoch = 0
         self.speed_service_available = True
         self.fight_service_available = True
         self.process_factory = process_factory or self._default_process_factory
@@ -123,6 +145,10 @@ class CameraRuntimeManager:
         self._restart_backoff = max(
             0.0, float(self.runtime_config.get("camera_restart_backoff_sec", 3.0))
         )
+
+    @property
+    def stopping(self):
+        return self._stopping or (self.global_stop is not None and self.global_stop.is_set())
 
     def _default_process_factory(self, name: str, target, args: tuple):
         process = self.ctx.Process(name=name, target=target, args=args, daemon=False)
@@ -186,9 +212,15 @@ class CameraRuntimeManager:
 
     def _spawn_trio(self, item: CameraRuntime) -> None:
         cid = item.camera_id
-        def admission_port(channel):
-            return channel.for_slot(item.slot_id) if hasattr(channel, "for_slot") else channel
+        if (item.camera["use_fight_detection"] and not self.fight_service_available
+                and is_file_source(item.camera["source"])):
+            item.fight_service_waiting = True
+            return  # No FILE frame may be read before its required consumer exists.
         args_common = (self.config, item.camera)
+        if item.camera["use_fight_detection"]:
+            self.ensure_fight(item)
+        if item.camera["use_speed_detection"]:
+            self._spawn_speed(item)
         item.processes["ingest"] = self.process_factory(
             f"camera_ingest_{cid}",
             camera_ingest_process_main,
@@ -204,6 +236,8 @@ class CameraRuntimeManager:
                 item.speed_queue,
                 item.speed_stop,
                 item.file_eof_event,
+                item.fight_pause,
+                self.fight_epochs,
             ),
         )
         item.processes["preview"] = self.process_factory(
@@ -219,33 +253,133 @@ class CameraRuntimeManager:
                 item.slot_id,
             ),
         )
-        if item.camera["use_fight_detection"]:
-            self._spawn_fight(item, args_common, admission_port)
-        if item.camera["use_speed_detection"]:
-            self._spawn_speed(item)
 
-    def _spawn_fight(self, item, args_common, admission_port):
+    def _spawn_fight(self, item):
         cid = item.camera_id
+        self.fight_epochs[item.slot_id] += 1
+        item.fight_epoch = int(self.fight_epochs[item.slot_id])
+        item.fight_stop = self.ctx.Event()
+        def tagged(channel):
+            return FightChannel(channel, item.fight_epoch) if channel is not None else None
+        def admission_port(channel):
+            return tagged(channel.for_slot(item.slot_id) if hasattr(channel, "for_slot") else channel)
         item.processes["camera"] = self.process_factory(
             f"camera_{cid}",
             camera_process_main,
-            args_common
+            (self.config, item.camera)
             + (
                 admission_port(self.stage3_queue),
-                self.report_queue,
-                item.stop_event,
+                tagged(self.report_queue),
+                item.fight_stop,
                 admission_port(self.person_request_queue),
-                self.person_result_channels[item.slot_id],
+                tagged(self.person_result_channels[item.slot_id]),
                 admission_port(self.pose_request_queue),
-                self.pose_result_channels.get(item.slot_id),
+                tagged(self.pose_result_channels.get(item.slot_id)),
                 item.generation,
-                item.fight_queue,
+                tagged(item.fight_queue),
                 item.slot_id,
-                self.health_queue,
+                tagged(self.health_queue),
             ),
         )
+        item.fight_failed = item.fight_service_waiting = False
+        item.fight_failure_reason = ""
+        item.fight_pause.clear()
+        self._fight_status(item, "fight_consumer_resumed")
+
+    def _fight_status(self, item, detail, **extra):
+        self._status(detail, item.camera_id, generation=item.generation,
+                     consumer_epoch=item.fight_epoch, service_epoch=self.fight_service_epoch,
+                     retries=item.fight_restarts,
+                     pids={name: getattr(process, "pid", None) for name, process in item.processes.items()}, **extra)
+
+    def ensure_fight(self, item):
+        if (self.stopping or item.intentional_stop or item.file_done or item.fight_failed
+                or not item.camera["use_fight_detection"]):
+            return
+        if not self.fight_service_available:
+            item.fight_service_waiting = True
+            return
+        process = item.processes.get("camera")
+        if process is not None and process.is_alive():
+            return
+        self._spawn_fight(item)
+
+    def _clear_fight_frames(self, item):
+        # A killed reader can leave a multiprocessing queue lock/partial packet.
+        # Probe/drain only while publication is paused, with a bounded parent wait.
+        # If poisoned, never reuse it or create another source as a workaround.
+        done, errors = threading.Event(), []
+        def drain():
+            try:
+                for _ in range(max(1, int(self.runtime_config.get("camera_ingest_fight_queue_size", 8))) + 1):
+                    try:
+                        item.fight_queue.get(timeout=.05)
+                    except queue.Empty:
+                        break
+            except (OSError, ValueError, EOFError) as exc:
+                errors.append(exc)
+            finally:
+                done.set()
+        threading.Thread(target=drain, name="fight_frame_withdraw", daemon=True).start()
+        if not done.wait(.5) or errors:
+            raise CameraLifecycleError("fight_frame_transport_unsafe")
+
+    def _fence_fight(self, item, reason, *, failed, waiting):
+        item.fight_pause.set()
+        if failed:
+            with getattr(self.fight_publication_floor, "get_lock", lambda: nullcontext())():
+                self.fight_publication_floor[item.slot_id + 1] = item.fight_epoch + 1
+        if item.fight_stop is not None:
+            item.fight_stop.set()
+        # Set ownership state before potentially unsafe teardown, including its
+        # shutdown fallback. Never drain abandoned shared result transport.
+        item.fight_service_waiting = waiting
+        item.fight_failed = failed and not waiting
+        item.fight_failure_reason = reason
+
+    def disable_fight(self, item, reason, *, failed=False, waiting=False):
+        self._fence_fight(item, reason, failed=failed, waiting=waiting)
+        process = item.processes.get("camera")
+        if process is not None:
+            self.terminate_process(process, timeout=1.0)
+            if process.is_alive():
+                raise CameraLifecycleError("fight_consumer_withdrawal_failed")
+            self._clear_fight_frames(item)
+            item.processes.pop("camera", None)
+        self._fight_status(item, "fight_consumer_suspended", reason=reason)
+
+    def restart_fight(self, item, reason):
+        if self.stopping or item.fight_service_waiting or item.file_done:
+            return
+        if not item.fight_failed:
+            self.disable_fight(item, reason, failed=True)
+        if is_file_source(item.camera["source"]):
+            return  # Incomplete FILE is latched; never reopen or reattach.
+        if (item.fight_restarts >= int(self.runtime_config.get("watchdog_camera_restart_limit", 3))
+                or self.monotonic() - item.fight_last_restart < max(1, float(
+                    self.runtime_config.get("watchdog_camera_restart_cooldown_sec", 120)))):
+            return
+        item.fight_restarts += 1
+        item.fight_last_restart = self.monotonic()
+        item.fight_failed = False
+        try:
+            self.ensure_fight(item)
+        except Exception as exc:
+            self._fight_start_failed(item, exc, counted=True)
+
+    def _fight_start_failed(self, item, exc, *, counted=False):
+        if not counted:
+            item.fight_restarts += 1
+            item.fight_last_restart = self.monotonic()
+        item.fight_failed = True
+        item.fight_service_waiting = False
+        item.fight_pause.set()
+        item.fight_failure_reason = "fight_consumer_start_failed"
+        self._fight_status(item, "fight_consumer_restart_failed", reason=type(exc).__name__)
 
     def _spawn_speed(self, item):
+        if self.stopping:
+            return
         if not self.speed_service_available:
             self.disable_speed(item, "vehicle_service_unavailable")
             return
@@ -283,6 +417,8 @@ class CameraRuntimeManager:
         preferred_slot_id: int | None = None,
         reuse_current_generation: bool = False,
     ) -> CameraRuntime:
+        if self.stopping:
+            raise CameraLifecycleError("runtime_stopping")
         normalized = runtime_camera(camera)
         cid = normalized["camera_id"]
         existing = self.runtimes.get(cid)
@@ -316,26 +452,23 @@ class CameraRuntimeManager:
                 maxsize=max(
                     1, int(self.runtime_config.get("camera_ingest_fight_queue_size", 8))
                 )
-            ) if normalized["use_fight_detection"] else None,
+            ),
             preview_queue=self.ctx.Queue(
                 maxsize=max(
                     1, int(self.runtime_config.get("camera_ingest_preview_queue_size", 1))
                 )
             ),
         )
-        if normalized["use_speed_detection"]:
-            item.speed_queue = self.ctx.Queue(maxsize=max(1, int(self.runtime_config.get("camera_ingest_speed_queue_size", 2))))
-            item.speed_stop = self.ctx.Event()
+        item.fight_pause = self.ctx.Event()
+        item.fight_pause.set()
+        item.speed_queue = self.ctx.Queue(maxsize=max(1, int(self.runtime_config.get("camera_ingest_speed_queue_size", 2))))
+        item.speed_stop = self.ctx.Event()
+        item.speed_stop.set()
         self.runtimes[cid] = item
         self._status(
             "camera_starting", cid, generation=generation, slot_id=slot_id, reason=reason
         )
         try:
-            if normalized["use_fight_detection"] and not self.fight_service_available:
-                item.fight_service_waiting = True
-                item.intentional_stop = True
-                item.state = RECONNECTING
-                return item
             self._spawn_trio(item)
         except Exception:
             item.state = FAILED
@@ -343,7 +476,8 @@ class CameraRuntimeManager:
             raise
         item.state = RUNNING
         self._status(
-            "camera_started", cid, generation=generation, slot_id=slot_id, reason=reason
+            "camera_started", cid, generation=generation, slot_id=slot_id, reason=reason,
+            pids={name: getattr(process, "pid", None) for name, process in item.processes.items()}
         )
         return item
 
@@ -363,14 +497,19 @@ class CameraRuntimeManager:
         # Invalidate first so delayed shared-worker output cannot enter a reused slot.
         self._next_generation(item.slot_id)
         item.stop_event.set()
+        item.fight_pause.set()
+        if item.fight_stop is not None:
+            item.fight_stop.set()
         if item.speed_stop is not None:
             item.speed_stop.set()
             self.speed_epochs[item.slot_id] += 1
         for process in item.processes.values():
             self.terminate_process(process, timeout=2.0)
-        if not item.fight_service_waiting:
+            if process.is_alive() and not self.stopping:
+                raise CameraLifecycleError("camera_withdrawal_failed")
+        if not item.fight_service_waiting and not item.fight_failed:
             self._drain(self.person_result_channels.get(item.slot_id))
-        if not item.fight_service_waiting and item.slot_id in self.pose_result_channels:
+        if not item.fight_service_waiting and not item.fight_failed and item.slot_id in self.pose_result_channels:
             self._drain(self.pose_result_channels[item.slot_id])
         self.close_queue(item.fight_queue)
         self.close_queue(item.preview_queue)
@@ -389,45 +528,30 @@ class CameraRuntimeManager:
         return True
 
     def suspend_fight(self):
-        """Reserve slots, invalidate all affected generations, then withdraw readers.
-
-        Whole affected LIVE camera runtimes restart on fresh transport; Speed-only
-        cameras and the shared Vehicle process are not involved.
-        """
+        """Withdraw Fight only; the source, Speed state and preview stay current."""
         self.fight_service_available = False
         affected = [item for item in self.runtimes.values()
                     if item.camera["use_fight_detection"] and not item.fight_service_waiting]
         for item in affected:
-            item.generation = self._next_generation(item.slot_id)
-            item.fight_service_waiting = True
-            item.intentional_stop = True
-            item.state = RECONNECTING
-            item.stop_event.set()
-            if item.speed_stop is not None:
-                item.speed_stop.set()
-                self.speed_epochs[item.slot_id] += 1
+            self._fence_fight(item, "fight_service_restarting", failed=True,
+                              waiting=not is_file_source(item.camera["source"]))
         for item in affected:
-            for process in item.processes.values():
-                self.terminate_process(process, timeout=1.0)
-                if process.is_alive():
-                    raise RuntimeError("fight_camera_withdrawal_failed")
-            item.processes.clear()
-            for channel in (item.fight_queue, item.preview_queue, item.speed_queue):
-                try:
-                    channel.cancel_join_thread()
-                except AttributeError:
-                    pass
-                self.close_queue(channel)
+            self.disable_fight(item, "fight_service_restarting", failed=True,
+                               waiting=not is_file_source(item.camera["source"]))
 
     def resume_fight(self):
+        if self.stopping:
+            return
         self.fight_service_available = True
         for item in list(self.runtimes.values()):
             if item.fight_service_waiting:
-                try:
-                    self.restart_camera(item.camera_id, item.camera, reason="fight_service_recovered")
-                except Exception as exc:
-                    self._remember_failed(item.camera, "fight_camera_resume_failed", exc)
-                    raise
+                if not item.processes:
+                    self._spawn_trio(item)
+                else:
+                    try:
+                        self.ensure_fight(item)
+                    except Exception as exc:
+                        self._fight_start_failed(item, exc)
 
     def restart_camera(self, camera_id: str, camera: dict, *, reason: str) -> CameraRuntime:
         old = self.runtimes[str(camera_id)]
@@ -458,6 +582,8 @@ class CameraRuntimeManager:
         return item
 
     def reconcile(self, cameras: list[dict], *, revision: int | None = None) -> dict:
+        if self.stopping:
+            return {}
         desired = {
             item["camera_id"]: item
             for item in (runtime_camera(camera) for camera in cameras)
@@ -478,10 +604,16 @@ class CameraRuntimeManager:
             current = self.runtimes[cid]
             if restart_identity(current.camera) != restart_identity(desired[cid]):
                 try:
-                    self.restart_camera(cid, desired[cid], reason="runtime_config_changed")
+                    if (current.camera["source"] == desired[cid]["source"]
+                            and not is_file_source(current.camera["source"])):
+                        self._reconfigure_consumers(current, desired[cid])
+                    else:
+                        self.restart_camera(cid, desired[cid], reason="runtime_config_changed")
                     restarted.append(cid)
                     self._failed_desired.pop(cid, None)
                     self._failed_attempts.pop(cid, None)
+                except CameraLifecycleError:
+                    raise
                 except Exception as exc:
                     self._remember_failed(desired[cid], "restart_failed", exc)
             else:
@@ -506,6 +638,33 @@ class CameraRuntimeManager:
         }
         self._status("camera_reconcile_summary", **result)
         return result
+
+    def _reconfigure_consumers(self, item, desired):
+        previous = item.camera
+        if previous["use_fight_detection"] and not desired["use_fight_detection"]:
+            self.disable_fight(item, "capability_removed")
+        speed_changed = (previous["use_speed_detection"] != desired["use_speed_detection"]
+                         or previous["speed_config"] != desired["speed_config"])
+        if speed_changed and previous["use_speed_detection"]:
+            self.disable_speed(item, "capability_changed")
+            process = item.processes.get("speed")
+            if process is not None and process.is_alive():
+                raise CameraLifecycleError("speed_consumer_withdrawal_failed")
+            item.processes.pop("speed", None)
+        item.camera = desired
+        if not previous["use_fight_detection"] and desired["use_fight_detection"]:
+            item.fight_failed = False
+            try:
+                self.ensure_fight(item)
+            except Exception as exc:
+                self._fight_start_failed(item, exc)
+        if speed_changed and desired["use_speed_detection"]:
+            try:
+                self._spawn_speed(item)
+            except Exception:
+                self.disable_speed(item, "speed_consumer_start_failed")
+        if not desired["use_speed_detection"]:
+            item.speed_service_waiting = item.speed_failed = False
 
     def _retry_due(self, camera_id: str) -> bool:
         attempted = self._failed_attempts.get(camera_id)
@@ -538,6 +697,8 @@ class CameraRuntimeManager:
         )
 
     def poll(self) -> None:
+        if self.stopping:
+            return
         for cid, item in list(self.runtimes.items()):
             if item.intentional_stop or item.file_done:
                 continue
@@ -559,20 +720,38 @@ class CameraRuntimeManager:
                     # Zero exit can mean stop/epoch invalidation, not EOF. Latch
                     # the existing file failure; later ingest EOF cannot erase it.
                     self.disable_speed(item, "speed_process_dead")
-                if (item.speed_failed and self.speed_service_available
-                        and not is_file_source(item.camera["source"])
-                        and item.speed_restarts < int(self.runtime_config.get("watchdog_camera_restart_limit", 3))
-                        and self.monotonic() - item.speed_last_restart >= max(1, float(self.runtime_config.get("watchdog_camera_restart_cooldown_sec", 120)))):
-                    item.speed_restarts += 1
-                    item.speed_last_restart = self.monotonic()
+            # A failed spawn has no process handle, but still consumes the same
+            # bounded LIVE-only retry budget as an exited Speed consumer.
+            if (item.camera["use_speed_detection"] and item.speed_failed and self.speed_service_available
+                    and not is_file_source(item.camera["source"])
+                    and item.speed_restarts < int(self.runtime_config.get("watchdog_camera_restart_limit", 3))
+                    and self.monotonic() - item.speed_last_restart >= max(1, float(self.runtime_config.get("watchdog_camera_restart_cooldown_sec", 120)))):
+                item.speed_restarts += 1
+                item.speed_last_restart = self.monotonic()
+                try:
                     self._spawn_speed(item)
+                except Exception:
+                    self.disable_speed(item, "speed_consumer_start_failed")
             # Check a Fight exit before finalizing on ingest exit. A nonzero
             # consumer exit must never be mislabeled as successful file drain.
-            if camera is not None and not camera.is_alive():
+            if item.fight_failed and item.camera["use_fight_detection"]:
+                self.restart_fight(item, item.fight_failure_reason)
+                camera = item.processes.get("camera")
+            if camera is not None and not camera.is_alive() and not item.fight_service_waiting and not item.fight_failed:
                 if not (getattr(camera, "exitcode", None) == 0 and self.file_eof_reached(item)):
-                    self._restart_failed(item, "camera_process_dead")
+                    self.restart_fight(item, "camera_process_dead")
                     continue
             if ingest is not None and not ingest.is_alive():
+                if item.fight_failed and is_file_source(item.camera["source"]) and not self.file_eof_reached(item):
+                    # Overlapping source death cannot turn a failed ordered
+                    # consumer into a generation restart/replay on the next tick.
+                    item.stop_event.set()
+                    item.speed_stop.set()
+                    for process in item.processes.values():
+                        self.terminate_process(process, timeout=1.0)
+                    item.file_done = True
+                    item.state = FAILED
+                    continue
                 if (
                     getattr(ingest, "exitcode", None) == 0
                     and self.file_eof_reached(item)
@@ -580,7 +759,7 @@ class CameraRuntimeManager:
                     if camera is not None and camera.is_alive():
                         continue
                     if camera is not None and getattr(camera, "exitcode", None) != 0:
-                        self._restart_failed(item, "camera_process_dead")
+                        self.restart_fight(item, "camera_process_dead")
                         continue
                     if speed is not None and speed.is_alive():
                         continue
@@ -594,7 +773,7 @@ class CameraRuntimeManager:
                         cid,
                         generation=item.generation,
                         slot_id=item.slot_id,
-                        reason="file_eof",
+                        reason="file_incomplete" if item.fight_failed or item.speed_failed else "file_eof",
                     )
                     continue
                 self._restart_failed(item, "ingest_process_dead")
@@ -673,6 +852,8 @@ class CameraRuntimeManager:
         )
         try:
             self.restart_camera(item.camera_id, camera, reason=reason)
+        except CameraLifecycleError:
+            raise
         except Exception as exc:
             self._remember_failed(camera, "restart_failed", exc)
 
@@ -691,8 +872,13 @@ class CameraRuntimeManager:
                 "file_done": item.file_done,
                 "file_eof": self.file_eof_reached(item),
                 "fight_service_waiting": item.fight_service_waiting,
+                "fight_epoch": item.fight_epoch,
+                "fight_failed": item.fight_failed,
+                "fight_restarts": item.fight_restarts,
+                "fight_failure_reason": item.fight_failure_reason,
                 "restart_count": item.restart_count,
                 "use_fight_detection": item.camera["use_fight_detection"],
+                "source_is_file": is_file_source(item.camera["source"]),
                 "use_speed_detection": item.camera["use_speed_detection"],
                 "speed_failed": item.speed_failed,
                 "speed_restarts": item.speed_restarts,
@@ -718,5 +904,6 @@ class CameraRuntimeManager:
         return status
 
     def stop_all(self, *, reason: str = "global_stop") -> None:
+        self._stopping = True
         for camera_id in list(self.runtimes):
             self.stop_camera(camera_id, reason=reason)

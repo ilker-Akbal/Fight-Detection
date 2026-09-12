@@ -530,6 +530,7 @@ def run_person_inference_loop(
                         result_queue,
                         PersonInferenceResult(
                             camera_id=request.camera_id, generation=request.generation,
+                            consumer_epoch=request.consumer_epoch,
                             frame_idx=request.frame_idx, request_id=request.request_id,
                             slot_id=request.slot_id, outcome="dropped_live",
                         ), stop_event, timeout=max(0.01, result_timeout_sec),
@@ -670,6 +671,7 @@ def run_person_inference_loop(
                 result = PersonInferenceResult(
                     camera_id=request.camera_id,
                     generation=request.generation,
+                    consumer_epoch=request.consumer_epoch,
                     frame_idx=request.frame_idx,
                     request_id=request.request_id,
                     detections=detections,

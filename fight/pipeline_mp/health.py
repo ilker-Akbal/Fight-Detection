@@ -300,11 +300,14 @@ class HealthRegistry:
             camera["file_done"] = bool(status.get("file_done", False))
             camera["file_eof"] = bool(status.get("file_eof", False))
             camera["restart_count"] = int(status.get("restart_count", 0) or 0)
-            for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts", "fight_service_waiting"):
+            for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts", "fight_service_waiting", "fight_failed", "fight_restarts", "fight_failure_reason", "source_is_file"):
                 camera[key] = status.get(key, key == "use_fight_detection")
             if camera.get("speed_epoch") != status.get("speed_epoch"):
                 camera["speed_epoch"] = status.get("speed_epoch")
                 camera["components"]["speed_worker"] = _new_record("speed_worker", "camera", self.monotonic())
+            if camera.get("fight_epoch", 0) != status.get("fight_epoch", 0):
+                camera["fight_epoch"] = status.get("fight_epoch", 0)
+                camera["components"]["camera_worker"] = _new_record("camera_worker", "camera", self.monotonic())
 
     def handle(self, event: HealthEvent) -> bool:
         if not isinstance(event, HealthEvent) or event.event_type not in KNOWN_EVENTS:
@@ -322,6 +325,8 @@ class HealthRegistry:
             if record is None:
                 return False
             if event.component == "speed_worker" and event.consumer_epoch != camera.get("speed_epoch", 0):
+                return False
+            if event.component == "camera_worker" and event.consumer_epoch != camera.get("fight_epoch", 0):
                 return False
         else:
             record = self.workers.get(event.component)
@@ -455,6 +460,8 @@ class HealthRegistry:
     ) -> tuple[str, str, str | None]:
         lifecycle = camera["lifecycle"]
         if camera["file_done"]:
+            if camera.get("fight_failed") or camera.get("speed_failed"):
+                return DEGRADED, "file_incomplete", None
             return EOF, "file_eof", None
         if lifecycle == STOPPING:
             return STOPPING, "intentional_stop", None
@@ -462,27 +469,28 @@ class HealthRegistry:
             return STOPPED, "intentional_stop", None
         if lifecycle == FAILED:
             return FAILED, "lifecycle_failed", None
+        if camera.get("fight_failed") and camera.get("source_is_file"):
+            return DEGRADED, "file_incomplete", None
         age = now - float(camera["registered_at"])
-        if camera.get("fight_service_waiting"):
-            return DEGRADED, "fight_service_restarting", None
+        fight_suspended = camera.get("fight_service_waiting") or camera.get("fight_failed")
         components = camera["components"]
         ingest = components["camera_ingest"]
         worker = components["camera_worker"]
-        if not camera.get("use_fight_detection", True):
+        if not camera.get("use_fight_detection", True) or fight_suspended:
             worker = ingest
         preview = components["camera_preview"]
         ingest_eof = camera.get("file_eof", False) or ingest["source_state"] == EOF
-        if not process_alive.get("ingest", True) and (
-            not ingest_eof or ("ingest" in process_exitcodes and process_exitcodes["ingest"] != 0)
-        ):
-            return FAILED, "process_dead", "restart_camera"
         fight_drained = False
-        if camera.get("use_fight_detection", True) and not process_alive.get("camera", True):
+        if camera.get("use_fight_detection", True) and not fight_suspended and not process_alive.get("camera", True):
             # Only authoritative non-looping file EOF plus a clean exit permits
             # a dead Fight consumer. Missing/unknown/nonzero exit status fails.
             fight_drained = camera.get("file_eof", False) and process_exitcodes.get("camera") == 0
             if not fight_drained:
-                return FAILED, "process_dead", "restart_camera"
+                return DEGRADED, "fight_process_dead", "restart_fight"
+        if not process_alive.get("ingest", True) and (
+            not ingest_eof or ("ingest" in process_exitcodes and process_exitcodes["ingest"] != 0)
+        ):
+            return FAILED, "process_dead", "restart_camera"
         if not ingest_eof and not process_alive.get("preview", True):
             return DEGRADED, "preview_process_dead", "restart_preview"
         if ingest_eof and (fight_drained or not camera.get("use_fight_detection", True)):
@@ -531,7 +539,7 @@ class HealthRegistry:
         first_ingest_frame = float(ingest["first_frame"])
         worker_frame_at = float(worker["last_frame"])
         worker_frame_age = (
-            now - (worker_frame_at if worker_frame_at > 0 else first_ingest_frame)
+            now - (worker_frame_at if worker_frame_at > 0 else max(first_ingest_frame, float(worker["registered_at"])))
             if first_ingest_frame > 0
             else 0.0
         )
@@ -543,6 +551,8 @@ class HealthRegistry:
         ):
             if waiting_on_inference:
                 return DEGRADED, "shared_inference_in_progress", None
+            if ingest_heartbeat_age < policy.camera_frame_stall_fail_sec and frame_age < policy.camera_frame_stall_fail_sec:
+                return DEGRADED, "fight_frame_stall", "restart_fight"
             return FAILED, "frame_stall", "restart_camera"
         if (
             ingest_heartbeat_age >= policy.camera_heartbeat_timeout_sec
@@ -566,6 +576,8 @@ class HealthRegistry:
             or preview_publish_age >= policy.preview_heartbeat_timeout_sec
         ):
             return DEGRADED, "preview_heartbeat_timeout", "restart_preview"
+        if fight_suspended:
+            return DEGRADED, "fight_service_restarting" if camera.get("fight_service_waiting") else "fight_consumer_failed", None
         return ONLINE, "frames_progressing", None
 
     def evaluate(
@@ -700,6 +712,14 @@ class HealthRegistry:
                 "frames_dropped": ingest["dropped"],
                 "restart_count": camera["restart_count"],
                 "source_state": ingest["source_state"],
+                "fight_service_waiting": camera.get("fight_service_waiting", False),
+                "fight": {"enabled": camera.get("use_fight_detection", True),
+                          "waiting": camera.get("fight_service_waiting", False),
+                          "failed": camera.get("fight_failed", False),
+                          "reason": camera.get("fight_failure_reason", ""),
+                          "epoch": camera.get("fight_epoch", 0),
+                          "restarts": camera.get("fight_restarts", 0),
+                          "progress": worker["progress"]},
                 "capacity": camera.get("capacity", {}),
                 "speed": {"enabled": camera.get("use_speed_detection", False),
                           "failed": camera.get("speed_failed", False),
@@ -868,6 +888,9 @@ class RuntimeWatchdog:
                 continue
             if action["action"] == "restart_speed":
                 manager.disable_speed(runtime, action["reason"])
+                continue
+            if action["action"] == "restart_fight":
+                manager.restart_fight(runtime, action["reason"])
                 continue
             if action["action"] == "restart_preview":
                 if (

@@ -200,6 +200,7 @@ def stage3_process_main(
                             pose_score_mean=float(job.pose_score_mean),
                             generation=int(getattr(job, "generation", 0)),
                             slot_id=int(getattr(job, "slot_id", -1)),
+                            consumer_epoch=job.consumer_epoch,
                         ),
                         stop_event,
                         timeout=1.0,

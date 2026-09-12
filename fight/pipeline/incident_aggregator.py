@@ -46,6 +46,8 @@ class Stage3Result:
     pose_score_max: float
     pose_score_mean: float
     service_epoch: int = 0
+    slot_id: int = -1
+    consumer_epoch: int = 0
 
 
 @dataclass
@@ -405,10 +407,16 @@ class IncidentAggregator:
             pose_score_max=float(result.pose_score_max),
             pose_score_mean=float(result.pose_score_mean),
             service_epoch=int(result.service_epoch),
+            slot_id=int(result.slot_id),
+            consumer_epoch=int(result.consumer_epoch),
         )
 
     def _publication_current(self, result):
-        return self.publication_floor is None or result.service_epoch >= int(self.publication_floor[0])
+        if self.publication_floor is None:
+            return True
+        return (result.service_epoch >= int(self.publication_floor[0])
+                and (result.slot_id < 0 or result.slot_id + 1 >= len(self.publication_floor)
+                     or result.consumer_epoch >= int(self.publication_floor[result.slot_id + 1])))
 
     def _state_current(self, state):
         return all(self._publication_current(segment.result) for segment in state.segments)

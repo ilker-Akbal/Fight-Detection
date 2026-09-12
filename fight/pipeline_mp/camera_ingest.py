@@ -17,6 +17,7 @@ from fight.pipeline_mp.common import (
 from fight.pipeline_mp.messages import CameraFrame, CameraIngestSignal, ReportMessage
 from fight.pipeline_mp.health import HealthEmitter
 from fight.pipeline_mp.attribution import AttributionMetrics
+from fight.pipeline_mp.fight_identity import FightChannel
 
 
 def _report(report_queue, camera_id: str, detail: str, **extra) -> None:
@@ -151,6 +152,8 @@ def run_camera_ingest_loop(
     speed_channel=None,
     speed_stop=None,
     file_eof_event=None,
+    fight_stop=None,
+    fight_epochs=None,
 ) -> None:
     runtime = config.get("runtime", {})
     telemetry = AttributionMetrics(runtime,
@@ -159,6 +162,11 @@ def run_camera_ingest_loop(
               for counter in ("offered", "enqueued", "dropped")))
     camera_id = str(camera["camera_id"])
     source = str(camera["source"])
+    def fight_output():
+        if fight_stop is not None and fight_stop.is_set():
+            return None
+        return (FightChannel(fight_channel, int(fight_epochs[slot_id]))
+                if fight_epochs is not None and fight_channel is not None else fight_channel)
     safe_source = redact_source(source)
     source_is_file = is_file_source(source)
     reconnect_enabled = bool(runtime.get("camera_reconnect_enabled", True))
@@ -254,7 +262,6 @@ def run_camera_ingest_loop(
                         generation=int(generation),
                         reconnect_count=reconnect_count,
                     )
-                reconnect_delay = reconnect_initial
                 flow_started = False
 
                 while stop_event is None or not stop_event.is_set():
@@ -289,10 +296,10 @@ def run_camera_ingest_loop(
                                 frame_seq=frame_seq,
                             )
                             _publish_signal(
-                                fight_channel,
+                                fight_output(),
                                 eof_signal,
                                 ordered=file_fight_ordered,
-                                stop_event=stop_event,
+                                stop_event=ConsumerStop(stop_event, fight_stop),
                                 timeout=publish_timeout,
                             )
                             publish_speed(speed_channel, eof_signal, stop_event, speed_stop,
@@ -343,24 +350,27 @@ def run_camera_ingest_loop(
                     )
 
                     fanout_started = time.perf_counter() if telemetry.enabled else 0.0
-                    with telemetry.measure("fight_enqueue_ms") if fight_channel is not None else nullcontext():
-                        if fight_channel is None:
+                    fight_offered = fight_channel is not None and (fight_stop is None or not fight_stop.is_set())
+                    fight_target = (FightChannel(fight_channel, int(fight_epochs[slot_id]))
+                                    if fight_offered and fight_epochs is not None else fight_channel)
+                    with telemetry.measure("fight_enqueue_ms") if fight_offered else nullcontext():
+                        if not fight_offered:
                             published_fight, dropped_fight = False, 0
                         elif file_fight_ordered:
                             published_fight = publish_ordered(
-                                fight_channel,
+                                fight_target,
                                 envelope,
-                                stop_event,
+                                ConsumerStop(stop_event, fight_stop),
                                 publish_timeout,
                             )
                             dropped_fight = 0
                         else:
                             published_fight, dropped_fight = publish_latest(
-                                fight_channel,
+                                fight_target,
                                 envelope,
                             )
                     frames_published_fight += int(published_fight)
-                    frames_dropped_fight += int(dropped_fight or not published_fight)
+                    frames_dropped_fight += int(dropped_fight or (fight_offered and not published_fight))
                     speed_offered = speed_channel is not None and (speed_stop is None or not speed_stop.is_set())
                     with telemetry.measure("speed_enqueue_ms") if speed_offered else nullcontext():
                         published_speed, dropped_speed = publish_speed(
@@ -381,7 +391,7 @@ def run_camera_ingest_loop(
                     if telemetry.enabled:
                         telemetry.observe("fanout_ms", (time.perf_counter() - fanout_started) * 1000)
                         for name, offered, delivered, dropped in (
-                            ("fight", fight_channel is not None, published_fight, dropped_fight),
+                            ("fight", fight_offered, published_fight, dropped_fight),
                             ("speed", speed_offered, published_speed, dropped_speed),
                             ("preview", preview_channel is not None, published_preview, dropped_preview),
                         ):
@@ -399,6 +409,7 @@ def run_camera_ingest_loop(
 
                     if not flow_started:
                         flow_started = True
+                        reconnect_delay = reconnect_initial
                         _report(
                             report_queue,
                             camera_id,
@@ -425,7 +436,7 @@ def run_camera_ingest_loop(
                     )
                     publish_speed(speed_channel, failure, stop_event, speed_stop, False, publish_timeout)
                     _publish_signal(
-                        fight_channel,
+                        fight_output(),
                         failure,
                         ordered=False,
                         stop_event=stop_event,
@@ -461,10 +472,10 @@ def run_camera_ingest_loop(
                     )
                     publish_speed(speed_channel, failure, stop_event, speed_stop, source_is_file, publish_timeout)
                     _publish_signal(
-                        fight_channel,
+                        fight_output(),
                         failure,
                         ordered=file_fight_ordered,
-                        stop_event=stop_event,
+                        stop_event=ConsumerStop(stop_event, fight_stop),
                         timeout=publish_timeout,
                     )
                     _publish_signal(
@@ -500,7 +511,11 @@ def run_camera_ingest_loop(
                 progress=frame_seq,
                 reconnect_count=reconnect_count,
             )
-            sleep_fn(reconnect_delay)
+            # Production backoff is interruptible. Tests can still inject a clock.
+            if sleep_fn is time.sleep and stop_event is not None:
+                stop_event.wait(reconnect_delay)
+            else:
+                sleep_fn(reconnect_delay)
             reconnect_delay = min(reconnect_max, reconnect_delay * 2.0)
     finally:
         telemetry.publish(report_queue, "camera_ingest", force=True, camera_id=camera_id, generation=generation)
@@ -525,7 +540,7 @@ def run_camera_ingest_loop(
                 frame_seq=frame_seq,
             )
             _publish_signal(
-                fight_channel,
+                fight_output(),
                 signal,
                 ordered=False,
                 stop_event=None,
@@ -587,6 +602,8 @@ def camera_ingest_process_main(
     speed_channel=None,
     speed_stop=None,
     file_eof_event=None,
+    fight_stop=None,
+    fight_epochs=None,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -609,6 +626,8 @@ def camera_ingest_process_main(
             speed_channel=speed_channel,
             speed_stop=speed_stop,
             file_eof_event=file_eof_event,
+            fight_stop=fight_stop,
+            fight_epochs=fight_epochs,
         )
     except Exception as exc:
         _report(

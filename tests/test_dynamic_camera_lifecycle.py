@@ -48,6 +48,10 @@ class FakeContext:
     Event = threading.Event
 
     @staticmethod
+    def Array(_type, size, lock=True):
+        return [0] * size
+
+    @staticmethod
     def Queue(maxsize=0):
         return queue.Queue(maxsize=maxsize)
 
@@ -194,11 +198,13 @@ class DynamicCameraLifecycleTests(unittest.TestCase):
         self.manager.reconcile([self.camera("A"), self.camera("B")])
         b = self.manager.runtimes["B"]
         old_a = self.manager.runtimes["A"]
+        old_worker = old_a.processes["camera"]
         old_a.processes["camera"].alive = False
         old_a.processes["camera"].exitcode = 17
         self.manager.poll()
         self.assertIs(self.manager.runtimes["B"], b)
-        self.assertIsNot(self.manager.runtimes["A"], old_a)
+        self.assertIs(self.manager.runtimes["A"], old_a)
+        self.assertIsNot(old_a.processes["camera"], old_worker)
         generation = b.generation
         old_preview = b.processes["preview"]
         old_preview.alive = False
