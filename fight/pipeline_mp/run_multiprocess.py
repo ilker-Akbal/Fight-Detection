@@ -69,8 +69,19 @@ def _safe_empty(q) -> bool:
         return False
 
 
+def _runtime_child_main(target, args):
+    # CTRL_BREAK is broadcast to the Windows process group. Only the runtime
+    # parent owns orderly shutdown; children must not be aborted mid-queue/lock
+    # operation before it signals their Events and drains Reporter/Incident.
+    import signal
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, signal.SIG_IGN)
+    target(*args)
+
+
 def _start_process(name: str, target, args: tuple) -> mp.Process:
-    p = mp.get_context("spawn").Process(name=name, target=target, args=args, daemon=False)
+    p = mp.get_context("spawn").Process(name=name, target=_runtime_child_main,
+                                       args=(target, args), daemon=False)
     p.start()
     return p
 

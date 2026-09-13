@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import signal
+import threading
 import time
 from urllib.parse import urlsplit, urlunsplit
 from dataclasses import dataclass
@@ -102,8 +103,17 @@ def request_stop_event(stop_event) -> None:
 
 
 def install_signal_handlers(stop_event) -> None:
+    requested = False
+
     def _handler(signum, frame):
-        request_stop_event(stop_event)
+        nonlocal requested
+        if not requested:
+            requested = True
+            # A signal can interrupt Event.is_set()/wait() while this thread
+            # holds its multiprocessing lock. Set it outside the handler to
+            # avoid re-entering that non-reentrant lock. At most one helper.
+            threading.Thread(target=request_stop_event, args=(stop_event,),
+                             name="signal_stop", daemon=True).start()
 
     try:
         signal.signal(signal.SIGINT, _handler)
@@ -114,6 +124,14 @@ def install_signal_handlers(stop_event) -> None:
         signal.signal(signal.SIGTERM, _handler)
     except Exception:
         pass
+
+    # Windows Supervisor uses CTRL_BREAK_EVENT for its process group. Without
+    # SIGBREAK handling the parent exits before its normal child teardown.
+    if hasattr(signal, "SIGBREAK"):
+        try:
+            signal.signal(signal.SIGBREAK, _handler)
+        except (OSError, ValueError):
+            pass
 
 
 def queue_put_best_effort(q, item, timeout: float = 0.2) -> bool:

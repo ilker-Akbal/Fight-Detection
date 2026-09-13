@@ -364,3 +364,122 @@ credentials in scripts or committed configs):
 7. Stop through Supervisor during a recovery backoff. Confirm no replacement
    starts after stop, no reopened source, and no child left running. Preserve
    logs as qualification evidence; do not overwrite older result directories.
+
+## Phase 22: LIVE soak and recovery qualification
+
+`python -m benchmarks.live_qualification` runs **one selected mixed camera**
+through the real `RuntimeSupervisor -> run_multiprocess -> CameraRuntimeManager`
+path. It does not implement a second runtime or substitute model workers.
+No workers are killed by the default `baseline` command. Run on an isolated
+development runtime; another active runtime or held capacity lock is refused.
+
+Use an existing mixed-camera JSON configuration with its existing models and
+valid Speed calibration. `--camera-id` disambiguates multiple templates. The
+selected source is used unchanged unless `--generated` is explicit. Configs
+with Person batching enabled are refused, not silently retuned. Ordered local
+files are refused by this LIVE tool; use the existing file benchmark instead.
+
+Examples (each output directory must be NEW):
+
+```powershell
+# Baseline with the actual RTSP source in your private configuration:
+conda run -n torch_gpu --no-capture-output python -m benchmarks.live_qualification --config private/live.json --camera-id lobby --duration-sec 3600 --output benchmarks/results/phase22-rtsp-baseline-01
+
+# Explicitly opt in to killing the verified current shared Person child:
+conda run -n torch_gpu --no-capture-output python -m benchmarks.live_qualification --config private/live.json --camera-id lobby --scenario fight-shared --duration-sec 120 --output benchmarks/results/phase22-rtsp-fight-recovery-01
+
+# No external source: generated local MJPEG, with the same real runtime/models:
+conda run -n torch_gpu --no-capture-output python -m benchmarks.live_qualification --config private/live.json --camera-id lobby --generated --duration-sec 30 --output benchmarks/results/phase22-generated-baseline-01
+```
+
+Other explicit `--scenario` choices:
+
+| Scenario | Action and expectation |
+| --- | --- |
+| `baseline` (default) | No fault; advancing branches, stable identities, no restarts |
+| `fight-shared` | Kill current Person; one Fight service/consumer replacement; preserve ingest, Preview, Speed, Vehicle |
+| `fight-local` | Kill current Fight camera worker; replace only that consumer |
+| `capability-churn` | Publish revisioned mixed -> Speed-only -> mixed desired state; preserve source/Speed |
+| `shutdown-backoff` | Kill Person, observe pending recovery, request Supervisor stop before recovery resumes |
+
+Fault/churn begins one quarter into the requested soak; churn restores Fight
+after the disabled phase is observed and at least half the duration elapsed.
+`shutdown-backoff` intentionally finishes early. Failure injection has no PID
+argument: the target comes from a fresh, matching-run health snapshot and must
+be a current direct child of the verified runtime command, bound to an observed
+PID/creation-time identity. Unknown, reused, stale or ambiguous targets are refused.
+No administrator privileges are required.
+
+Defaults: 300-second soak **after initial healthy progress**, 120-second startup
+deadline, 1-second sample interval (minimum 0.25), 256 retained samples (maximum
+4096), 64 recent identity/recovery events, and 256 lifetime process identities.
+The existing Supervisor stop budgets are unchanged; the harness observes stop
+for at most 20 seconds plus a 3-second child-exit settling window. Too little
+time to observe a recovery is not a successful qualification.
+
+Output is `qualification_summary.json`, atomically published in the new run
+directory, alongside the ordinary private Supervisor/runtime/outbox artifacts.
+The summary contains source label, requested/measured/total durations, identity
+and progress start/end, observed PID/creation-time identities and changes,
+recovery reasons, restart/reconnect counts, current-incarnation capacity/drop/
+stale/rejection counters, health/snapshot-write observations, exit code and
+surviving children. RSS start/end/peak/count cover all sampled observations;
+CPU mean/p95 and optional GPU/VRAM distributions use the existing bounded-tail
+system sampler. CPU is **host CPU**, not per-worker CPU. No leak diagnosis is
+inferred from a small RSS fluctuation, startup allocation, or one short run.
+
+Classification is deliberately separate from capacity benchmarks:
+
+- `PASS`: completed baseline, healthy advancing branches, expected identities,
+  no observed restart/ownership violation, clean exit and no surviving children.
+- `PASS_WITH_RECOVERY`: explicit scenario completed with its expected isolation
+  and identity transitions (including intentional churn or stop during backoff).
+- `FAIL`: observed wrong identity/restart, stopped required branch, failed Speed,
+  runtime failure, duplicate observed source owner, nonzero exit or leaked child.
+- `INCOMPLETE`: missing/freshness-limited observations, startup/deadline failure,
+  missing final shutdown reports, or an unobserved required scenario phase.
+
+Failures stay latched even if a later snapshot looks healthy. The diagnostic
+restart rule is intentionally strict: baseline permits no recovery; a fault
+permits at most one corresponding Fight recovery and no unrelated camera,
+Speed, Vehicle or source-reconnect loop. These checks **do not control runtime
+health or recovery**. Existing benchmark HEALTHY/PRESSURED/SATURATED/INCOMPLETE
+classification is untouched.
+
+Important evidence limits:
+
+- Generated input is always labelled **LIVE-LIKE / SYNTHETIC SOURCE**. Its
+  stationary image may trigger no inference after motion warm-up; it tests real
+  process/decode/lifecycle plumbing, not detection quality, inference contention,
+  Speed tracking on vehicles, or RTSP/network resilience.
+- HTTP input is not called RTSP. A real RTSP baseline does not itself establish
+  network-interruption recovery. Use the manual procedure below.
+- PID/progress monitoring is sampled. It cannot prove absence of every
+  sub-sample transient. Generated-source connection peak adds an independent
+  local overlap observation, not a network ownership oracle.
+- Outbox envelopes are read without rewriting/compacting them. Their schema
+  does not include publication-floor history, so
+  `stale_durable_publication_verified` is explicitly `null`. No incident is
+  synthesized and zero incidents is not claimed as stale-work fencing proof.
+  Existing deterministic Phase-20/21 fencing regressions remain the proof for
+  that boundary; retain real incident artifacts for separate forensic review.
+- Missing measurements stay null. Raw private runtime configs contain the
+  actual source needed to connect: use a private output directory and do not
+  publish/commit those configs or raw logs. The compact summary is redacted.
+
+### Manual real RTSP interruption
+
+Use a real mixed RTSP camera and the Phase-20/21 procedure above. Record PIDs,
+generation, Fight/Speed consumer epochs and both service epochs. Interrupt only
+the test source/network, observe ingest-owned reconnect/backoff, restore it,
+and confirm progress returns without competing source owners or unrelated
+Fight/Vehicle recovery. Stop while reconnecting to verify bounded responsiveness.
+The harness does not disable network interfaces or simulate this as RTSP proof.
+A manual interruption during `baseline` is intentionally reported as an
+unexpected reconnect/failure, not silently relabelled a passing recovery test.
+
+Phase-22 local smoke exposed Windows CTRL_BREAK shutdown gaps: the parent now
+handles SIGBREAK without re-entering a multiprocessing Event lock inside a
+signal callback; runtime children ignore the group broadcast and remain owned
+by the parent's existing ordered teardown. FILE semantics, service budgets,
+models/calibration and batching defaults are unchanged.

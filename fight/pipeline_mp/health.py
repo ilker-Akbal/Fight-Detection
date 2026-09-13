@@ -300,6 +300,7 @@ class HealthRegistry:
             camera["file_done"] = bool(status.get("file_done", False))
             camera["file_eof"] = bool(status.get("file_eof", False))
             camera["restart_count"] = int(status.get("restart_count", 0) or 0)
+            camera["pids"] = dict(status.get("pids", {}))  # Observation only.
             for key in ("use_fight_detection", "use_speed_detection", "speed_failed", "speed_restarts", "fight_service_waiting", "fight_failed", "fight_restarts", "fight_failure_reason", "source_is_file"):
                 camera[key] = status.get(key, key == "use_fight_detection")
             if camera.get("speed_epoch") != status.get("speed_epoch"):
@@ -678,6 +679,9 @@ class HealthRegistry:
             preview = camera["components"]["camera_preview"]
             cameras[cid] = {
                 "generation": camera["generation"],
+                "pids": camera.get("pids", {}),
+                "ingest_progress": ingest["progress"],
+                "preview_progress": preview["progress"],
                 "slot_id": camera["slot_id"],
                 "lifecycle": camera["lifecycle"],
                 "file_eof": camera.get("file_eof", False),
@@ -732,6 +736,7 @@ class HealthRegistry:
         workers = {
             name: {
                 "health": record["health"],
+                "pid": record.get("pid"),
                 "reason": record["reason"],
                 "heartbeat_age_sec": self._age(current, record["last_heartbeat"]),
                 "last_request_age_sec": self._age(current, record["last_request"]),

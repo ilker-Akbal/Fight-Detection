@@ -217,6 +217,42 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertIn("/T", taskkill_calls[0])
         self.assertIn("/F", taskkill_calls[0])
 
+    def test_windows_timeout_kills_tree_before_parent_can_orphan_children(self):
+        class Parent(FakeChild):
+            def terminate(self):
+                self.terminate_count += 1
+                self.returncode = -15  # Parent exits; SIGBREAK-ignoring children do not.
+        factory = Factory(lambda: Parent(graceful=False, hanging=True))
+        descendants_alive = [True]
+        calls = []
+        def command_runner(command, **kwargs):
+            self.assertIsNone(factory.children[0].poll())
+            self.assertGreater(kwargs["timeout"], 0)
+            calls.append(command)
+            descendants_alive[0] = False
+            factory.children[0].returncode = -9
+        supervisor = self.make_supervisor(factory, command_runner=command_runner)
+        supervisor.start(self.config_path)
+        supervisor.stop()
+        self.assertFalse(descendants_alive[0])
+        self.assertEqual(factory.children[0].terminate_count, 0)
+        self.assertIn("/T", calls[0])
+
+    def test_windows_tree_kill_timeout_does_not_report_successful_stop(self):
+        factory = Factory(lambda: FakeChild(graceful=False, hanging=True))
+        def command_runner(command, **kwargs):
+            raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+        supervisor = self.make_supervisor(factory, command_runner=command_runner)
+        supervisor.start(self.config_path)
+        try:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                supervisor.stop()
+            self.assertIs(supervisor._child, factory.children[0])
+            self.assertEqual(supervisor.status()["runtime_state"], "STOPPING")
+            self.assertEqual(factory.children[0].terminate_count, 0)
+        finally:
+            factory.children[0].returncode = -9
+
     def test_linux_process_group_path_uses_term_before_kill(self):
         factory = Factory(lambda: FakeChild(graceful=False, hanging=True))
         supervisor = self.make_supervisor(factory, platform_name="posix")

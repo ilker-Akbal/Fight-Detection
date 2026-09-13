@@ -467,19 +467,18 @@ class RuntimeSupervisor:
                 pass
             if self._wait_child(child, self.config.stop_grace_sec):
                 return
-            try:
-                child.terminate()
-            except Exception:
-                pass
-            if self._wait_child(child, self.config.kill_grace_sec):
-                return
+            # Kill the tree while its root still exists. Terminating only the
+            # parent first can orphan children that correctly ignore SIGBREAK,
+            # and makes a later taskkill /T unable to discover that tree.
             self._command_runner(
                 ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
+                check=True,
+                timeout=max(0.1, self.config.kill_grace_sec),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            self._wait_child(child, self.config.kill_grace_sec)
+            if not self._wait_child(child, self.config.kill_grace_sec):
+                raise RuntimeError("runtime_tree_stop_failed")
             return
 
         try:
