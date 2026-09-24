@@ -1041,7 +1041,7 @@ Failure/restart rules:
 - watchdog/source/required-consumer failure for `offline_*` is terminal for that run,
 - cancellation is terminal for that run identity,
 - explicit re-analysis creates a new UUID and may intentionally read the asset again,
-- technical global stop fails/interupts in-flight offline ownership rather than pretending it completed,
+- technical global stop fails/interrupts in-flight offline ownership rather than pretending it completed,
 - LIVE analytics pause does not cancel the historical job,
 - evidence-write failure may allow ordered inference/Stage3/drain to finish but the run becomes `FAILED / evidence_write_failed`, not `COMPLETED`.
 
