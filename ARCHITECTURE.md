@@ -11,68 +11,103 @@ Architecture refreshes are not a narrow “append the latest commit” exercise.
 Current production-code reference commit:
 
 ```text
-06a67cc4328b602493ef9ef6d87916ec11e9b630
-Add Phase 22 live runtime qualification and shutdown hardening
+57dc5db9393f9791184fa4433501588ebe016634
+Integrate operator UI, live preview and offline analysis
 ```
 
-**Phase 22 is committed on `master` and is the current production architecture baseline.** It does not introduce another runtime. It adds a bounded LIVE qualification harness around the existing `RuntimeSupervisor -> run_multiprocess -> CameraRuntimeManager` path and hardens Windows shutdown ownership discovered during that qualification.
+**Phases 23, 24, 25 and 25.1 are committed on `master` and form the current production-code architecture baseline.** They retain the Phase-20/21 identity/recovery isolation and Phase-22 Supervisor/Windows ownership model while promoting three previously deferred product concerns into accepted architecture:
 
-Phase 20/21 remains the recovery-isolation foundation: camera/source lifetime, Fight-consumer lifetime, Speed-consumer lifetime, Fight service lifetime and Vehicle service lifetime are distinct. Phase 22 measures and validates those boundaries without changing model thresholds, calibration, ordered-file semantics, Django models, UI, deployment topology or the default Person batching policy.
+- one consolidated operator workspace over the existing authorization/runtime domains,
+- source-preserving LIVE preview that remains available when AI analytics are paused,
+- a separate explicit one-shot historical-video analysis domain that reuses the same runtime/shared model services without treating uploaded media as live cameras.
 
-Final reported validation for the current baseline:
+Phase 25.1 hardens the historical Fight path: compact deterministic evidence names avoid the reproduced Windows-long-path failure, source/video-relative time is kept distinct from wall clock, evidence serialization failure is not misclassified as an inference-consumer crash, and ordered FILE completion remains authoritative-EOF/drain based.
+
+Final reported validation for the current code baseline:
 
 ```text
 full pytest:
-  257 passed, 26 subtests passed
+  278 passed, 26 subtests passed
 
-compileall fight benchmarks tests:
+compileall:
+  fight benchmarks tests Fight_backend_project/backend_frontend_project
   passed
+
+Django:
+  manage.py check
+  no issues
+
+  manage.py makemigrations --check --dry-run
+  no changes detected
 
 git diff --check:
-  passed
-
-Phase-22 generated LIVE-like smoke:
-  baseline                 PASS
-  fight-shared recovery    PASS_WITH_RECOVERY
-  shutdown-backoff         PASS_WITH_RECOVERY
-
-Person batching default:
-  OFF
+  passed (Windows LF/CRLF conversion warnings only)
 ```
 
-Earlier in Phase 22, focused qualification/recovery suites and dedicated harness tests also passed. The final full-suite count above supersedes earlier intermediate counts.
+Manual local acceptance additionally exercised the Supervisor-managed LIVE HTTP/MJPEG path and an explicit historical Fight run. The historical source reported 903 frames and the accepted run consumed 903/903 frames, reached authoritative ingest EOF and Fight EOF, opened/closed 8/8 Fight events, submitted 6 Stage3 jobs and produced one historical Fight result without `save_failed`, `camera_process_dead`, `required_consumer_failed` or `evidence_write_failed`.
 
-Generated/local qualification is **not** proof of real RTSP/network behavior, detection quality, full Fight Pose/Stage3 contention, or target-hardware capacity. Real RTSP interruption and long-duration soak remain environment-specific acceptance work.
+That manual result is an acceptance observation, **not** a throughput/capacity claim. Generated/local HTTP/MJPEG testing is still not proof of real RTSP/network behavior, long-duration stability, target-hardware capacity, or historical Speed correctness with a representative calibration. Real RTSP interruption and long soak remain environment-specific qualification work.
 
 ---
 
 # 1. System purpose and current topology
 
-The repository is a centralized multi-camera security platform in which Fight Detection and Speed Detection share source/runtime infrastructure while preserving camera-local temporal state.
+The repository is a centralized multi-camera security platform with two distinct application workflows that share one AI runtime:
+
+1. **LIVE monitoring** — persistent camera/source definitions, continuous preview, optional Fight and/or Speed analytics and live Incident/routing behavior.
+2. **OFFLINE / historical analysis** — private uploaded/local media represented by `OfflineAsset`, processed only through explicit one-shot `OfflineRun` jobs and persisted as `OfflineResult`.
+
+Uploaded media is not a live camera. The separation is a product/domain boundary, not a second model-runtime topology.
 
 ```text
 Django / application control plane
-    -> Camera Registry Reconciler
-    -> Runtime Supervisor
-        -> one global run_multiprocess parent
-            -> one CameraIngest source/decode owner per physical camera
-            -> independently gated Fight / Speed / Preview consumers
-            -> capability-managed shared inference services
-            -> camera-local Fight/Speed temporal state
-            -> runtime-global Reporter + Incident processing
-            -> bounded health/performance/attribution reporting
-    -> durable incident outbox
-    -> Django Incident Dispatcher
-    -> common Incident / routing / authorization domain
+    |
+    +--> LIVE Camera registry (source_kind=LIVE)
+    |      -> Camera Registry Reconciler
+    |      -> durable desired LIVE camera state
+    |
+    +--> Historical media domain
+    |      -> OfflineAsset
+    |      -> explicit OfflineRun request
+    |      -> durable one-shot job state
+    |
+    +--> Runtime Supervisor
+           -> one global run_multiprocess parent
+               -> SharedServices over current LIVE demand + active offline demand
+               -> CameraRuntimeManager
+                    LIVE source:
+                      one CameraIngest source/decode owner
+                      + Preview always while monitorable
+                      + Fight consumer when required
+                      + Speed consumer when required
+
+                    explicit OFFLINE run:
+                      one one-shot CameraIngest for that run identity
+                      + required Fight/Speed consumer(s)
+                      + ordered FILE EOF/drain semantics
+
+               -> parent-owned private PreviewGateway
+                    camera_preview -> bounded latest JPEG
+                    -> loopback bearer-protected transport
+                    -> Django authorization proxy
+                    -> browser
+
+               -> runtime-global Reporter + Incident worker
+               -> bounded health/performance/attribution reporting
+    |
+    +--> durable incident outbox
+           -> Django Incident Dispatcher
+                LIVE envelope    -> Incident ORM -> routing/authorization
+                offline_*        -> OfflineResult -> historical UI only
 ```
 
-The production design is deliberately **not** “one complete AI pipeline per camera”. Expensive/stateless inference is shared across cameras. Temporal interpretation that depends on one camera’s history remains camera-local.
+The production design is deliberately **not** “one complete AI pipeline per camera” and is also **not** “one AI runtime per historical job”. Expensive/stateless inference remains shared across current demand. Temporal interpretation that depends on one camera/run history remains local to that consumer.
 
 The runtime distinguishes separate lifetimes:
 
 ```text
 SOURCE / CAMERA INCARNATION
-  CameraIngest + physical source + Preview + camera generation
+  CameraIngest + source + Preview + camera generation
 
 FIGHT CONSUMER INCARNATION
   camera_worker + Fight-local temporal state + Fight consumer epoch
@@ -87,11 +122,17 @@ FIGHT SERVICE INCARNATION
 VEHICLE SERVICE INCARNATION
   Vehicle worker/model
   -> Vehicle service epoch
+
+OFFLINE RUN IDENTITY
+  persisted OfflineRun UUID
+  -> runtime camera_id = offline_<uuid.hex>
+  -> one-shot durable claim/state
+  -> no transparent replay under a new parent
 ```
 
-These identities are intentionally separate. A Fight-consumer replacement is not a source replacement. A shared Fight-service replacement is not a camera-generation replacement. A Speed replacement is not a Fight replacement.
+A LIVE Fight-consumer replacement is not a source replacement. A shared Fight-service replacement is not a camera-generation replacement. A Speed replacement is not a Fight replacement. An explicit historical re-analysis is a **new OfflineRun identity**, not a replay of an old one.
 
-Target scale is large multi-camera deployment, but this contract does **not** assert a production camera-count guarantee. RTX 3050 results are characterization evidence for specific workloads, not an RTX 5090 estimate, sustained RTSP SLA, or proof that 200/300 real cameras fit one node.
+Target scale remains large multi-camera deployment, but this contract does **not** assert a production camera-count guarantee. RTX 3050 results are characterization evidence for specific workloads, not an RTX 5090 estimate, sustained RTSP SLA, or proof that 200/300 real cameras fit one node.
 
 ---
 
@@ -101,54 +142,74 @@ Target scale is large multi-camera deployment, but this contract does **not** as
 2. Django/Gunicorn is the application/control plane, not the AI child-process owner.
 3. Runtime Supervisor owns the global production AI runtime lifecycle.
 4. `run_multiprocess` owns multiprocessing topology below the Supervisor.
-5. One physical camera has exactly one intended `CameraIngest` source/decode owner in normal Supervisor operation.
-6. Fight and Speed on the same physical camera share one desired camera entry and one CameraIngest decode path.
+5. One active runtime source has exactly one intended `CameraIngest` decode/source owner for its camera/run incarnation.
+6. Fight and Speed on the same LIVE physical camera share one desired camera entry and one CameraIngest decode path.
 7. Recovery must never create a second CameraIngest as a workaround.
-8. `camera_worker`, `speed_worker`, Preview and web views must not independently reopen the production source.
-9. Expensive/stateless inference models are shared services, not model-per-camera instances.
-10. Fight temporal tracking/pair/ROI/event state and Speed tracking/calibration/speed state remain camera-local where history matters.
-11. Shared services are capability-aware and run only while desired cameras require them.
+8. `camera_worker`, `speed_worker`, Preview, PreviewGateway and web views must not independently reopen the production LIVE source.
+9. Expensive/stateless inference models are shared services, not model-per-camera or model-per-offline-run instances.
+10. Fight temporal tracking/pair/ROI/event state and Speed tracking/calibration/speed state remain camera/run-local where history matters.
+11. Shared services are capability-aware and run only while current LIVE or active OFFLINE demand requires them.
 12. Capability changes do not require a global runtime restart solely because capabilities changed.
 13. Source/camera incarnation is fenced by stable slot + camera generation.
 14. Fight consumer incarnation adds a separate parent-owned Fight epoch when the Fight consumer can change without changing source generation.
 15. Speed consumer identity uses its own parent-owned epoch.
 16. Recoverable shared services use service epochs where required.
 17. Fight durable publication is fenced by shared-service and per-Fight-consumer publication floors.
-18. Old work may physically finish, but stale work cannot become current health/result/durable-incident truth.
-19. Live and ordered-file workloads intentionally use different backpressure/recovery semantics.
+18. Old work may physically finish, but stale work cannot become current health/result/durable-publication truth.
+19. LIVE and ordered-file workloads intentionally use different backpressure/recovery semantics.
 20. Correctness must not depend on OS `Queue.qsize()` or `Queue.empty()` observations.
-21. Telemetry, queues, retries, health scans and cleanup remain bounded.
+21. Telemetry, queues, retries, health scans, preview caches and cleanup remain bounded.
 22. Windows `spawn` compatibility is a first-class requirement.
-23. Runtime incident truth crosses to Django through the durable incident outbox; runtime workers do not create Incident ORM rows.
-24. Fight and Speed share the same Incident/routing/authorization domain.
-25. Optional service absence is healthy when that service is not required.
-26. Incident and Reporter remain runtime-global liveness-critical processes.
-27. Synthetic camera-equivalents are not production inference capacity.
-28. One GPU/workload result must not be linearly extrapolated to another GPU/workload.
-29. Benchmark/qualification code must not silently retune production thresholds, batching, calibration or ownership merely to obtain better results.
-30. PostgreSQL, Docker, Nginx, deployment/service packaging and UI redesign remain frozen unless explicitly promoted.
-31. Shared-memory transport remains deferred until controlled measurement proves transport is materially limiting.
-32. Ordered non-looping file EOF is correctness state, not telemetry.
-33. CameraIngest sets authoritative generation-local EOF before consumer EOF signals.
-34. A dead required file consumer is clean only with authoritative EOF + exit code 0.
-35. Clean EOF does not advance generation, reopen source, replay the file or synthesize watchdog recovery.
-36. Fight/Vehicle failures during ordered-file work remain fail-closed/no-replay.
-37. Attribution/performance telemetry never drives health, admission, epochs, recovery, EOF, durable publication or benchmark/qualification correctness.
-38. Missing/disabled/no-sample metrics remain null/unavailable rather than fabricated zero.
-39. Normal graceful finalization remains distinct from failure teardown.
-40. Final telemetry is best-effort observability, not durability or EOF truth.
-41. Health snapshot publication failure is non-fatal but observable; retry stays bounded and narrow.
-42. Failure reporting preserves the pre-teardown cause when available.
-43. Forced-kill exit codes must not be misreported as the original stall cause.
-44. Person microbatching remains configurable but **OFF by default**.
-45. Fight recovery preserves healthy mixed-camera Speed state whenever source/Speed ownership is healthy.
-46. Camera-local Fight failure does not automatically recycle the shared Fight bundle.
-47. Shared Fight-bundle failure does not automatically recycle CameraIngest, Preview, Speed or Vehicle.
-48. Global stop is authoritative: reconnect/recovery/backoff may not recreate work after shutdown begins.
-49. Runtime parent owns orderly child teardown. Group signals must not allow children to bypass parent-owned shutdown sequencing.
-50. Qualification fault injection is opt-in and may target only processes verified to belong to the current qualification run.
-51. Qualification output directories are immutable-by-convention: do not reuse/overwrite an existing run directory.
-52. Generated/live-like input must be explicitly labeled synthetic and must never be presented as RTSP/network proof.
+23. Runtime incident truth crosses to Django through the durable incident outbox; runtime workers do not create Django ORM rows.
+24. LIVE Fight and Speed share the same live Incident/routing/authorization domain.
+25. OFFLINE Fight and Speed results belong to the historical `OfflineResult` domain and must not masquerade as current live Incidents.
+26. Optional service absence is healthy when that service is not required.
+27. Incident and Reporter remain runtime-global liveness-critical processes.
+28. Synthetic camera-equivalents are not production inference capacity.
+29. One GPU/workload result must not be linearly extrapolated to another GPU/workload.
+30. Benchmark/qualification code must not silently retune production thresholds, batching, calibration or ownership merely to obtain better results.
+31. PostgreSQL, Docker, Nginx and deployment/service packaging remain frozen unless explicitly promoted. The Phase-23/24/25 operator/preview/offline UI is accepted current architecture; **further** redesign is frozen unless promoted.
+32. Shared-memory transport remains deferred until controlled measurement proves transport is materially limiting.
+33. Ordered non-looping file EOF is correctness state, not telemetry.
+34. CameraIngest sets authoritative generation-local EOF before consumer EOF signals.
+35. A dead required file consumer is clean only with authoritative EOF + exit code 0.
+36. Clean EOF does not advance generation, reopen source, replay the file or synthesize watchdog recovery.
+37. Fight/Vehicle failures during ordered-file work remain fail-closed/no-replay.
+38. Attribution/performance telemetry never drives health, admission, epochs, recovery, EOF, durable publication or benchmark/qualification correctness.
+39. Missing/disabled/no-sample metrics remain null/unavailable rather than fabricated zero.
+40. Normal graceful finalization remains distinct from failure teardown.
+41. Final telemetry is best-effort observability, not durability or EOF truth.
+42. Health snapshot publication failure is non-fatal but observable; retry stays bounded and narrow.
+43. Failure reporting preserves the pre-teardown cause when available.
+44. Forced-kill exit codes must not be misreported as the original stall cause.
+45. Person microbatching remains configurable but **OFF by default**.
+46. Fight recovery preserves healthy mixed-camera Speed state whenever source/Speed ownership is healthy.
+47. Camera-local Fight failure does not automatically recycle the shared Fight bundle.
+48. Shared Fight-bundle failure does not automatically recycle CameraIngest, Preview, Speed or Vehicle.
+49. Global stop is authoritative: reconnect/recovery/backoff may not recreate work after shutdown begins.
+50. Runtime parent owns orderly child teardown. Group signals must not allow children to bypass parent-owned shutdown sequencing.
+51. Qualification fault injection is opt-in and may target only processes verified to belong to the current qualification run.
+52. Qualification output directories are immutable-by-convention: do not reuse/overwrite an existing run directory.
+53. Generated/live-like input must be explicitly labeled synthetic and must never be presented as RTSP/network proof.
+54. A monitorable LIVE camera may remain in desired state with Fight=false and Speed=false; that is valid **preview-only** operation, not “camera stopped”.
+55. LIVE desired-camera publication includes only `source_kind=LIVE` Camera rows. Uploaded/local historical files are not live desired cameras.
+56. The primary LIVE preview path is lossy/latest-frame, source-preserving and non-blocking; preview slowness must not backpressure CameraIngest or analytics.
+57. PreviewGateway is private runtime transport: loopback-only, bearer-protected, bounded and run/generation aware. Django remains the browser authorization boundary.
+58. Pausing LIVE analytics withdraws Fight/Speed branches while preserving monitorable LIVE CameraIngest + Preview where possible.
+59. LIVE analytics pause does not cancel or rewrite an already-running historical OfflineRun.
+60. Technical hard stop is distinct from analytics pause: it may stop acquisition/preview and interrupt current historical work; automatic monitoring is held until explicitly resumed.
+61. Uploading historical media creates an `OfflineAsset`, not a new LIVE Camera.
+62. Historical analysis starts only from an explicit `OfflineRun`; re-analysis creates a new run UUID/runtime identity.
+63. Offline job ownership/state is durable. A different runtime parent may fail an interrupted processing claim but must not silently replay it.
+64. Current offline request transport is intentionally single-outstanding-job; no multi-job concurrency guarantee is implied.
+65. Successful OfflineRun completion requires ordered required-consumer completion, authoritative FILE EOF and downstream drain acknowledgement; Django does not mark completion until its dispatcher cursor reaches the acknowledged outbox offset.
+66. Offline cancellation/failure is terminal for that run identity; recovery never reopens the same partial run as if it were clean.
+67. Offline event position is source/video-relative metadata. A relative position such as 5.53 seconds must never be formatted as a 1970 wall-clock timestamp.
+68. Offline evidence filenames use compact deterministic identity-derived names; the full offline UUID must not be redundantly repeated into long filesystem paths.
+69. Auxiliary Fight clip serialization failure is not an inference-consumer crash. If Stage3 can continue from in-memory frames it may do so, while the evidence error remains explicit.
+70. Missing/failed required historical evidence must not be reported as a successful historical result. The run may finish ordered inference/drain and then fail explicitly with an evidence error.
+71. Historical playback/evidence remains private and authorization-scoped; raw local filesystem paths are not a browser authorization mechanism.
+72. Modern Location/SecurityUnit/UserSecurityAssignment scope remains fail-closed for non-admin users. Profile/faculty does not silently grant modern location camera access; legacy fallback exists only for legacy location-less camera records.
 
 ---
 
@@ -156,9 +217,22 @@ Target scale is large multi-camera deployment, but this contract does **not** as
 
 ## 3.1 Django/application plane
 
-Django owns persisted camera configuration, `SpeedCameraConfig`, Location/security organization, Incident ORM rows, routing/audit/ACK/resolve state, desired-camera publication, Supervisor start/stop requests, operator-facing status/preview/action endpoints, retention/reference protection and the independent Incident Dispatcher service loop.
+Django owns persisted LIVE `Camera` configuration, `SpeedCameraConfig`, Location/security organization, `OfflineAsset` / `OfflineRun` / `OfflineResult`, live Incident ORM rows, routing/audit/ACK/resolve state, LIVE desired-camera publication, historical job request/state reconciliation, Supervisor control requests, operator-facing status/preview/action endpoints, protected historical media, retention/reference protection and the independent Incident Dispatcher service loop.
 
-Django may observe runtime state and consume preview/evidence. It must not become a hidden second AI runtime or source owner.
+Django classifies source intent before publication:
+
+```text
+Camera.source_kind = LIVE
+  -> eligible for LIVE desired-camera registry
+
+uploaded/local historical file
+  -> OfflineAsset / explicit OfflineRun
+  -> not a LIVE desired camera
+```
+
+Django may observe runtime health and consume preview/evidence. It must not become a hidden second AI runtime or open a production camera source in web requests. `RUNTIME_CONTROL_MODE=direct` remains compatibility/rollback behavior, not the production ownership contract.
+
+Authorization is centralized through the existing access-scope services. Modern non-admin physical scope derives from active `UserSecurityAssignment -> SecurityUnit -> SecurityUnitCoverage -> Location`; browser preview, events, historical assets and protected media re-check the appropriate scope.
 
 ## 3.2 Runtime Supervisor
 
@@ -183,7 +257,7 @@ BACKOFF
 
 Local state under `.runtime_supervisor/` is operational data, not source code.
 
-The Supervisor owns process-group start/stop semantics and the final bounded fallback when the runtime parent does not stop within the configured grace period.
+The Supervisor owns process-group start/stop semantics, desired LIVE camera state, runtime status/health projection and the final bounded fallback when the runtime parent does not stop within the configured grace period.
 
 ## 3.3 Runtime parent
 
@@ -206,14 +280,47 @@ The runtime parent owns:
 - Reporter and Incident workers,
 - `SharedServices`,
 - `CameraRuntimeManager`,
-- desired-state reconcile,
+- LIVE desired-state reconcile,
+- `OfflineJobs` one-shot job ownership when configured,
+- the private `PreviewGateway` and its bounded latest-frame channel when enabled,
 - health registry/watchdog/snapshot publication,
 - fair admissions,
 - ordered-file EOF/drain/finalization,
 - performance summary,
 - orderly child shutdown.
 
+The dynamic runtime calculates service demand over:
+
+```text
+current LIVE desired cameras
++ the currently PROCESSING offline runtime camera, if any
+```
+
+so an explicit historical run reuses the current shared models rather than launching a second model topology.
+
 Lifecycle policy remains parent-owned. Children receive only spawn-safe queues, Events/Arrays, simple identities and configuration required for their role.
+
+## 3.4 Preview transport boundary
+
+`PreviewGateway` is owned by the runtime parent but is **not** a source owner or AI service. It keeps only the newest valid JPEG per slot/generation, listens on loopback, requires a per-run bearer token and publishes a private descriptor outside Django static/media paths.
+
+Django's `live_preview` bridge validates the active run/descriptor, connects only to loopback, validates bounded JPEG/stream payloads and periodically re-checks user authorization while streaming. Browser clients never receive the gateway bearer token.
+
+## 3.5 Durable dispatcher boundary
+
+The runtime writes durable outbox envelopes without importing Django. The independent Django dispatcher decides the application domain:
+
+```text
+camera_id starts with offline_
+  -> OfflineResult import
+  -> no live Incident row / route
+
+otherwise
+  -> LIVE Incident import
+  -> normal routing / authorization domain
+```
+
+This split is part of the durability contract, not merely UI filtering.
 
 ---
 
@@ -268,17 +375,19 @@ Old Fight work may finish physically; it must fail closed logically.
 
 ---
 
-# 5. Desired camera state and capability reconciliation
+# 5. Desired LIVE camera state and capability reconciliation
 
 Primary files:
 
 ```text
 fight/runtime_supervisor/camera_state.py
 Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/analytics_control.py
+Fight_backend_project/backend_frontend_project/streams/source_kind.py
 fight/pipeline_mp/camera_lifecycle.py
 ```
 
-Schema version remains `1` with canonical fields including:
+Desired camera schema version remains `1` with canonical camera fields including:
 
 ```text
 camera_id
@@ -290,25 +399,53 @@ use_speed_detection
 speed_config
 ```
 
-A camera is active when:
+and durable global LIVE intent:
 
 ```text
-enabled == true
-AND (use_fight_detection == true OR use_speed_detection == true)
+speed_paused
+analytics_paused
 ```
 
-Supported modes:
+The Django registry publishes only:
 
 ```text
-Fight-only
-Speed-only
-Fight + Speed
-neither / not started
+Camera.is_active == true
+AND Camera.source_kind == LIVE
+AND runtime source exists
 ```
 
-Desired state has a monotonic revision. Stale/equal revisions must not create duplicate lifecycle work. `speed_paused` remains durable desired intent.
+Fight/Speed are independent analytics capabilities, **not camera existence**. A desired LIVE camera is therefore valid in all four branch modes:
 
-## 5.1 Source-preserving LIVE capability changes
+```text
+Preview-only:  Fight=false, Speed=false
+Fight-only:    Fight=true,  Speed=false
+Speed-only:    Fight=false, Speed=true
+Fight + Speed: Fight=true,  Speed=true
+```
+
+A preview-only camera keeps its CameraIngest/Preview runtime without loading Fight/Vehicle services solely because the source is present.
+
+Speed is advertised only when the Camera requests Speed and its current enabled `SpeedCameraConfig` resolves a usable speed configuration/calibration.
+
+Desired state has a monotonic revision. Stale/equal revisions must not create duplicate lifecycle work. Equal revisions with different cameras or pause intent are conflicts.
+
+## 5.1 LIVE analytics pause vs technical stop
+
+`analytics_paused=true` is durable **LIVE analytics intent**. The registry keeps monitorable LIVE cameras in desired state but publishes both analytics capabilities false while paused.
+
+```text
+analytics pause
+ -> keep LIVE desired camera
+ -> keep CameraIngest + Preview
+ -> withdraw Fight/Speed branches
+ -> shared models may idle if no other demand exists
+```
+
+An active historical OfflineRun is separate demand and may keep shared services alive while LIVE analytics are paused.
+
+Technical hard stop is different: it sets the monitoring hold and stops the Supervisor runtime, including acquisition/preview and any in-flight historical runtime work. Explicit resume clears that hold.
+
+## 5.2 Source-preserving LIVE capability changes
 
 When source identity is unchanged and the source is LIVE/non-file, capability/config transitions can reconfigure branch consumers without replacing the source runtime solely because branch composition changed.
 
@@ -325,28 +462,44 @@ A genuine source change is a source-runtime replacement and advances camera gene
 
 Ordered files remain conservative and do not use transparent live-style consumer recovery after ordered work may have been lost.
 
-`MAX_CAMERAS = 512` remains a schema/registry bound, not a capacity claim.
+## 5.3 Historical jobs are not desired LIVE cameras
+
+`OfflineAsset` and `OfflineRun` are deliberately absent from the Supervisor's durable LIVE desired-camera list. During one active historical job, `OfflineJobs` exposes the job's synthetic runtime camera to the runtime parent only:
+
+```text
+live_cameras = durable LIVE desired set
+combined     = live_cameras + offline.cameras()
+```
+
+`SharedServices.prepare(combined)` and `CameraRuntimeManager.reconcile(combined)` allow the one-shot job to reuse the same runtime without converting it into a persistent camera.
+
+`MAX_CAMERAS = 512` remains a registry/schema bound, not a capacity claim.
 
 ---
 
-# 6. CameraIngest and physical source ownership
+# 6. CameraIngest, source ownership and preview
 
-Primary implementation:
+Primary implementations:
 
 ```text
 fight/pipeline_mp/camera_ingest.py
+fight/pipeline_mp/camera_preview.py
+fight/pipeline_mp/preview_gateway.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/live_preview.py
 ```
+
+For a monitorable LIVE source:
 
 ```text
-                     +--> independently gated Fight branch
-Physical source ---> CameraIngest
-                     +--> independently gated Speed branch
-                     +--> Preview
+                         +--> Fight branch when enabled
+LIVE physical/network ---> CameraIngest
+                         +--> Speed branch when enabled
+                         +--> Preview always
 ```
 
-CameraIngest is the sole source/decode/reconnect owner in the Supervisor-managed production path.
+CameraIngest is the sole source/decode/reconnect owner in the Supervisor-managed LIVE production path. Fight or Vehicle service recovery is never permission to open a second source.
 
-Fight or Vehicle service recovery is never permission to open a second source.
+For an explicit historical run, the same CameraIngest implementation is intentionally reused as the **single one-shot decoder for that OfflineRun identity**. This does not turn the asset into a LIVE Camera and does not permit web/preview consumers to reopen it independently.
 
 ## 6.1 Independent branch gating
 
@@ -354,9 +507,38 @@ Fight and Speed branch queues are allocated for the source runtime and gated ind
 
 Fight publication uses parent-owned Fight pause/epoch state. Disabled Fight is not counted as a dropped Fight frame merely because work was intentionally not offered. Speed uses its own stop/epoch semantics. Preview is independent.
 
-This separation allows the source to remain alive while a Fight consumer is withdrawn/replaced.
+This separation allows CameraIngest + Preview to remain alive while Fight and/or Speed consumers are withdrawn, replaced or intentionally paused.
 
-## 6.2 LIVE reconnect
+## 6.2 Primary LIVE preview transport — Phase 24
+
+The primary Supervisor preview path is in-memory and latest-frame oriented:
+
+```text
+CameraIngest preview queue (bounded/latest)
+ -> camera_preview
+ -> JPEG encode
+ -> bounded preview_live_channel with replace-old semantics
+ -> parent PreviewGateway cache (one current JPEG per slot/generation)
+ -> private loopback authenticated stream
+ -> Django authorization proxy
+ -> browser
+```
+
+Properties:
+
+- `camera_preview` never opens the physical/network source.
+- The primary path does not require a per-frame disk write/read round trip.
+- Preview is deliberately lossy: freshness wins over completeness.
+- A slow/absent viewer cannot backpressure CameraIngest or ordered inference.
+- Preview cache entries are slot/generation and frame-sequence fenced and expire when stale.
+- The gateway is loopback-only, bearer-protected and bounded; it is not exposed as public media.
+- Django re-checks current user/camera authorization during long-lived streams.
+- Multi-camera browser preview uses one bounded multiplexed page stream for up to the configured page limit rather than one independent source connection per card.
+- The old disk preview writer remains only as a fallback path when no live preview channel is supplied; it is not the primary Phase-24 browser path.
+
+Historical playback does **not** use the LIVE PreviewGateway. It serves the original authorized asset through protected byte-range responses.
+
+## 6.3 LIVE reconnect
 
 Reconnect is CameraIngest-owned, bounded and exponential. Phase 20/21 made reconnect waits stop-aware so shutdown does not block on an uninterruptible sleep.
 
@@ -364,7 +546,7 @@ Reconnect delay resets only after real frame flow resumes, not merely after reop
 
 Temporary source silence must not independently trigger Fight/Vehicle bundle replacement simply because no frames are arriving.
 
-## 6.3 Ordered-file EOF
+## 6.4 Ordered-file EOF
 
 For a non-looping local file, each `CameraRuntime` owns a fresh generation-local `multiprocessing.Event` representing authoritative EOF.
 
@@ -373,12 +555,14 @@ legitimate file EOF
  -> set EOF Event
  -> publish consumer EOF signal(s)
  -> consumers drain/exit
- -> manager/watchdog classify completion
+ -> manager classifies completion
 ```
 
 A later Fight consumer epoch cannot replace or reinterpret source-generation EOF truth.
 
 Blocked ordered Fight error/EOF publication observes Fight withdrawal/stop guards so an intentionally removed Fight reader cannot deadlock CameraIngest indefinitely.
+
+For explicit OfflineRun work, the generic FILE rules are strengthened by one-shot job ownership and downstream drain/cursor completion described in Section 13.
 
 ---
 
@@ -395,10 +579,13 @@ Per-camera runtime state includes desired camera definition, slot/generation, so
 Normal composition:
 
 ```text
+Preview-only: CameraIngest + Preview
 Fight-only:   CameraIngest + camera_worker + Preview
 Speed-only:   CameraIngest + speed_worker + Preview
 Fight+Speed:  CameraIngest + camera_worker + speed_worker + Preview
 ```
+
+The same manager temporarily owns an explicit `offline_<run-uuid>` runtime camera. That runtime may also contain a Preview process as part of the common source lifecycle, but OFFLINE IDs are never exposed through the LIVE browser-preview authorization path.
 
 ## 7.1 Fight consumer replacement
 
@@ -477,6 +664,13 @@ Current desired state wins over pending recovery.
 
 A Speed-consumer spawn failure is not silently left as “enabled but absent”; LIVE mode uses the existing bounded local retry policy.
 
+## 7.5 Explicit OfflineRun lifecycle
+
+An offline runtime identity is one-shot. `restart_camera()` treats `offline_*` specially: watchdog/source restart requests terminate/fail that run instead of reopening/replaying the asset. FILE Fight/Speed consumer failures remain latched and are not transparently reattached.
+
+Only a new explicit OfflineRun may intentionally decode the asset again.
+
+
 ---
 
 # 8. SharedServices and service lifecycle
@@ -487,11 +681,13 @@ Primary implementation:
 fight/pipeline_mp/shared_services.py::SharedServices
 ```
 
-Required service bundles derive from active desired capabilities:
+Required service bundles derive from enabled capabilities over **all current runtime demand**, not merely persistent LIVE cameras:
 
 ```text
-fight   = any active camera requiring Fight
-vehicle = any active camera requiring Speed
+runtime demand = current LIVE desired cameras + active offline runtime camera
+
+fight   = any enabled demand requiring Fight
+vehicle = any enabled demand requiring Speed
 ```
 
 Fight bundle:
@@ -523,6 +719,13 @@ confirmed failure -> non-graceful bounded teardown + recovery
 Default shared-service idle grace remains 5 seconds.
 
 Normal service finalization retains the Phase-19 8-second shared grace budget per bundle. Failure/recovery does not reuse graceful finalization on potentially poisoned transport.
+
+Consequences of the current product split:
+
+- Preview-only LIVE cameras do not require Fight or Vehicle solely because the runtime exists.
+- LIVE analytics pause may make both optional bundles idle.
+- A concurrently processing historical job can legitimately keep Fight and/or Vehicle required while LIVE analytics are paused.
+- When an offline job becomes terminal, `OfflineJobs` recomputes service requirements from LIVE cameras so historical-only demand does not leak.
 
 ---
 
@@ -575,6 +778,13 @@ maximum added sleep 140 ms
 ```
 
 The old complete snapshot remains until replacement succeeds. Unrelated/persistent errors surface. Parent reporting includes errno/winerror. Snapshot publication remains best-effort/non-fatal.
+
+## 9.4 LIVE operator projection vs offline job truth
+
+Runtime health may contain temporary `offline_*` camera records because historical jobs reuse `CameraRuntimeManager`. Operator LIVE status intentionally excludes those IDs from LIVE camera cards and LIVE analytics-confirmation calculations.
+
+Historical job completion/failure is proven by durable offline job state, FILE EOF and downstream drain/cursor state. Health/telemetry alone is never proof that an OfflineRun completed.
+
 
 ---
 
@@ -684,7 +894,11 @@ camera_worker[N]
 
 Fight consumer epoch is propagated through correctness-relevant request/result/health/report/incident paths. Shared Fight service epoch remains a separate boundary.
 
-Fight event/evidence IDs include source generation and Fight consumer incarnation so a restarted camera worker cannot reuse a local counter value and overwrite earlier evidence.
+Fight logical event identity includes source generation and Fight consumer incarnation so a restarted camera worker cannot reuse a local counter value as current work.
+
+On-disk Fight evidence names use `fight/pipeline/evidence_metadata.py::compact_evidence_name`: a deterministic 128-bit BLAKE2b identity token plus generation, Fight epoch, event counter and a compact time token. OFFLINE names use a video-relative millisecond token rather than `datetime.fromtimestamp(relative_seconds)`, avoiding both 1970 dates and the reproduced UUID-duplication/277-character filename failure.
+
+A temporary clip-serialization failure is carried as `evidence_error`. Stage3 may still infer from the job's in-memory frames; however the historical run cannot silently claim durable evidence success and is failed explicitly after ordered EOF/downstream drain when evidence is required.
 
 ---
 
@@ -719,11 +933,16 @@ Vehicle result payloads do not send full frame pixels back.
 
 A Fight-only recovery must preserve Speed worker identity/state, Speed epoch, Vehicle service and existing source feed on a healthy mixed LIVE camera.
 
+## 12.1 Historical Speed
+
+Historical Speed uses the same camera-local Speed processor and shared Vehicle service, but a Speed/BOTH OfflineRun is not queued until a calibration document is supplied and validated. The run snapshots that calibration into private job storage; a historical run does not borrow mutable LIVE camera calibration implicitly.
+
+
 ---
 
-# 13. Live vs ordered-file semantics
+# 13. LIVE vs ordered FILE vs explicit historical-run semantics
 
-## 13.1 LIVE / RTSP
+## 13.1 LIVE / RTSP / HTTP camera
 
 Priority:
 
@@ -734,15 +953,16 @@ freshness > completeness
 Expected behavior:
 
 - bounded queues,
-- stale live work may be shed explicitly,
+- stale LIVE work may be shed explicitly,
 - reconnect is ingest-owned,
 - bounded local retries,
 - eligible LIVE Speed resumes after Vehicle recovery,
 - eligible LIVE Fight resumes after Fight recovery,
 - unrelated branches/services survive recoverable faults where safe,
-- same-source capability churn preserves source generation where possible.
+- same-source capability churn preserves source generation where possible,
+- preview may remain active with both analytics branches intentionally disabled.
 
-## 13.2 FILE
+## 13.2 Generic ordered FILE
 
 Priority:
 
@@ -763,11 +983,79 @@ Expected behavior:
 - Fight/Vehicle service failures do not replay partial files,
 - benchmark deadline truncation remains `INCOMPLETE`.
 
-Phase 22 does not change these rules.
+These generic FILE rules remain valid for benchmark/local-file execution. Django's product workflow adds the stronger explicit historical domain below.
+
+## 13.3 OFFLINE / historical application workflow — Phase 25
+
+Persistent domain:
+
+```text
+OfflineAsset
+  -> original private file + optional Location + optional legacy Camera link
+
+OfflineRun (UUID)
+  -> explicit analysis_type: FIGHT / SPEED / BOTH
+  -> configuration snapshot
+  -> QUEUED / PROCESSING / COMPLETED / FAILED / CANCELLED
+
+OfflineResult
+  -> run
+  -> event_id
+  -> analysis_type
+  -> video_time_sec
+  -> confidence
+  -> evidence_path
+  -> payload
+```
+
+An upload creates an `OfflineAsset`; it does **not** create a new LIVE Camera. Migration `0009_backfill_offline_assets` links historical non-live Camera records to assets without moving original files, deleting legacy Incidents, or creating implicit analysis runs.
+
+Current job protocol is intentionally one outstanding request at a time:
+
+```text
+Django create_run
+ -> immutable OfflineRun UUID / offline_<uuidhex>
+ -> request.json
+
+runtime OfflineJobs
+ -> persist PROCESSING claim + owner BEFORE source/model launch
+ -> SharedServices.prepare(live + offline)
+ -> CameraRuntimeManager.start_camera(one-shot FILE)
+ -> ordered processing
+ -> authoritative generation-local EOF
+ -> required consumer clean drain/exit
+ -> OfflineDrain through Stage3/Incident path
+ -> IncidentAggregator finalization
+ -> durable outbox offset acknowledgement
+
+Django reconcile_jobs
+ -> waits until Incident Dispatcher cursor >= acknowledged outbox offset
+ -> only then marks run COMPLETED
+```
+
+The cursor wait prevents the UI from declaring completion before historical results already published by the runtime have crossed the durable dispatcher boundary.
+
+Failure/restart rules:
+
+- a different parent encountering an old PROCESSING claim marks it `runtime_interrupted`; it does not replay it,
+- watchdog/source/required-consumer failure for `offline_*` is terminal for that run,
+- cancellation is terminal for that run identity,
+- explicit re-analysis creates a new UUID and may intentionally read the asset again,
+- technical global stop fails/interupts in-flight offline ownership rather than pretending it completed,
+- LIVE analytics pause does not cancel the historical job,
+- evidence-write failure may allow ordered inference/Stage3/drain to finish but the run becomes `FAILED / evidence_write_failed`, not `COMPLETED`.
+
+## 13.4 Historical time semantics
+
+Historical Fight event positions are video-relative seconds. Reporting uses explicit source-time fields and `OfflineResult.video_time_sec`; it does not format video position as Unix wall clock.
+
+LIVE event timestamps remain wall-clock timestamps.
+
+The durable outbox may still carry a real wall-clock `detected_at`/finalization time for transport/audit while `video_time_sec` carries historical position. These meanings must not be conflated.
 
 ---
 
-# 14. Incident durability boundary
+# 14. Incident durability and live-vs-historical persistence boundary
 
 Primary files:
 
@@ -776,25 +1064,77 @@ fight/pipeline/incident_outbox.py
 fight/pipeline/incident_aggregator.py
 fight/pipeline_mp/incident_worker.py
 fight/pipeline_mp/speed_worker.py
+Fight_backend_project/backend_frontend_project/incidents/services/ingest.py
+Fight_backend_project/backend_frontend_project/incidents/services/routing.py
+Fight_backend_project/backend_frontend_project/services/incident_access.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/offline_analysis.py
 ```
 
-Runtime produces evidence and durable incident envelopes before Django ingestion.
+Runtime produces evidence and durable outbox envelopes before Django ingestion.
 
-Core semantics:
+Core runtime semantics remain:
 
 - append-only JSONL incident outbox,
 - serialized writers,
 - flush/fsync where designed before successful publication,
 - partial-tail preservation,
 - persistence failure surfacing,
-- evidence durability before incident publication,
+- required evidence durability before successful publication,
 - stale generation/epoch guards,
 - Fight service + consumer publication floors,
-- Speed generation + consumer-epoch fencing.
+- Speed generation + consumer-epoch fencing,
+- optional `video_time_sec` for historical position.
 
-Runtime never directly creates Incident ORM rows.
+Runtime never directly creates Django `Incident` or `OfflineResult` ORM rows.
 
-## 14.1 Qualification evidence limitation
+## 14.1 LIVE envelope path
+
+For normal LIVE camera IDs:
+
+```text
+outbox
+ -> Django dispatcher
+ -> Incident ORM
+ -> routing / audit / ACK / resolve
+ -> access-scoped Olaylar / evidence
+```
+
+Routing itself refuses non-LIVE camera incidents, and operator-visible Incident queries filter to `camera.source_kind=LIVE`.
+
+## 14.2 OFFLINE envelope path
+
+`incidents.services.ingest.ingest_envelope` recognizes `offline_*` before normal Camera lookup:
+
+```text
+outbox envelope camera_id=offline_<run>
+ -> offline_analysis.import_result
+ -> OfflineResult (idempotent event_id)
+ -> NO live Incident ORM row
+ -> NO IncidentRoute / live alarm
+ -> Video Analizleri only
+```
+
+Historical playback/evidence is served through scope-checked protected endpoints with byte-range support. Retention reference checks protect evidence referenced by either live `Incident` or historical `OfflineResult`.
+
+This is a persistence-domain separation, not just presentation filtering.
+
+## 14.3 Phase-25.1 evidence failure semantics
+
+A Fight event may have enough in-memory frames for Stage3 even if temporary MP4 serialization fails.
+
+```text
+temp clip serialization fails
+ -> report explicit evidence_write_failed
+ -> Stage3 may infer from in-memory frames
+ -> do not fabricate clip_path/evidence
+ -> Incident worker records offline failure
+ -> ordered FILE reaches EOF/drain if otherwise healthy
+ -> OfflineRun becomes FAILED / evidence_write_failed
+```
+
+A true Fight consumer crash before EOF remains a required-consumer failure and stays fail-closed/no-replay.
+
+## 14.4 Qualification evidence limitation
 
 The current outbox schema does not retain publication-floor history sufficient for an external qualification harness to prove, after the fact, that every stale Fight item was rejected at the exact floor transition.
 
@@ -1370,7 +1710,7 @@ Final reviewed validation before commit: 236 passed + 26 subtests, compileall an
 
 ## Phase 22 — LIVE qualification + Windows shutdown hardening
 
-Current baseline:
+Phase-22 baseline:
 
 ```text
 06a67cc4328b602493ef9ef6d87916ec11e9b630
@@ -1407,20 +1747,97 @@ generated shutdown-backoff PASS_WITH_RECOVERY
 
 Real RTSP interruption and long-duration soak remain separate manual/environment-specific qualification.
 
+## Phase 23 — consolidated operator workspace
+
+Accepted implementation baseline:
+
+```text
+57dc5db9393f9791184fa4433501588ebe016634
+Integrate operator UI, live preview and offline analysis
+```
+
+Promoted the operator-facing UI from deferred work into architecture:
+
+- consolidated navigation: Genel Bakış; Kameralar/Lokasyonlar/Kullanıcılar; Canlı İzleme/Olaylar/Video Analizleri; Sistem Durumu,
+- one presentation layer over existing runtime/Incident/access services rather than duplicate Fight/Speed dashboards,
+- unified LIVE event history/detail with camera scope,
+- legacy route compatibility while primary ACK/routing internals remain out of the normal operator UI,
+- redacted/friendly status projection,
+- LIVE camera form no longer accepts uploaded/local historical media as a camera source,
+- public authentication/error templates separated from the authenticated workspace.
+
+## Phase 24 — source-preserving LIVE preview, analytics control and access UI
+
+Same accepted baseline commit above.
+
+Established:
+
+- CameraIngest/Preview can run with Fight=false and Speed=false,
+- primary in-memory latest-frame preview transport,
+- parent-owned private loopback PreviewGateway,
+- one bounded multiplexed browser stream for page previews,
+- browser preview authorization continuously rechecked through Django scope,
+- LIVE analytics pause distinct from technical runtime stop,
+- analytics pause preserves LIVE source/preview and fences removed Fight/Speed consumers,
+- SecurityUnit assignment management in admin user create/edit,
+- unassigned approved viewers fail closed with an explicit no-access message,
+- source/capability churn remains generation/epoch fenced,
+- no web/preview source reopen.
+
+## Phase 25 — explicit historical-video analysis domain
+
+Same accepted baseline commit above.
+
+Established:
+
+- `Camera.source_kind` compatibility classification,
+- `OfflineAsset`, `OfflineRun`, `OfflineResult`,
+- migrations `0008_offline_analysis_domain` and `0009_backfill_offline_assets`,
+- LIVE registry excludes uploaded/local historical sources,
+- explicit FIGHT/SPEED/BOTH run creation; re-analysis = new run,
+- one-shot parent-owned `OfflineJobs` using the existing runtime and shared services,
+- durable claim/no-silent-replay semantics,
+- downstream `OfflineDrain` + outbox-offset + Django dispatcher-cursor completion,
+- historical envelopes import into `OfflineResult`, never live Incident/routing,
+- protected scoped original playback/evidence,
+- historical Speed requires validated calibration before queueing.
+
+## Phase 25.1 — historical evidence path/time hardening
+
+Same accepted baseline commit above.
+
+Established:
+
+- compact deterministic evidence filenames using a 128-bit identity hash plus generation/Fight epoch/counter/time token,
+- video-relative Fight metadata instead of 1970 epoch formatting,
+- explicit `evidence_error` propagation,
+- Stage3 continuation from in-memory frames after auxiliary temp-clip serialization failure,
+- evidence failure separated from Fight consumer/process failure,
+- historical evidence failure terminal only after authoritative EOF/downstream drain when the inference path otherwise remains healthy,
+- genuine pre-EOF consumer failure remains fail-closed/no-replay.
+
+Focused Phase-25.1 development validation reported 102 passed, 1 skipped when ffmpeg was unavailable in that test environment. The final repository-wide validation supersedes intermediate counts: 278 passed + 26 subtests, compileall/check/migration-drift/diff checks clean as reported at the top of this contract.
+
+Manual accepted historical Fight run processed 903/903 source frames and reached clean authoritative EOF with six Stage3 submissions and one historical result. This validates that reproduced path only; it is not a general throughput claim.
+
+
 ---
 
 # 26. Task router for coding agents
 
-Read this document first and inspect current Supervisor-managed ownership paths rather than inferring architecture from legacy helpers.
+Read this document first and inspect current Supervisor-managed ownership paths rather than inferring architecture from legacy helpers. Coding agents must not modify this contract.
 
-## Supervisor / Windows shutdown
+## Supervisor / Windows shutdown / desired state
 
 ```text
 fight/runtime_supervisor/core.py
 fight/runtime_supervisor/camera_state.py
+fight/runtime_supervisor/client.py
 fight/runtime_supervisor/locking.py
 fight/pipeline_mp/common.py
 fight/pipeline_mp/run_multiprocess.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/camera_registry.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/analytics_control.py
 tests/test_runtime_supervisor.py
 ```
 
@@ -1439,6 +1856,46 @@ tests/test_dynamic_camera_lifecycle.py
 tests/test_fight_service_recovery.py
 tests/test_runtime_health.py
 tests/test_speed_integration.py
+```
+
+## LIVE preview / operator status — Phase 24
+
+```text
+fight/pipeline_mp/camera_preview.py
+fight/pipeline_mp/preview_gateway.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/live_preview.py
+Fight_backend_project/backend_frontend_project/guvenlik/operator_views.py
+Fight_backend_project/backend_frontend_project/guvenlik/presentation.py
+Fight_backend_project/backend_frontend_project/static/operations/preview_stream.js
+Fight_backend_project/backend_frontend_project/static/operations/workspace.js
+Fight_backend_project/backend_frontend_project/templates/operations/
+tests/test_live_preview.py
+tests/preview_stream_test.cjs
+Fight_backend_project/backend_frontend_project/guvenlik/phase23_tests.py
+Fight_backend_project/backend_frontend_project/guvenlik/phase24_tests.py
+```
+
+## Historical/offline analysis — Phase 25/25.1
+
+```text
+Fight_backend_project/backend_frontend_project/streams/models.py
+Fight_backend_project/backend_frontend_project/streams/source_kind.py
+Fight_backend_project/backend_frontend_project/streams/offline_views.py
+Fight_backend_project/backend_frontend_project/streams/protected_media.py
+Fight_backend_project/backend_frontend_project/streams/migrations/0008_offline_analysis_domain.py
+Fight_backend_project/backend_frontend_project/streams/migrations/0009_backfill_offline_assets.py
+Fight_backend_project/backend_frontend_project/services/pipeline_bridge/offline_analysis.py
+fight/pipeline_mp/offline_jobs.py
+fight/pipeline/evidence_metadata.py
+fight/pipeline_mp/camera_worker.py
+fight/pipeline_mp/stage3_worker.py
+fight/pipeline_mp/incident_worker.py
+fight/pipeline/incident_aggregator.py
+fight/pipeline/incident_outbox.py
+Fight_backend_project/backend_frontend_project/incidents/services/ingest.py
+Fight_backend_project/backend_frontend_project/streams/phase25_tests.py
+tests/test_offline_jobs.py
+tests/test_offline_evidence.py
 ```
 
 ## Fight inference / durable fencing
@@ -1461,6 +1918,7 @@ fight/pipeline_mp/speed_worker.py
 fight/pipeline_mp/camera_lifecycle.py
 fight/pipeline_mp/shared_services.py
 fight/pipeline_mp/run_multiprocess.py
+Fight_backend_project/backend_frontend_project/services/speed_bridge/speed_runner.py
 tests/test_speed_integration.py
 ```
 
@@ -1519,18 +1977,21 @@ fight/pipeline/incident_outbox.py
 fight/pipeline/incident_aggregator.py
 fight/pipeline_mp/incident_worker.py
 fight/pipeline_mp/speed_worker.py
-incidents/services/ingest.py
-incidents/services/retention.py
-incidents/models.py
+Fight_backend_project/backend_frontend_project/incidents/services/ingest.py
+Fight_backend_project/backend_frontend_project/incidents/services/retention.py
+Fight_backend_project/backend_frontend_project/incidents/services/routing.py
+Fight_backend_project/backend_frontend_project/incidents/models.py
 ```
 
 ## Location / authorization
 
 ```text
-adminx/models.py
-streams/models.py
-services/access_scope.py
-incidents/models.py
+Fight_backend_project/backend_frontend_project/adminx/models.py
+Fight_backend_project/backend_frontend_project/adminx/forms.py
+Fight_backend_project/backend_frontend_project/streams/models.py
+Fight_backend_project/backend_frontend_project/services/access_scope.py
+Fight_backend_project/backend_frontend_project/services/incident_access.py
+Fight_backend_project/backend_frontend_project/incidents/models.py
 ```
 
 ---
@@ -1542,12 +2003,15 @@ Before accepting architecture-affecting work, verify as applicable:
 ```text
 [ ] ARCHITECTURE.md was read first and coding agent did not modify it
 [ ] one Runtime Supervisor owns the global AI runtime
-[ ] one CameraIngest remains the source/decode/reconnect owner per physical camera
-[ ] no recovery path opens a duplicate physical source
-[ ] Fight+Speed still share one source decode
 [ ] runtime remains Django-ORM-free
+[ ] one CameraIngest remains source/decode/reconnect owner per active runtime source incarnation
+[ ] no recovery or web/preview path opens a duplicate LIVE physical source
+[ ] LIVE Fight+Speed still share one source decode
+[ ] monitorable LIVE preview-only cameras remain valid with Fight=false and Speed=false
+[ ] LIVE registry publishes source_kind=LIVE cameras only
+[ ] uploaded/local historical media is not inserted into LIVE desired camera state
 [ ] camera-local temporal/calibration state stays local
-[ ] optional shared services start only when required
+[ ] optional shared services start only when LIVE + active OFFLINE demand requires them
 [ ] source generation, Fight epoch, Speed epoch and service epochs retain distinct meanings
 [ ] same-source LIVE Fight recovery does not advance camera generation
 [ ] Fight-only recovery does not advance Speed epoch
@@ -1558,13 +2022,37 @@ Before accepting architecture-affecting work, verify as applicable:
 [ ] capability churn cannot resurrect removed/disabled/stale consumers
 [ ] source change creates a new source generation
 [ ] global stop prevents pending recovery/reconnect recreation
+[ ] LIVE analytics pause preserves CameraIngest/Preview while withdrawing analytics
+[ ] LIVE analytics pause does not silently cancel an active OfflineRun
+[ ] technical hard stop remains distinct from analytics pause and sets monitoring hold
+[ ] primary preview path never opens the source and does not require per-frame disk round trip
+[ ] preview latest-frame replacement is bounded and cannot backpressure CameraIngest
+[ ] preview cache/packets are generation and frame-sequence fenced
+[ ] PreviewGateway remains loopback-only, bearer-protected, bounded and private
+[ ] Django preview proxy validates active run and continuously rechecks camera authorization
+[ ] historical upload creates OfflineAsset, not a new LIVE Camera
+[ ] explicit OfflineRun UUID is required for processing/re-analysis
+[ ] current single-outstanding offline request protocol is not misrepresented as concurrent job scheduling
+[ ] offline claim is persisted before source/model launch
+[ ] interrupted/failed OfflineRun cannot silently replay under a new parent
 [ ] ordered-file EOF remains generation-local authoritative state
-[ ] clean file completion still requires EOF + exitcode 0
+[ ] clean file completion still requires EOF + exitcode 0 for required consumers
 [ ] failed ordered work cannot later become clean because EOF arrived
 [ ] ordered FILE recovery never replays lost work
+[ ] OfflineRun completion additionally waits downstream drain acknowledgement
+[ ] Django does not mark OfflineRun complete before dispatcher cursor reaches acknowledged outbox offset
+[ ] offline_* outbox envelopes create OfflineResult only, never live Incident/routing
+[ ] operator LIVE incident feeds remain source_kind=LIVE
+[ ] historical video position remains video-relative, never formatted as 1970 wall time
+[ ] compact historical evidence names preserve uniqueness without repeated full UUID paths
+[ ] temp evidence serialization failure is distinct from inference-consumer failure
+[ ] historical evidence failure cannot be reported as successful durable evidence
+[ ] historical playback/evidence is access-scoped and path traversal/reference escape is rejected
+[ ] historical Speed cannot queue without validated calibration
 [ ] fair scheduling/capacity stays bounded
 [ ] no correctness dependency on OS qsize()/empty()
 [ ] health remains generation/consumer/service-epoch aware
+[ ] OfflineRun completion truth is durable job/EOF/drain state, not health telemetry
 [ ] snapshot retry remains limited to documented transient Windows replacement errors
 [ ] normal shared-service withdrawal retains Phase-19 bounded graceful finalization
 [ ] failure teardown does not pretend to be graceful just to preserve telemetry
@@ -1586,8 +2074,9 @@ Before accepting architecture-affecting work, verify as applicable:
 [ ] benchmark and qualification classifications remain distinct
 [ ] synthetic counts are not called real capacity
 [ ] one GPU's measurements are not extrapolated to another GPU
-[ ] generated runtime/benchmark artifacts are not staged
-[ ] UI/PostgreSQL/Docker/Nginx/deployment remain frozen unless explicitly promoted
+[ ] generated runtime/benchmark/job secrets are not staged
+[ ] accepted Phase-23/24/25 UI semantics are preserved unless a new phase explicitly changes them
+[ ] PostgreSQL/Docker/Nginx/deployment and further UX redesign remain frozen unless explicitly promoted
 ```
 
 ---
@@ -1598,6 +2087,8 @@ Operational/generated paths include:
 
 ```text
 .runtime_supervisor/
+.runtime_supervisor/preview_gateway.json
+.runtime_supervisor/offline/
 Fight_backend_project/backend_frontend_project/media/camera_uploads/
 Fight_backend_project/backend_frontend_project/media/pipeline_runs/.run_locks/
 Fight_backend_project/backend_frontend_project/media/runtime_spool/
@@ -1606,24 +2097,38 @@ benchmarks/.capacity.lock
 phase*_review.diff
 ```
 
-Each benchmark/qualification run gets a new result directory. Historical results are not overwritten to obtain a cleaner number.
+The preview-gateway descriptor contains run-private connection metadata/token and is operational state, not a public/static artifact.
 
-Private LIVE configs and raw logs may contain source credentials or network details and must not be committed.
+The offline job root contains private uploaded assets, calibration snapshots, request/state files and run ownership metadata. It is not source code and must not be exposed as a generic media directory.
+
+Each benchmark/qualification run gets a new result directory. Historical benchmark results are not overwritten to obtain a cleaner number.
+
+Private LIVE configs/raw logs may contain source credentials or network details and must not be committed. Raw local filesystem paths are not authorization.
+
+A tracked root helper currently present at the Phase-25.1 reference commit, `mp4_mjpeg_camera.py`, is a manual/local MJPEG diagnostic fixture. It is **not** part of the production source-ownership topology, not a second production CameraIngest, and must not be used by coding agents as an architectural source owner.
 
 ---
 
-# 29. Deferred / frozen work after Phase 22
+# 29. Deferred / frozen work and known risks after Phase 25.1
 
 Highest-value next qualification work:
 
 - real external RTSP baseline with representative FPS/resolution/network path,
 - deliberate RTSP/network interruption and reconnect validation,
-- long-duration soak with source churn, capability churn, Fight/Vehicle recovery and storage growth,
+- long-duration soak with source churn, capability churn, preview clients, Fight/Vehicle recovery, offline jobs and storage growth,
 - repeated orphan/process-tree checks under real Windows long runs,
 - mixed Fight+Speed workloads that actually exercise Pose and Stage3,
 - target-hardware RTX 5090 characterization using the real machine,
 - realistic incident/evidence end-to-end latency and duplicate-incident validation,
-- production-class storage/retention/operator observability sizing.
+- real historical Speed acceptance with representative calibration/evidence,
+- production-class storage/retention/operator-observability sizing.
+
+Known implementation risks at the current reference commit:
+
+1. **Windows stale-PID probe gap.** `fight/runtime_supervisor/core.py::_pid_exists` currently catches `ProcessLookupError`, `PermissionError` and `OSError` around `os.kill(pid, 0)`, but not `SystemError`. A manual Windows restart previously reproduced `WinError 87 / SystemError: built-in kill returned a result with an exception set` for a stale persisted PID. The architecture requires stale PID reconciliation to be safe, but this specific implementation edge still needs a focused fix/regression before it should be called fully hardened.
+2. **Arbitrarily deep Windows output roots are not proven safe.** Phase 25.1 substantially shortens evidence filenames and fixed the reproduced 277-character path case, but exceptionally deep base/run directories can still exceed a codec/platform path limit.
+3. **Offline concurrency is intentionally not claimed.** The current durable protocol has one outstanding `request.json`; multi-job scheduling requires a separately designed queue/ownership model.
+4. **Manual historical acceptance is Fight-focused.** Unit/integration coverage enforces Speed calibration and common lifecycle behavior, but representative real historical Speed calibration/evidence acceptance remains outstanding.
 
 Optimization work remains evidence-driven:
 
@@ -1640,16 +2145,18 @@ PostgreSQL migration
 Docker redesign
 Nginx/media offload
 production deployment/service packaging
-frontend/dashboard redesign
-incident UX redesign
-preview/offline UX redesign
+further frontend/dashboard redesign
+further incident UX redesign
+further preview/offline UX redesign
 ```
+
+The Phase-23/24/25 workspace, preview and historical-video workflows themselves are **not deferred**; they are the accepted current architecture.
 
 ---
 
-# 30. Qualification strategy after Phase 22
+# 30. Qualification strategy after Phase 25.1
 
-Phase 22 changes the next question from “can we simulate the recovery state machine?” to “does the same ownership contract hold under representative real live conditions for long enough to trust operationally?”
+Phase 22 established the real Supervisor-path LIVE qualification method. Phases 23-25.1 add operator-preview and historical-workflow boundaries that must be qualified without weakening the same ownership contract.
 
 On a real RTSP environment, qualification should capture at minimum:
 
@@ -1662,6 +2169,7 @@ Speed epoch
 Fight service epoch
 Vehicle service epoch
 Fight/Speed/Preview progress
+preview freshness and bounded viewer behavior
 restart/recovery counters
 source reconnect counters
 health/snapshot failures
@@ -1673,6 +2181,26 @@ GPU utilization / VRAM where available
 incident/evidence artifacts when naturally produced
 ```
 
+Historical acceptance should separately capture:
+
+```text
+explicit OfflineRun identity
+asset authorization and protected original playback
+one-shot claim before decode
+source frame count vs consumed frame count where known
+authoritative EOF
+required Fight/Speed consumer completion
+Stage3/Incident downstream drain acknowledgement
+dispatcher cursor >= acknowledged outbox offset
+OfflineResult persistence
+absence of corresponding live Incident/routing rows
+video-relative result time
+evidence-path validity
+restart/interruption => terminal no-replay
+explicit re-analysis => new run identity
+Speed calibration validation for SPEED/BOTH
+```
+
 For target-hardware capacity, add:
 
 ```text
@@ -1680,8 +2208,10 @@ aggregate and per-camera service rate
 Person/Pose/Stage3 queue + inference + result enqueue
 Vehicle admission-inclusive wait + inference + result enqueue
 Fight/Speed camera-local processing
+preview encoding/fan-out cost under representative viewers
 queue high-water / rejection / live shedding
 Reporter/snapshot reliability over long duration
+historical + LIVE contention where both are allowed
 ```
 
 Decision rule:
@@ -1693,6 +2223,9 @@ If shared model service time/queueing dominates:
 If camera-local CPU work dominates:
     optimize that subsystem first.
 
+If preview encoding/fan-out becomes material:
+    optimize preview separately; do not make source ownership or inference wait on viewers.
+
 If transport remains dominant after controlling backlog/fanout:
     run a shared-memory transport experiment before adopting it.
 
@@ -1703,4 +2236,4 @@ If target GPU behavior differs materially from RTX 3050:
     prefer target measurements over laptop tuning conclusions.
 ```
 
-No camera-count or RTSP SLA claim belongs in this contract without a clearly described real workload, hardware, source characteristics, duration and acceptance criterion.
+No camera-count, RTSP SLA, historical-throughput or multi-job concurrency claim belongs in this contract without a clearly described real workload, hardware, source characteristics, duration and acceptance criterion.
