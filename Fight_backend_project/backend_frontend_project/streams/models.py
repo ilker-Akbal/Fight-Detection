@@ -15,6 +15,15 @@ def camera_video_upload_to(instance, filename):
 
 
 class Camera(models.Model):
+    source_kind = models.CharField(max_length=8, default="LIVE", editable=False)
+
+    def save(self, *args, **kwargs):
+        from .source_kind import is_live_source
+        self.source_kind = "LIVE" if is_live_source(self.source, self.uploaded_video) else "OFFLINE"
+        if kwargs.get("update_fields") is not None:
+            kwargs["update_fields"] = set(kwargs["update_fields"]) | {"source_kind"}
+        super().save(*args, **kwargs)
+
     name = models.CharField(
         max_length=120,
         verbose_name="Kamera Adı",
@@ -146,3 +155,43 @@ class Camera(models.Model):
 
     def __str__(self):
         return f"{self.name} ({self.camera_id}) - {self.get_faculty_display()}"
+
+
+class OfflineAsset(models.Model):
+    """Historical media, never a desired live camera. Legacy files stay in place."""
+    name = models.CharField(max_length=120)
+    location = models.ForeignKey("adminx.Location", on_delete=models.PROTECT, null=True)
+    legacy_camera = models.OneToOneField(Camera, on_delete=models.PROTECT, null=True, blank=True)
+    # Private server-owned path, not a public MEDIA URL or a user-supplied path.
+    file_path = models.CharField(max_length=1000)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
+class OfflineRun(models.Model):
+    STATES = [("QUEUED", "Bekliyor"), ("PROCESSING", "İşleniyor"),
+              ("COMPLETED", "Tamamlandı"), ("FAILED", "Başarısız"), ("CANCELLED", "İptal edildi")]
+    id = models.UUIDField(primary_key=True, default=uuid4, editable=False)
+    asset = models.ForeignKey(OfflineAsset, on_delete=models.PROTECT, related_name="runs")
+    analysis_type = models.CharField(max_length=8, choices=[("FIGHT", "Kavga"), ("SPEED", "Hız"), ("BOTH", "Kavga + Hız")])
+    configuration = models.JSONField(default=dict)
+    state = models.CharField(max_length=12, choices=STATES, default="QUEUED")
+    created_at = models.DateTimeField(auto_now_add=True)
+    started_at = models.DateTimeField(null=True)
+    completed_at = models.DateTimeField(null=True)
+    error = models.CharField(max_length=100, blank=True)
+    cancel_requested = models.BooleanField(default=False)
+
+    @property
+    def runtime_camera_id(self):
+        return "offline_" + self.id.hex
+
+
+class OfflineResult(models.Model):
+    run = models.ForeignKey(OfflineRun, on_delete=models.PROTECT, related_name="results")
+    event_id = models.UUIDField(unique=True)
+    analysis_type = models.CharField(max_length=8)
+    video_time_sec = models.FloatField(null=True)
+    confidence = models.FloatField(null=True)
+    evidence_path = models.CharField(max_length=1000, blank=True)
+    payload = models.JSONField(default=dict)
+    created_at = models.DateTimeField(auto_now_add=True)

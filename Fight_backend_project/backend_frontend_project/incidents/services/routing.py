@@ -57,7 +57,7 @@ def route_incident(
         .select_related("camera", "camera__location")
         .get(pk=incident.pk)
     )
-    if incident.status != Incident.STATUS_OPEN:
+    if incident.status != Incident.STATUS_OPEN or incident.camera.source_kind != "LIVE":
         return 0
     if incident.routing_started_at is None:
         incident.routing_started_at = now

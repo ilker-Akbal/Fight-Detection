@@ -125,7 +125,7 @@ def _base_mail_template(title, description, button_text=None, button_url=None, e
 
 @never_cache
 def splash_view(request):
-    next_url = request.GET.get("next", f"{settings.URL_PREFIX}/dashboard/")
+    next_url = _safe_next_url(request.GET.get("next"))
 
     return render(
         request,
@@ -139,11 +139,12 @@ def splash_view(request):
 @require_http_methods(["GET", "POST"])
 def login_view(request):
     next_url = _safe_next_url(
-        request.POST.get("next") or request.GET.get("next") or f"{settings.URL_PREFIX}/dashboard/"
+        request.POST.get("next") or request.GET.get("next")
     )
 
     if request.user.is_authenticated:
-        return redirect(f"{settings.URL_PREFIX}/dashboard/")
+        from services.access_scope import is_it_admin
+        return redirect(next_url or ("adminx:dashboard" if is_it_admin(request.user) else "dashboard:index"))
 
     error = None
 
@@ -175,7 +176,8 @@ def login_view(request):
                     if next_url:
                         return redirect(next_url)
 
-                    return redirect(f"{settings.URL_PREFIX}/dashboard/")
+                    from services.access_scope import is_it_admin
+                    return redirect("adminx:dashboard" if is_it_admin(user) else "dashboard:index")
 
     return render(
         request,

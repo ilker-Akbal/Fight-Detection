@@ -17,6 +17,13 @@ class InvalidDesiredCameraState(ValueError):
     pass
 
 
+class DuplicateCameraSources(InvalidDesiredCameraState):
+    """Safe camera identities only; never include source addresses in errors."""
+    def __init__(self, groups):
+        self.camera_groups = groups
+        super().__init__("enabled cameras must have distinct sources; enable both consumers on one camera")
+
+
 class StaleDesiredCameraRevision(InvalidDesiredCameraState):
     pass
 
@@ -70,10 +77,13 @@ def normalize_cameras(cameras) -> list[dict]:
     ids = [camera["camera_id"] for camera in normalized]
     if len(ids) != len(set(ids)):
         raise InvalidDesiredCameraState("camera_id values must be unique")
-    sources = [item["source"] for item in normalized if item["enabled"] and (
-        item["use_fight_detection"] or item["use_speed_detection"])]
+    sources = [item["source"] for item in normalized if item["enabled"]]
     if len(sources) != len(set(sources)):
-        raise InvalidDesiredCameraState("enabled cameras must have distinct sources; enable both consumers on one camera")
+        groups = {}
+        for camera in normalized:
+            if camera["enabled"]:
+                groups.setdefault(camera["source"], []).append(camera["camera_id"])
+        raise DuplicateCameraSources(sorted(sorted(ids) for ids in groups.values() if len(ids) > 1))
     return sorted(normalized, key=lambda camera: camera["camera_id"])
 
 
@@ -85,6 +95,8 @@ def validate_desired_state(payload: dict) -> dict:
     revision = payload.get("revision")
     if not isinstance(payload.get("speed_paused", False), bool):
         raise InvalidDesiredCameraState("speed_paused must be boolean")
+    if not isinstance(payload.get("analytics_paused", False), bool):
+        raise InvalidDesiredCameraState("analytics_paused must be boolean")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 0:
         raise InvalidDesiredCameraState("revision must be a non-negative integer")
     return {
@@ -93,6 +105,7 @@ def validate_desired_state(payload: dict) -> dict:
         "cameras": normalize_cameras(payload.get("cameras")),
         "updated_at": str(payload.get("updated_at") or _utc_now()),
         "speed_paused": payload.get("speed_paused", False),
+        "analytics_paused": payload.get("analytics_paused", False),
     }
 
 
@@ -140,7 +153,9 @@ class DesiredCameraStateStore:
         if incoming["revision"] < current["revision"]:
             raise StaleDesiredCameraRevision("desired camera revision is stale")
         if incoming["revision"] == current["revision"]:
-            if incoming["cameras"] != current["cameras"] or incoming["speed_paused"] != current.get("speed_paused", False):
+            if (incoming["cameras"] != current["cameras"]
+                    or any(incoming[key] != current.get(key, False)
+                           for key in ("speed_paused", "analytics_paused"))):
                 raise DesiredCameraRevisionConflict(
                     "desired camera revision already has different content"
                 )

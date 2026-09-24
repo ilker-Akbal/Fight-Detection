@@ -1,0 +1,8 @@
+{% for event in events %}
+<article class="feed-item event-{{ event.kind|lower }}">
+  <div class="section-head"><span class="badge {{ event.tone }}">{{ event.title }}</span><time>{{ event.detected_at|date:"d.m.Y H:i" }}</time></div>
+  <strong>{{ event.camera }}</strong><p>{{ event.location }}</p>
+  {% if event.kind == 'SPEED' %}<p>{% if event.speed != None %}{{ event.speed }} km/h{% else %}Hız bilgisi yok{% endif %} · Limit: {{ event.limit|default_if_none:'—' }} km/h</p>{% else %}<p>Güven: {{ event.confidence|default_if_none:'—' }}%</p>{% endif %}
+  <a href="{{ event.url }}">İncele<span class="sr-only">: {{ event.title }} · {{ event.camera }}</span> →</a>
+</article>
+{% empty %}<div class="empty-state"><h3>Henüz olay yok</h3><p>Erişiminiz olan kameralardaki olaylar burada görünecek.</p></div>{% endfor %}

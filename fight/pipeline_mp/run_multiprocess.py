@@ -1009,8 +1009,11 @@ def _run_dynamic(config: dict) -> int:
         speed_epochs=speed_epochs,
         fight_publication_floor=fight_publication_floor,
         global_stop=stop_event,
+        process_factory=_start_process,
     )
     desired_path = str(runtime.get("desired_camera_state_path") or "").strip()
+    preview_gateway = None
+    preview_live_channel = None
     desired_store = DesiredCameraStateStore(desired_path) if desired_path else None
     desired_revision = -1
     poll_interval = max(
@@ -1039,6 +1042,10 @@ def _run_dynamic(config: dict) -> int:
     from fight.pipeline_mp.camera_lifecycle import CameraLifecycleError
     services = SharedServices(manager, incident_queue, _start_process, _terminate_process, health_registry,
                               publication_floor=fight_publication_floor)
+    from fight.pipeline_mp.offline_jobs import OfflineJobs
+    offline = (OfflineJobs(runtime["offline_job_dir"], config, manager, services, incident_queue)
+               if runtime.get("offline_job_dir") else None)
+    live_cameras = initial_cameras
     watchdog_interval = max(0.25, float(runtime.get("health_watchdog_interval_sec", 1.0)))
     health_drain_limit = max(64, int(runtime.get("health_event_drain_limit", 2048)))
     last_watchdog = -1e30
@@ -1063,6 +1070,11 @@ def _run_dynamic(config: dict) -> int:
 
     try:
         # Prefer the current durable state over a potentially older launch snapshot.
+        if runtime.get("preview_live_enabled", False):
+            from fight.pipeline_mp.preview_gateway import PreviewGateway
+            preview_live_channel = ctx.Queue(maxsize=slot_count)
+            preview_gateway = PreviewGateway(preview_live_channel, slot_generations, output_dir, run_id)
+            manager.preview_live_channel = preview_live_channel
         if desired_store is not None:
             try:
                 desired = desired_store.load()
@@ -1072,6 +1084,7 @@ def _run_dynamic(config: dict) -> int:
                 pass
         services.prepare(initial_cameras)
         manager.reconcile(initial_cameras, revision=desired_revision)
+        live_cameras = initial_cameras
         while not stop_event.is_set():
             for name, (process, failure_code) in shared_processes.items():
                 if process is not None and not process.is_alive():
@@ -1096,8 +1109,10 @@ def _run_dynamic(config: dict) -> int:
                     desired = desired_store.load()
                     revision = int(desired["revision"])
                     if revision > desired_revision:
-                        services.prepare(desired["cameras"])
-                        manager.reconcile(desired["cameras"], revision=revision)
+                        live_cameras = desired["cameras"]
+                        combined = live_cameras + (offline.cameras() if offline else [])
+                        services.prepare(combined)
+                        manager.reconcile(combined, revision=revision)
                         desired_revision = revision
                 except InvalidDesiredCameraState:
                     _put_status(
@@ -1133,6 +1148,8 @@ def _run_dynamic(config: dict) -> int:
                 stop_event.set()
                 break
             manager.poll()
+            if offline is not None:
+                offline.tick(live_cameras)
             manager.retry_failed(revision=desired_revision)
             if health_registry is not None and health_queue is not None:
                 health_registry.sync_cameras(manager.get_camera_status())
@@ -1156,7 +1173,9 @@ def _run_dynamic(config: dict) -> int:
                         exit_code = 10
                         stop_event.set()
                     try:
-                        snapshot_store.write(health_registry.snapshot(run_id))
+                        snapshot = health_registry.snapshot(run_id)
+                        snapshot["desired_camera_revision"] = desired_revision
+                        snapshot_store.write(snapshot)
                         if health_snapshot_write_failed:
                             _put_status(
                                 report_queue,
@@ -1230,6 +1249,17 @@ def _run_dynamic(config: dict) -> int:
         stop_event.set()
     finally:
         manager.stop_all(reason="global_stop")
+        if offline is not None:
+            try:
+                offline.close()
+            except OSError as exc:
+                exit_code = exit_code or 14
+                _put_status(report_queue, {"ts": now_str(), "camera_id": "__system__",
+                    "stage": "offline", "detail": "offline_state_write_failed", "error": type(exc).__name__})
+        if preview_gateway is not None:
+            preview_gateway.close()
+        if preview_live_channel is not None:
+            _close_queue(preview_live_channel)
         stop_event.set()
         final_capacity = {stage: admission.snapshot() for stage, admission in services.admissions().items()
                           if hasattr(admission, "snapshot")} if exit_code in {0, 13} else {}

@@ -10,7 +10,9 @@ class SupervisorUnavailable(RuntimeError):
 
 
 class SupervisorRequestError(RuntimeError):
-    pass
+    def __init__(self, detail, *, http_status=None, method=None, path=None):
+        super().__init__(detail)
+        self.http_status, self.method, self.path = http_status, method, path
 
 
 class RuntimeSupervisorClient:
@@ -48,7 +50,7 @@ class RuntimeSupervisorClient:
                 detail = json.loads(exc.read().decode("utf-8")).get("error", "request_failed")
             except Exception:
                 detail = "request_failed"
-            raise SupervisorRequestError(detail) from exc
+            raise SupervisorRequestError(detail, http_status=exc.code, method=method, path=path) from exc
         except (URLError, OSError, TimeoutError) as exc:
             raise SupervisorUnavailable("runtime supervisor is unavailable") from exc
 

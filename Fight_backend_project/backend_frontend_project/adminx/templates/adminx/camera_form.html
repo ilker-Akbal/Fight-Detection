@@ -5,9 +5,7 @@
 {% block page_title %}{{ page_title }}{% endblock %}
 {% block page_desc %}Kamera bilgilerini doldur{% endblock %}
 
-{% block extra_css %}
-<link rel="stylesheet" href="{% static 'adminx/css/camera_form.css' %}?v=1" />
-{% endblock %}
+
 
 {% block content %}
 <div
@@ -23,7 +21,7 @@
   data-roi-hidden-input-id=""
   {% endif %}
 >
-  <form method="post" enctype="multipart/form-data" class="form-grid">
+  <form method="post" enctype="multipart/form-data" class="form-grid" id="camera-wizard">
     {% csrf_token %}
 
     {% if form.non_field_errors %}
@@ -38,17 +36,12 @@
     </div>
     {% endif %}
 
-    {% if camera %}
-    <input
-      type="hidden"
-      id="camera-preview-url"
-      value="{% url 'adminx:camera_preview_frame' camera.pk %}"
-    />
-    {% else %}
-    <input type="hidden" id="camera-preview-url" value="" />
-    {% endif %}
+    <ol class="wizard-progress" aria-label="Kamera kurulum adımları"><li>1 · Kamera Bilgisi</li><li>2 · Görüntü Kaynağı</li><li>3 · Konum</li><li>4 · Analiz</li></ol>
+    {% if form.errors or speed_form.errors %}<div class="notice danger" role="alert">Kaydedilemedi. Aşağıdaki alanları kontrol edin.</div>{% endif %}
+    <noscript><style>.camera-source-panel,.speed-module-config-wrapper{display:block}</style><p>Tüm adımlar aşağıda gösterilmektedir. Seçtiğiniz kaynak türünün alanlarını doldurup Kaydet'e basın.</p></noscript>
 
     <div class="camera-form-section">
+    <fieldset class="wizard-step"><legend>1. Kamera Bilgisi</legend>
       <div class="field">
         <label for="{{ form.name.id_for_label }}">Kamera Adı</label>
         {{ form.name }}
@@ -60,7 +53,7 @@
       </div>
 
       <div class="field">
-        <label for="{{ form.camera_id.id_for_label }}">Camera ID</label>
+        <label for="{{ form.camera_id.id_for_label }}">Kamera Kimliği</label>
         {{ form.camera_id }}
         <small class="muted">
           Sadece kısa kimlik gir. Dosya yolu girme. Örnek: cam_01, giris_kapi, fight_test
@@ -71,8 +64,9 @@
         {% endif %}
       </div>
 
+    </fieldset><fieldset class="wizard-step"><legend>2. Görüntü Kaynağı</legend>
       <div class="field">
-        <label>Kaynak Tipi</label>
+        <p><strong>Görüntü nereden geliyor?</strong></p>
 
         <div class="camera-source-grid">
           <label class="camera-source-card" for="sourceModeManual">
@@ -88,36 +82,15 @@
               <div class="camera-source-card__icon">↗</div>
 
               <div class="camera-source-card__content">
-                <strong>Manuel kaynak</strong>
+                <strong>IP Kamera / RTSP / HTTP</strong>
                 <span>
-                  IP kamera, RTSP/HTTP adresi, cihaz index'i veya local video yolu gir.
+                  Ağ kamerasının bağlantı adresini girin.
                 </span>
-                <div class="camera-source-card__tag">Canlı / Path</div>
+                <div class="camera-source-card__tag">Canlı Kamera</div>
               </div>
             </div>
           </label>
 
-          <label class="camera-source-card" for="sourceModeUpload">
-            <input
-              type="radio"
-              id="sourceModeUpload"
-              name="{{ form.source_mode.html_name }}"
-              value="upload"
-              {% if form.source_mode.value == "upload" %}checked{% endif %}
-            />
-
-            <div class="camera-source-card__body">
-              <div class="camera-source-card__icon">▣</div>
-
-              <div class="camera-source-card__content">
-                <strong>Video yükle</strong>
-                <span>
-                  Kullanıcının sisteme video dosyası yüklemesini ve pipeline kaynağı olarak kullanmasını sağlar.
-                </span>
-                <div class="camera-source-card__tag">Dosya Upload</div>
-              </div>
-            </div>
-          </label>
         </div>
 
         {% if form.source_mode.errors %}
@@ -125,13 +98,13 @@
         {% endif %}
       </div>
 
-      <div id="manualSourcePanel" class="camera-source-panel">
+      <div id="manualSourcePanel" class="camera-source-panel {% if form.source_mode.value != 'upload' %}is-visible{% endif %}">
         <div class="field">
-          <label for="{{ form.source.id_for_label }}">Manuel Kaynak</label>
+          <label for="{{ form.source.id_for_label }}">Kamera Adresi</label>
           {{ form.source }}
 
           <small class="muted">
-            Örnek: 0, rtsp://..., http://..., C:/.../fight.mp4
+            Örnek: rtsp://kamera/adres veya https://kamera/akis
           </small>
 
           {% if form.source.errors %}
@@ -140,37 +113,8 @@
         </div>
       </div>
 
-      <div id="uploadSourcePanel" class="camera-source-panel">
-        <div class="field">
-          <label for="{{ form.uploaded_video.id_for_label }}">Video Dosyası</label>
-
-          <div class="camera-file-box">
-            <div class="camera-file-drop">
-              <div>
-                <div class="camera-file-drop__title">Video dosyasını seç</div>
-                <div class="camera-file-drop__text">
-                  Desteklenen formatlar: mp4, avi, mov, mkv, webm.
-                  Video yüklendiğinde kaynak otomatik oluşturulur.
-                </div>
-              </div>
-
-              {{ form.uploaded_video }}
-            </div>
-
-            {% if form.instance.uploaded_video %}
-            <div class="camera-current-file">
-              <strong>Mevcut video:</strong>
-              {{ form.instance.uploaded_video.name }}
-            </div>
-            {% endif %}
-          </div>
-
-          {% if form.uploaded_video.errors %}
-          <div class="camera-field-errors">{{ form.uploaded_video.errors }}</div>
-          {% endif %}
-        </div>
-      </div>
-
+      <p>Geçmiş video dosyaları için <a href="{% url 'dashboard:offline_upload' %}">Video Analizleri</a> bölümünü kullanın. Etkin canlı kameralar otomatik izlenir.</p>
+    </fieldset><fieldset class="wizard-step"><legend>3. Konum</legend>
       <div class="field">
         <label for="{{ form.description.id_for_label }}">Açıklama</label>
         {{ form.description }}
@@ -195,8 +139,8 @@
         {% endif %}
       </div>
 
-      <div class="field">
-        <label for="{{ form.faculty.id_for_label }}">Fakülte / Mevki</label>
+      <details><summary>Gelişmiş konum bilgisi</summary><div class="field">
+        <label for="{{ form.faculty.id_for_label }}">Eski lokasyon etiketi</label>
         {{ form.faculty }}
         <small class="muted">
           Eski kayıt uyumluluğu için korunur; yeni yetkilendirmede fiziksel lokasyon kullanılır.
@@ -207,6 +151,8 @@
         {% endif %}
       </div>
 
+      </details>
+    </fieldset><fieldset class="wizard-step"><legend>4. Analiz ve Durum</legend>
       <div class="field">
         <div class="camera-active-box">
           <div class="camera-active-info">
@@ -215,6 +161,7 @@
           </div>
 
           <label class="camera-switch" for="{{ form.is_active.id_for_label }}">
+            <span class="sr-only">Kamera aktif</span>
             {{ form.is_active }}
             <span class="camera-switch-slider"></span>
           </label>
@@ -227,10 +174,10 @@
 
       <div class="speed-settings-box module-settings-box">
         <div class="speed-settings-head">
-          <h3>Modül Seçimi</h3>
+          <h3>Bu kamerada hangi analizler çalışsın?</h3>
           <p>
-            Bu kameranın hangi yapay zeka modüllerinde çalışacağını seç.
-            Bir kamera birden fazla modülde kullanılabilir.
+            Bu kamerada hangi analizlerin yapılacağını seçin.
+            Kavga ve Hız aynı kamerada birlikte çalışabilir.
           </p>
         </div>
 
@@ -238,10 +185,11 @@
           <div class="camera-active-box">
             <div class="camera-active-info">
               <strong>Kavga Tespiti</strong>
-              <span>Bu kamera kavga tespiti ekranında ve pipeline’ında kullanılır.</span>
+              <span>Kavga şüphesi algılandığında olay oluşturulur.</span>
             </div>
 
             <label class="camera-switch" for="{{ form.use_fight_detection.id_for_label }}">
+              <span class="sr-only">Kavga Tespiti</span>
               {{ form.use_fight_detection }}
               <span class="camera-switch-slider"></span>
             </label>
@@ -256,10 +204,11 @@
           <div class="camera-active-box">
             <div class="camera-active-info">
               <strong>Hız Tespiti</strong>
-              <span>Bu kamera hız tespiti ekranında ve pipeline’ında kullanılır.</span>
+              <span>Kalibrasyonlu hız ihlalleri olay olarak gösterilir.</span>
             </div>
 
             <label class="camera-switch" for="{{ form.use_speed_detection.id_for_label }}">
+              <span class="sr-only">Hız Tespiti</span>
               {{ form.use_speed_detection }}
               <span class="camera-switch-slider"></span>
             </label>
@@ -274,7 +223,7 @@
       {% if speed_form %}
       <div
         id="speedModuleConfigWrapper"
-        class="speed-settings-box speed-module-config-wrapper"
+        class="speed-settings-box speed-module-config-wrapper {% if form.use_speed_detection.value %}is-visible{% endif %}"
       >
         <div class="speed-settings-head">
           <h3>Hız Tespiti Ayarları</h3>
@@ -290,11 +239,12 @@
             <div class="camera-active-info">
               <strong>Hız Tespiti Durumu</strong>
               <span>
-                Aktif olduğunda bu kamera hız tespiti pipeline’ına dahil edilir.
+                Aktif olduğunda bu kamera hız tespiti analizine dahil edilir.
               </span>
             </div>
 
             <label class="camera-switch" for="{{ speed_form.enabled.id_for_label }}">
+              <span class="sr-only">Hız analizi etkin</span>
               {{ speed_form.enabled }}
               <span class="camera-switch-slider"></span>
             </label>
@@ -456,12 +406,12 @@
             <div class="speed-inline-options">
               <label class="speed-check-label">
                 {{ speed_form.save_snapshot }}
-                Snapshot
+                Fotoğraf
               </label>
 
               <label class="speed-check-label">
                 {{ speed_form.save_clip }}
-                Clip
+                Video
               </label>
             </div>
           </div>
@@ -472,8 +422,11 @@
       </div>
       {% endif %}
 
-      <div class="actions">
-        <button type="submit" class="btn success">{{ submit_label }}</button>
+    </fieldset>
+      <div class="wizard-actions">
+        <button type="button" class="btn secondary" data-wizard-back hidden>Geri</button>
+        <button type="button" class="btn" data-wizard-next hidden>Devam</button>
+        <button data-wizard-save type="submit" class="btn success">{{ submit_label }}</button>
         <a href="{% url 'adminx:camera_list' %}" class="btn secondary">İptal</a>
       </div>
     </div>
@@ -482,5 +435,6 @@
 {% endblock %}
 
 {% block extra_scripts %}
-<script src="{% static 'adminx/js/camera_form.js' %}?v=1"></script>
+<script src="{% static 'adminx/js/camera_form.js' %}?v=23"></script>
+<script src="{% static 'operations/camera_wizard.js' %}" defer></script>
 {% endblock %}

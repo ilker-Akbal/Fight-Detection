@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}{{ event.title }}{% endblock %}
+{% block page_title %}{{ event.title }}{% endblock %}
+{% block page_desc %}{{ event.camera }} · {{ event.location }}{% endblock %}
+{% block page_actions %}<a class="btn secondary" href="{% url 'dashboard:history' %}">Olaylara Dön</a><a href="{% url 'dashboard:index' %}">Canlı İzleme</a>{% endblock %}
+{% block content %}<section class="card incident-detail">
+  <span class="badge {{ event.tone }}">{{ event.title }}</span><p><time>{{ event.detected_at|date:"d.m.Y H:i:s" }}</time></p>
+  {% if event.kind == 'SPEED' %}<p>Ölçülen hız: {{ event.speed|default_if_none:'—' }} km/h · Hız limiti: {{ event.limit|default_if_none:'—' }} km/h</p>{% else %}<p>Algılama güveni: {{ event.confidence|default_if_none:'—' }}%</p>{% endif %}
+  <div class="detail-media">{% if event.evidence_url %}{% if event.media_kind == 'image' %}<img src="{{ event.evidence_url }}" alt="Olay kanıt görüntüsü" data-evidence>{% else %}<video controls preload="metadata" src="{{ event.evidence_url }}" data-evidence aria-label="Olay kanıt videosu"></video>{% endif %}<p hidden>Kanıt görüntüsü kullanılamıyor.</p>{% else %}<p class="empty-state">Bu olay için görüntülenebilir kanıt bulunmuyor.</p>{% endif %}</div>
+  {% if technical %}<details><summary>Teknik Detaylar · Yönetici</summary><dl>{% for name, value in technical.items %}<dt>{{ name }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></details>{% endif %}
+</section>{% endblock %}

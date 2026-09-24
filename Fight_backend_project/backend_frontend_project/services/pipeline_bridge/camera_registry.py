@@ -9,9 +9,7 @@ from streams.models import Camera
 
 
 def desired_camera_snapshot() -> list[dict]:
-    cameras = Camera.objects.filter(is_active=True).filter(
-        Q(use_fight_detection=True) | Q(use_speed_detection=True, speed_config__enabled=True)
-    ).select_related("speed_config").order_by("camera_id")
+    cameras = Camera.objects.filter(is_active=True, source_kind="LIVE").select_related("speed_config").order_by("camera_id")
     items = []
     for camera in cameras:
         speed = getattr(camera, "speed_config", None)
@@ -54,13 +52,21 @@ class CameraRegistryReconciler:
 
     def tick(self) -> dict:
         desired = desired_camera_snapshot()
+        from services.pipeline_bridge.offline_analysis import reconcile_jobs, monitoring_held
+        offline_pending = reconcile_jobs()
         current = self.client.desired_cameras()
         paused = bool(current.get("speed_paused", False))
+        analytics_paused = bool(current.get("analytics_paused", False))
+        if analytics_paused:
+            for camera in desired:
+                camera["use_fight_detection"] = False
+                camera["use_speed_detection"] = False
         if paused:
             for camera in desired:
                 camera["use_speed_detection"] = False
         current_cameras = normalize_cameras(current.get("cameras") or [])
         if current_cameras == desired:
+            self._autostart(desired, offline_pending)
             return {
                 "changed": False,
                 "revision": int(current.get("revision", 0)),
@@ -73,10 +79,20 @@ class CameraRegistryReconciler:
                 "revision": revision,
                 "cameras": desired,
                 "speed_paused": paused,
+                "analytics_paused": analytics_paused,
             }
         )
+        self._autostart(desired, offline_pending)
         return {
             "changed": bool(result.get("accepted", True)),
             "revision": int(result.get("revision", revision)),
             "camera_count": len(desired),
         }
+
+    def _autostart(self, desired, offline_pending):
+        from .offline_analysis import monitoring_held
+        if (desired or offline_pending) and not monitoring_held():
+            status = self.client.status()
+            if status.get("runtime_state") == "STOPPED" and not status.get("orphan_detected"):
+                from .fight_runner import start_pipeline
+                start_pipeline(desired)

@@ -13,6 +13,7 @@ from services.access_scope import (
 def get_user_incident_routes(user) -> QuerySet:
     queryset = (
         IncidentRoute.objects
+        .filter(incident__camera__source_kind="LIVE")
         .select_related(
             "incident",
             "incident__camera",

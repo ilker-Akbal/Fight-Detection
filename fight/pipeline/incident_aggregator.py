@@ -11,6 +11,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from datetime import datetime
+from fight.pipeline.evidence_metadata import compact_evidence_name, source_time_fields
 from pathlib import Path
 from typing import Deque, Dict, List, Optional
 
@@ -614,6 +615,8 @@ class IncidentAggregator:
             return
 
         if not self._wait_clips_ready(st):
+            if st.camera_id.startswith("offline_"):
+                raise DurableWriteError("offline_evidence_missing")
             print(
                 f"[INCIDENT][WARN] clips not ready, skip incident camera={st.camera_id} "
                 f"incident={st.incident_id}",
@@ -622,8 +625,12 @@ class IncidentAggregator:
             self.by_camera.pop(camera_id, None)
             return
 
-        ts = datetime.fromtimestamp(st.start_ts).strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        out_path = self.out_dir / f"{st.incident_id}__{ts}__{final_label}.mp4"
+        offline = st.camera_id.startswith("offline_")
+        if offline:
+            out_path = self.out_dir / compact_evidence_name(st.camera_id, st.incident_id, st.start_ts)
+        else:
+            ts = datetime.fromtimestamp(st.start_ts).strftime("%Y%m%d_%H%M%S_%f")[:-3]
+            out_path = self.out_dir / f"{st.incident_id}__{ts}__{final_label}.mp4"
 
         clip_paths = [seg.result.clip_path for seg in st.segments]
         ok = self._concat_mp4s(clip_paths, out_path)
@@ -638,7 +645,7 @@ class IncidentAggregator:
             "label": final_label,
             "score": st.decision_score,
             "max_fight_prob": st.max_prob,
-            "start_ts": self._fmt_ts(st.start_ts),
+            "start_ts": f"video +{st.start_ts:.3f}s" if offline else self._fmt_ts(st.start_ts),
         }
 
         overlay_ok = self._add_ai_overlay_to_clip(out_path, overlay_meta)
@@ -656,10 +663,9 @@ class IncidentAggregator:
             "source": st.source,
             "incident_id": st.incident_id,
 
-            "start_ts": self._fmt_ts(st.start_ts),
-            "end_ts": self._fmt_ts(st.end_ts),
-            "start_ts_epoch": float(st.start_ts),
-            "end_ts_epoch": float(st.end_ts),
+            **source_time_fields(st.camera_id, st.start_ts, st.end_ts, start_key="start_ts", end_key="end_ts"),
+            "start_ts_epoch": None if offline else float(st.start_ts),
+            "end_ts_epoch": None if offline else float(st.end_ts),
             "duration_sec": round(float(st.duration_sec), 3),
 
             "part_count": int(st.part_count),
@@ -685,8 +691,11 @@ class IncidentAggregator:
                     "pose_score_max": round(float(seg.result.pose_score_max), 6),
                     "pose_score_mean": round(float(seg.result.pose_score_mean), 6),
                     "clip_path": seg.result.clip_path,
-                    "event_start_ts": float(seg.result.event_start_ts),
-                    "event_end_ts": float(seg.result.event_end_ts),
+                    **({"event_start_ts": None, "event_end_ts": None,
+                        "source_start_time_sec": float(seg.result.event_start_ts),
+                        "source_end_time_sec": float(seg.result.event_end_ts)} if offline else {
+                        "event_start_ts": float(seg.result.event_start_ts),
+                        "event_end_ts": float(seg.result.event_end_ts)}),
                 }
                 for seg in st.segments
             ],
@@ -700,7 +709,8 @@ class IncidentAggregator:
             external_incident_id=st.incident_id,
             camera_id=st.camera_id,
             incident_type="FIGHT",
-            detected_at=utc_iso_from_epoch(st.start_ts),
+            detected_at=utc_iso_from_epoch(finalized_wall_time if st.camera_id.startswith("offline_") else st.start_ts),
+            video_time_sec=st.start_ts if st.camera_id.startswith("offline_") else None,
             finalized_at=utc_iso_from_epoch(finalized_wall_time),
             label=final_label,
             decision_score=round(float(st.decision_score), 6),

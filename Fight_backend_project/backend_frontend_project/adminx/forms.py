@@ -3,12 +3,13 @@ from pathlib import Path
 from django import forms
 from django.contrib.auth.models import User
 from django.db.models import Q
+from django.db import transaction
 
 from accounts.models import UserProfile
 from streams.models import Camera
 from speed_detection.models import SpeedCameraConfig
 
-from .models import FacultyLocation, Location
+from .models import FacultyLocation, Location, SecurityUnit, UserSecurityAssignment
 
 
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
@@ -46,7 +47,6 @@ class CameraForm(forms.ModelForm):
 
     SOURCE_MODE_CHOICES = [
         (SOURCE_MODE_MANUAL, "Manuel kaynak"),
-        (SOURCE_MODE_UPLOAD, "Video yükle"),
     ]
 
     source_mode = forms.ChoiceField(
@@ -170,9 +170,13 @@ class CameraForm(forms.ModelForm):
             self.fields["source_mode"].initial = self.SOURCE_MODE_MANUAL
 
         self.fields["source"].required = False
+        self.fields["source"].widget.attrs["placeholder"] = "rtsp://kamera/adres veya https://kamera/akis"
+        self.fields["camera_id"].label = "Kamera Kimliği"
 
     def clean_faculty(self):
         faculty = self.cleaned_data.get("faculty")
+        if self.cleaned_data.get("location"):
+            return self.cleaned_data["location"].code
 
         if not faculty:
             return None
@@ -218,6 +222,12 @@ class CameraForm(forms.ModelForm):
 
     def clean(self):
         cleaned_data = super().clean()
+
+        from streams.source_kind import is_live_source
+        if not is_live_source(cleaned_data.get("source"), cleaned_data.get("uploaded_video")):
+            self.add_error("source", "Yalnızca canlı RTSP/HTTP veya cihaz kaynağı kullanın. Dosyalar için Video Analizleri bölümünü açın.")
+        if str(cleaned_data.get("camera_id", "")).startswith("offline_"):
+            self.add_error("camera_id", "Bu kimlik öneki geçmiş video çalışmaları için ayrılmıştır.")
 
         source_mode = cleaned_data.get("source_mode")
         source = (cleaned_data.get("source") or "").strip()
@@ -371,6 +381,10 @@ class SpeedCameraConfigForm(forms.ModelForm):
 
 
 class UserEditForm(forms.ModelForm):
+    security_units = forms.ModelMultipleChoiceField(
+        label="Kamera / Güvenlik Erişimi", queryset=SecurityUnit.objects.none(), required=False,
+        widget=forms.CheckboxSelectMultiple,
+        help_text="Seçilen birimlerin mevcut lokasyon kapsamı erişim verir. Profil lokasyonu erişim vermez.")
     username = forms.CharField(label="Kullanıcı Adı")
     email = forms.EmailField(label="E-posta", required=False)
 
@@ -395,6 +409,13 @@ class UserEditForm(forms.ModelForm):
         user = kwargs.pop("user_instance")
 
         super().__init__(*args, **kwargs)
+        self.user_instance = user
+        self.fields["security_units"].queryset = SecurityUnit.objects.filter(active=True).order_by("name")
+        self.fields["security_units"].initial = list(user.security_assignments.filter(
+            active=True, security_unit__active=True).values_list("security_unit_id", flat=True)) if user.pk else []
+
+        self.fields["role"].choices = [("admin", "Yönetici"), ("operator", "Operatör"), ("viewer", "İzleyici")]
+        self.fields["faculty"].label = "Lokasyon Etiketi"
 
         self.fields["username"].initial = user.username
         self.fields["email"].initial = user.email
@@ -434,14 +455,59 @@ class UserEditForm(forms.ModelForm):
 
         return faculty
 
+    def clean_username(self):
+        value = self.cleaned_data["username"]
+        if User.objects.filter(username=value).exclude(pk=self.user_instance.pk).exists():
+            raise forms.ValidationError("Bu kullanıcı adı zaten kullanılıyor.")
+        return value
+
+    @transaction.atomic
     def save(self, user_instance, commit=True):
         user_instance.username = self.cleaned_data["username"]
         user_instance.email = self.cleaned_data["email"]
 
         if commit:
+            if user_instance.pk:
+                User.objects.select_for_update().get(pk=user_instance.pk)
             user_instance.save()
+            if not self.instance.pk:
+                self.instance.pk = UserProfile.objects.get(user=user_instance).pk
+                self.instance.user = user_instance
+        profile = super().save(commit=commit)
+        if commit:
+            units = self.cleaned_data["security_units"]
+            assignments = UserSecurityAssignment.objects.filter(user=user_instance)
+            assignments.exclude(security_unit__in=units).update(active=False)
+            for unit in units:
+                existing = assignments.filter(security_unit=unit).order_by("-active", "pk").first()
+                if existing is None:
+                    UserSecurityAssignment.objects.create(user=user_instance, security_unit=unit)
+                elif not existing.active:
+                    existing.active = True
+                    existing.save(update_fields=["active"])
+        return profile
 
-        return super().save(commit=commit)
+
+class UserCreateForm(UserEditForm):
+    password1 = forms.CharField(label="Şifre", widget=forms.PasswordInput)
+    password2 = forms.CharField(label="Şifre tekrar", widget=forms.PasswordInput)
+
+    def clean(self):
+        from django.contrib.auth.password_validation import validate_password
+        data = super().clean()
+        if data.get("password1") != data.get("password2"):
+            self.add_error("password2", "Şifreler eşleşmiyor.")
+        if data.get("password1"):
+            candidate = User(username=data.get("username", ""), email=data.get("email", ""))
+            try:
+                validate_password(data["password1"], candidate)
+            except forms.ValidationError as exc:
+                self.add_error("password1", exc)
+        return data
+
+    def save(self, user_instance, commit=True):
+        user_instance.set_password(self.cleaned_data["password1"])
+        return super().save(user_instance, commit=commit)
 
 
 class FacultyLocationForm(forms.ModelForm):
@@ -472,3 +538,18 @@ class FacultyLocationForm(forms.ModelForm):
             "description": "Açıklama",
             "is_active": "Aktif",
         }
+
+
+class LocationForm(forms.ModelForm):
+    """Presentation form for the existing physical hierarchy; no new schema."""
+    class Meta:
+        model = Location
+        fields = ["name", "code", "parent", "location_type", "description", "active"]
+        labels = {"name": "Lokasyon Adı", "code": "Kısa Kod", "parent": "Üst Lokasyon",
+                  "location_type": "Lokasyon Türü", "description": "Açıklama", "active": "Aktif"}
+        widgets = {"description": forms.Textarea(attrs={"rows": 3})}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.instance.pk:
+            self.fields["parent"].queryset = Location.objects.exclude(pk=self.instance.pk)

@@ -450,7 +450,7 @@ PIPELINE_DEFAULTS = {
     "incident_keep_temp_parts": True,
 
     "preview_every_frames": 5,
-    "preview_write_interval_sec": 0.25,
+    "preview_write_interval_sec": 0.33,
     "preview_jpeg_quality": 75,
     "report_flush_interval_sec": 0.25,
 

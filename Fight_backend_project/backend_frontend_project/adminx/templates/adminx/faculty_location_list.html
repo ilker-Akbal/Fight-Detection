@@ -2,15 +2,15 @@
 {% load static %}
 
 {% block title %}
-  Fakülte / Mevki Yönetimi
+  Lokasyon Yönetimi
 {% endblock %}
 
 {% block page_title %}
-  Fakülte / Mevki Yönetimi
+  Lokasyon Yönetimi
 {% endblock %}
 
 {% block page_desc %}
-  Kamera, kullanıcı ve olay kayıtlarında kullanılacak fakülte/mevki bilgisini buradan yönetebilirsin.
+  Kamera, kullanıcı ve olay kayıtlarında kullanılacak lokasyon bilgisini buradan yönetebilirsin.
 {% endblock %}
 
 {% block page_actions %}
@@ -19,17 +19,17 @@
   </a>
 {% endblock %}
 
-{% block extra_css %}
-<link rel="stylesheet" href="{% static 'adminx/css/faculty_location_list.css' %}?v=1" />
-{% endblock %}
+
 
 {% block content %}
 <div class="content-stack">
+<section class="card"><h2>Fiziksel Lokasyonlar</h2><p>Kampüs, bina ve kat hiyerarşisini yönetin. Kamera erişimi fiziksel lokasyona göre belirlenir.</p><a class="btn" href="{% url 'adminx:location_create' %}">+ Yeni Fiziksel Lokasyon</a><ul>{% for location in physical_locations %}<li>{% if location.parent %}{{ location.parent.name }} / {% endif %}{{ location.name }} · {% if location.active %}Aktif{% else %}Pasif{% endif %} <a href="{% url 'adminx:location_edit' location.pk %}">Düzenle</a></li>{% empty %}<li>Henüz fiziksel lokasyon yok.</li>{% endfor %}</ul></section>
+<details><summary>Eski lokasyon etiketleri</summary><p>Önceki kamera ve kullanıcı kayıtlarıyla uyumluluk için korunur.</p>
   <div class="stats-grid">
     <div class="card stat stat--purple">
       <h3>Toplam Kayıt</h3>
       <div class="stat__value">{{ total_count }}</div>
-      <div class="stat__meta">Tanımlı fakülte / mevki sayısı</div>
+      <div class="stat__meta">Tanımlı lokasyon sayısı</div>
     </div>
 
     <div class="card stat stat--blue">
@@ -53,8 +53,8 @@
           <h2>Kaydı Düzenle</h2>
           <p>{{ editing_item.name }} kaydını güncelliyorsun.</p>
           {% else %}
-          <h2>Yeni Fakülte / Mevki Ekle</h2>
-          <p>Yeni kamera ve kullanıcı tanımlarında kullanılacak fakülte/mevki bilgisini ekle.</p>
+          <h2>Yeni Lokasyon Ekle</h2>
+          <p>Yeni kamera ve kullanıcı tanımlarında kullanılacak lokasyon bilgisini ekle.</p>
           {% endif %}
         </div>
       </div>
@@ -69,7 +69,7 @@
         {% endif %}
 
         <div class="field">
-          <label for="{{ form.name.id_for_label }}">Fakülte / Mevki Adı</label>
+          <label for="{{ form.name.id_for_label }}">Lokasyon Adı</label>
           {{ form.name }}
 
           {% if form.name.errors %}
@@ -94,6 +94,7 @@
             </div>
 
             <label class="faculty-switch" for="{{ form.is_active.id_for_label }}">
+              <span class="sr-only">Lokasyon etiketi aktif</span>
               {{ form.is_active }}
               <span class="faculty-switch-slider"></span>
             </label>
@@ -127,7 +128,7 @@
     <section class="table-card">
       <div class="section-head faculty-table-head">
         <div>
-          <h2>Kayıtlı Fakülte / Mevkiler</h2>
+          <h2>Kayıtlı Lokasyonlar</h2>
           <p>Buradaki kayıtlar kamera, kullanıcı ve olay eşleştirmelerinde kullanılır.</p>
         </div>
       </div>
@@ -159,7 +160,7 @@
                 {% if item.is_active %}
                 <span class="badge success">Aktif</span>
                 {% else %}
-                <span class="badge danger">Pasif</span>
+                <span class="badge neutral">Pasif</span>
                 {% endif %}
               </td>
 
@@ -192,7 +193,7 @@
                     method="post"
                     action="{% url 'adminx:faculty_location_delete' item.pk %}"
                     class="faculty-toggle-form"
-                    onsubmit="return confirm('Bu fakülte/mevki kaydını silmek istediğine emin misin?');"
+                    onsubmit="return confirm('Bu lokasyon kaydını silmek istediğine emin misin?');"
                   >
                     {% csrf_token %}
                     <button type="submit" class="btn danger faculty-action-btn">
@@ -205,7 +206,7 @@
             {% empty %}
             <tr>
               <td colspan="5" class="empty-row">
-                Henüz fakülte / mevki eklenmemiş.
+                Henüz lokasyon eklenmemiş.
               </td>
             </tr>
             {% endfor %}
@@ -214,5 +215,5 @@
       </div>
     </section>
   </div>
-</div>
+</details></div>
 {% endblock %}

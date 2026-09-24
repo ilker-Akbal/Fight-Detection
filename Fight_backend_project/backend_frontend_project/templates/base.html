@@ -1,156 +1,53 @@
-{% load static %}
+{% load static operator_ui %}
+{% operator_admin as ui_admin %}
 <!doctype html>
 <html lang="tr">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-
-    <title>{% block title %}Akıllı Güvenlik Dashboard{% endblock %}</title>
-
-    <link rel="stylesheet" href="{% static 'navbar/navbar.css' %}?v=12" />
-    <link rel="stylesheet" href="{% static 'dashboard/dashboard.css' %}?v=12" />
-
-
-    {% block extra_css %}{% endblock %}
-  </head>
-
-  <body class="has-module-rail">
-    <nav class="module-rail" aria-label="Yapay zeka modül menüsü">
-      <a
-        href="{% url 'dashboard:index' %}"
-        class="module-rail__item {% if request.resolver_match and request.resolver_match.app_name == 'dashboard' %}is-active{% endif %}"
-        title="Kavga Tespiti"
-      >
-        <span class="module-rail__icon">⚠</span>
-        <span class="module-rail__label">Kavga Tespiti</span>
-      </a>
-
-      <a
-        href="{% url 'speed_detection:index' %}"
-        class="module-rail__item {% if request.resolver_match and request.resolver_match.app_name == 'speed_detection' %}is-active{% endif %}"
-        title="Hız Tespiti"
-      >
-        <span class="module-rail__icon">⏱</span>
-        <span class="module-rail__label">Hız Tespiti</span>
-      </a>
-
-
-
-      <div class="module-rail__hint">
-        Modül seçmek için üzerine gel veya tıkla.
-      </div>
-    </nav>
-
-    <header class="topbar">
-      <div class="topbar__inner">
-        <div class="topbar__left">
-          <a href="{% url 'dashboard:index' %}" class="brand">
-            <div class="brand__logo brand__logo--image">
-              <img src="{% static 'images/togu-logo.png' %}" alt="TOGÜ Logo" />
-            </div>
-
-            <div class="brand__content">
-              <strong>Akıllı Güvenlik Dashboard</strong>
-              <span>Kavga, hız ve akıllı güvenlik modülleri</span>
-            </div>
-          </a>
-        </div>
-
-        <div class="topbar__center">
-          {% block navbar_status %}{% endblock %}
-        </div>
-
-        <div class="topbar__right">
-          {% if request.user.is_authenticated %}
-          <div class="account-menu">
-            <div class="account-avatar">
-              {{ request.user.username|first|upper }}
-            </div>
-
-            <div class="account-info">
-              <span class="account-info__label">Hoş geldiniz</span>
-
-              {% if request.user.get_full_name %}
-              <strong>{{ request.user.get_full_name }}</strong>
-              {% else %}
-              <strong>{{ request.user.username }}</strong>
-              {% endif %}
-            </div>
-
-            <a
-              href="{% url 'accounts:account_settings' %}"
-              class="account-link-btn"
-            >
-              Hesabım
-            </a>
-
-            <form
-              method="post"
-              action="{% url 'accounts:logout' %}"
-              class="logout-form"
-            >
-              {% csrf_token %}
-              <button type="submit" class="logout-btn">
-                <span class="logout-btn__icon">↗</span>
-                <span>Çıkış Yap</span>
-              </button>
-            </form>
-          </div>
-          {% else %}
-          <a href="{% url 'accounts:login' %}" class="login-link">
-            Giriş Yap
-          </a>
-          {% endif %}
-        </div>
-      </div>
-    </header>
-
-    {% if messages %}
-    <div
-      class="app-message-modal is-open"
-      id="app-message-modal"
-      aria-hidden="false"
-    >
-      <div class="app-message-modal__backdrop" data-message-modal-close></div>
-
-      <div class="app-message-modal__box" role="dialog" aria-modal="true">
-        <div class="app-message-modal__logo">
-          <img src="{% static 'images/togu-logo.png' %}" alt="TOGÜ Logo" />
-        </div>
-
-        <div class="app-message-modal__header">
-          <h2>İşlem Bildirimi</h2>
-          <p>Sistem tarafından oluşturulan bilgilendirme mesajı.</p>
-        </div>
-
-        <div class="app-message-modal__list">
-          {% for message in messages %}
-          <div
-            class="app-message-modal__item app-message-modal__item--{{ message.tags|default:'info' }}"
-          >
-            <span class="app-message-modal__item-icon"></span>
-            <span>{{ message }}</span>
-          </div>
-          {% endfor %}
-        </div>
-
-        <div class="app-message-modal__actions">
-          <button
-            type="button"
-            class="app-message-modal__close"
-            data-message-modal-close
-          >
-            Kapat
-          </button>
-        </div>
-      </div>
-    </div>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Akıllı Güvenlik{% endblock %}</title>
+  {% block extra_css %}{% endblock %}
+  <link rel="stylesheet" href="{% static 'operations/workspace.css' %}">
+</head>
+<body data-overview-url="{% url 'dashboard:overview' %}" data-previews-url="{% url 'dashboard:live_previews' %}">
+<a class="skip-link" href="#main-content">İçeriğe geç</a>
+<div class="app-layout">
+  <aside class="app-sidebar">
+    <a class="app-brand" href="{% if ui_admin %}{% url 'adminx:dashboard' %}{% else %}{% url 'dashboard:index' %}{% endif %}"><span class="brand-mark" aria-hidden="true">AG</span><span>Akıllı Güvenlik<small>İzleme ve olay yönetimi</small></span></a>
+    <nav aria-label="Ana menü">
+    {% if ui_admin %}
+      <p class="nav-label">GENEL</p>
+      <a href="{% url 'adminx:dashboard' %}">Genel Bakış</a>
+      <p class="nav-label">YÖNETİM</p>
+      <a href="{% url 'adminx:camera_list' %}">Kameralar</a>
+      <a href="{% url 'adminx:faculty_location_list' %}">Lokasyonlar</a>
+      <a href="{% url 'adminx:user_list' %}">Kullanıcılar</a>
     {% endif %}
-
-    <main class="page-shell">{% block content %}{% endblock %}</main>
-
-
-
-    {% block extra_scripts %}{% endblock %}
-  </body>
+      <p class="nav-label">OPERASYON</p>
+      <a href="{% url 'dashboard:index' %}">Canlı İzleme</a>
+      <a href="{% url 'dashboard:history' %}">Olaylar</a>
+      <a href="{% url 'dashboard:offline_list' %}">Video Analizleri</a>
+    {% if ui_admin %}
+      <p class="nav-label">SİSTEM</p>
+      <a href="{% url 'adminx:system_status' %}">Sistem Durumu</a>
+    {% endif %}
+    </nav>
+    <p class="sidebar-note">Kameralarınız, analizleriniz ve olaylarınız tek çalışma alanında.</p>
+  </aside>
+  <div class="app-main">
+    <header class="app-header">
+      <span id="global-status" role="status" class="badge {{ system.tone|default:'neutral' }}">{{ system.label|default:'Durum kontrol ediliyor' }}</span>
+      <div class="actions"><span class="user-name">{{ request.user.get_full_name|default:request.user.username }}</span><a href="{% url 'accounts:account_settings' %}">Hesabım</a><form method="post" action="{% url 'accounts:logout' %}">{% csrf_token %}<button class="btn secondary" type="submit">Çıkış Yap</button></form></div>
+    </header>
+    <main id="main-content" tabindex="-1">
+      <div class="page-head"><div><p class="eyebrow">AKILLI GÜVENLİK</p><h1>{% block page_title %}{% endblock %}</h1><p>{% block page_desc %}{% endblock %}</p></div><div class="actions">{% block page_actions %}{% endblock %}</div></div>
+      {% for message in messages %}<div class="notice {{ message.tags }}" role="status">{{ message }}</div>{% endfor %}
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+</div>
+<script src="{% static 'operations/preview_stream.js' %}" defer></script>
+<script src="{% static 'operations/workspace.js' %}" defer></script>
+{% block extra_scripts %}{% endblock %}
+</body>
 </html>

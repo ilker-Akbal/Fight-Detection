@@ -140,6 +140,9 @@ def ingest_envelope(
         record.save()
         return existing, record.status
 
+    if str(envelope["camera_id"]).startswith("offline_"):
+        from services.pipeline_bridge.offline_analysis import import_result
+        return import_result(envelope, record)
     camera = Camera.objects.filter(camera_id=str(envelope["camera_id"])).first()
     if camera is None:
         record.status = IncidentIngestRecord.STATUS_RETRYABLE

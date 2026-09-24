@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Canlı İzleme{% endblock %}
+{% block page_title %}Canlı İzleme{% endblock %}
+{% block page_desc %}Kamera görüntüleri ve son olaylar, tek ekranda.{% endblock %}
+{% block page_actions %}<a class="btn secondary" href="?capability={{ capability|urlencode }}">Kamera Listesini Yenile</a>{% if ui_admin %}<a class="btn secondary" href="{% url 'adminx:system_status' %}">Sistemi Yönet</a>{% endif %}{% endblock %}
+{% block content %}
+<nav class="tabs" aria-label="Kamera analizi"><a href="{% url 'dashboard:index' %}" {% if not capability %}aria-current="page"{% endif %}>Tüm Kameralar</a><a href="?capability=fight" {% if capability == 'fight' %}aria-current="page"{% endif %}>Kavga</a><a href="?capability=speed" {% if capability == 'speed' %}aria-current="page"{% endif %}>Hız</a></nav>
+<div class="live-layout" id="live-workspace">
+<section class="camera-grid" aria-label="Kameralar">
+{% for card in cards %}<article class="camera-tile" data-camera="{{ card.camera_id }}">
+  <div class="tile-head"><div><h2>{{ card.name }}</h2><p>{{ card.location }}</p></div><span class="badge {{ card.tone }}" data-camera-status>{{ card.label }}</span></div>
+  <div class="preview-box"><img data-monitorable="{{ card.monitorable|yesno:'true,false' }}" data-preview="{{ card.preview_url }}" alt="{{ card.name }} kamera görüntüsü" hidden><p data-preview-empty>Görüntü bekleniyor · Kamera kapalı veya önizleme henüz hazır değil.</p></div>
+  <footer><span class="badge" data-analysis>{{ card.analysis }}</span><small>{{ card.source_type }}</small></footer>
+</article>{% empty %}<div class="card empty-state"><h2>Gösterilecek kamera yok</h2><p>{% if no_access %}Hesabınıza kamera / güvenlik erişimi atanmamış. Yöneticinizden güvenlik birimi ataması isteyin.{% else %}Bu filtrede erişebildiğiniz kamera bulunmuyor.{% endif %}</p>{% if ui_admin %}<a class="btn" href="{% url 'adminx:camera_create' %}">İlk Kamerayı Ekle</a>{% else %}<p>Kamera erişimi için yöneticinizle iletişime geçin.</p>{% endif %}</div>{% endfor %}
+</section><aside class="card live-events"><div class="section-head"><h2>Son Olaylar</h2><a href="{% url 'dashboard:history' %}">Tümü</a></div><div id="live-event-feed">{% include "operations/event_feed.html" %}</div></aside>
+</div>
+{% if page_obj.paginator.num_pages > 1 %}<nav class="pagination" aria-label="Kamera sayfaları">{% if page_obj.has_previous %}<a class="btn secondary" href="?capability={{ capability|urlencode }}&page={{ page_obj.previous_page_number }}">Önceki</a>{% endif %}<span>{{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a class="btn secondary" href="?capability={{ capability|urlencode }}&page={{ page_obj.next_page_number }}">Sonraki</a>{% endif %}</nav>{% endif %}
+{% endblock %}

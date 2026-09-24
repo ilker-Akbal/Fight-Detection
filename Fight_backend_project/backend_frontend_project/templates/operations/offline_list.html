@@ -1,0 +1,5 @@
+{% extends 'base.html' %}
+{% block page_title %}Video Analizleri{% endblock %}
+{% block page_desc %}Geçmiş video analizi. Bu sonuçlar canlı alarm değildir.{% endblock %}
+{% block page_actions %}<a class="btn" href="{% url 'dashboard:offline_upload' %}">Yeni Video Analizi</a>{% endblock %}
+{% block content %}<section class="card">{% for asset in assets %}<p><a href="{% url 'dashboard:offline_detail' asset.pk %}">{{ asset.name }}</a> · {{ asset.location|default:'Lokasyon atanmamış' }}</p>{% empty %}<p>Erişebildiğiniz geçmiş video yok.</p>{% endfor %}</section><nav>{% if page_obj.has_previous %}<a href="?page={{ page_obj.previous_page_number }}">Önceki</a>{% endif %} {{ page_obj.number }} / {{ page_obj.paginator.num_pages }} {% if page_obj.has_next %}<a href="?page={{ page_obj.next_page_number }}">Sonraki</a>{% endif %}</nav>{% endblock %}

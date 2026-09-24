@@ -651,12 +651,13 @@ class IncidentViewTests(Phase8FixtureMixin, TestCase):
         self.client.force_login(admin)
         self.assertEqual(self.client.get(reverse("dashboard:incident_evidence", args=[incident.pk])).status_code, 200)
 
-    def test_58_dashboard_contains_route_backed_inbox(self):
+    def test_58_dashboard_shows_incident_without_routing_internals(self):
         incident = self.ingest()
         self.client.force_login(self.block_user)
         response = self.client.get(reverse("dashboard:index"))
-        self.assertContains(response, incident.external_incident_id)
-        self.assertContains(response, self.block_unit.name)
+        self.assertContains(response, reverse("dashboard:incident_detail", args=[incident.pk]))
+        self.assertNotContains(response, incident.external_incident_id)
+        self.assertNotContains(response, self.block_unit.name)
 
     def test_59_sse_payload_uses_db_incident_identity(self):
         first = self.ingest(self.envelope(run_id="run-a"))

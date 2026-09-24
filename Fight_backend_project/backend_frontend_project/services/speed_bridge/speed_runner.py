@@ -253,7 +253,8 @@ def _set_speed_paused(paused):
     if paused:
         cameras = [{**item, "use_speed_detection": False} for item in cameras]
     client.update_desired_cameras({"schema_version": 1, "revision": int(current.get("revision", 0)) + 1,
-                                   "cameras": cameras, "speed_paused": bool(paused)})
+                                   "cameras": cameras, "speed_paused": bool(paused),
+                                   "analytics_paused": bool(current.get("analytics_paused", False))})
 
 
 def start_speed_pipeline() -> ActiveSpeedRun:

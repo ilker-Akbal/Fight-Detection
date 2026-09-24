@@ -130,6 +130,7 @@ class CameraRuntimeManager:
                                         else ctx.Array("q", len(slot_generations) + 1, lock=True))
         self.global_stop = global_stop
         self._stopping = False
+        self.preview_live_channel = None
         self.fight_service_epoch = 0
         self.speed_service_available = True
         self.fight_service_available = True
@@ -251,6 +252,7 @@ class CameraRuntimeManager:
                 item.generation,
                 self.health_queue,
                 item.slot_id,
+                self.preview_live_channel,
             ),
         )
 
@@ -555,6 +557,17 @@ class CameraRuntimeManager:
 
     def restart_camera(self, camera_id: str, camera: dict, *, reason: str) -> CameraRuntime:
         old = self.runtimes[str(camera_id)]
+        if old.camera_id.startswith("offline_"):
+            # Explicit offline runs are one-shot, including ingest/watchdog
+            # failures. Only a new job identity may decode the asset again.
+            old.stop_event.set()
+            old.speed_stop.set()
+            self.disable_fight(old, reason, failed=True)
+            self.disable_speed(old, reason)
+            for process in old.processes.values():
+                self.terminate_process(process, timeout=1.0)
+            old.file_done, old.state = True, FAILED
+            return old
         slot_id = old.slot_id
         restart_count = old.restart_count + 1
         self._status(
@@ -587,7 +600,7 @@ class CameraRuntimeManager:
         desired = {
             item["camera_id"]: item
             for item in (runtime_camera(camera) for camera in cameras)
-            if item["enabled"] and (item["use_fight_detection"] or item["use_speed_detection"])
+            if item["enabled"]
         }
         actual_ids = set(self.runtimes)
         desired_ids = set(desired)
@@ -604,9 +617,16 @@ class CameraRuntimeManager:
             current = self.runtimes[cid]
             if restart_identity(current.camera) != restart_identity(desired[cid]):
                 try:
-                    if (current.camera["source"] == desired[cid]["source"]
-                            and not is_file_source(current.camera["source"])):
-                        self._reconfigure_consumers(current, desired[cid])
+                    if current.camera["source"] == desired[cid]["source"]:
+                        if is_file_source(current.camera["source"]):
+                            # A file already consumed for preview cannot be attached
+                            # mid-file as a complete ordered analysis. Withdrawal
+                            # also latches incomplete; never replay on control churn.
+                            self.disable_fight(current, "file_capability_changed", failed=True)
+                            self.disable_speed(current, "file_capability_changed")
+                            current.camera = desired[cid]
+                        else:
+                            self._reconfigure_consumers(current, desired[cid])
                     else:
                         self.restart_camera(cid, desired[cid], reason="runtime_config_changed")
                     restarted.append(cid)
@@ -642,7 +662,8 @@ class CameraRuntimeManager:
     def _reconfigure_consumers(self, item, desired):
         previous = item.camera
         if previous["use_fight_detection"] and not desired["use_fight_detection"]:
-            self.disable_fight(item, "capability_removed")
+            self.disable_fight(item, "capability_removed", failed=True)
+            item.fight_failed = False
         speed_changed = (previous["use_speed_detection"] != desired["use_speed_detection"]
                          or previous["speed_config"] != desired["speed_config"])
         if speed_changed and previous["use_speed_detection"]:
@@ -802,6 +823,7 @@ class CameraRuntimeManager:
                         item.generation,
                         self.health_queue,
                         item.slot_id,
+                        self.preview_live_channel,
                     ),
                 )
 
@@ -831,6 +853,7 @@ class CameraRuntimeManager:
                 item.generation,
                 self.health_queue,
                 item.slot_id,
+                self.preview_live_channel,
             ),
         )
         return True

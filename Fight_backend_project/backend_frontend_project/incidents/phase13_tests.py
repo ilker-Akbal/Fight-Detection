@@ -31,11 +31,14 @@ class Phase13IntegrationTests(TestCase):
                 cameras.append(cam)
             with override_settings(MEDIA_ROOT=root, INCIDENT_EVIDENCE_ROOTS=[root / "pipeline_runs"]):
                 desired = desired_camera_snapshot()
-                assert {item["camera_id"] for item in desired} == {"fight", "speed", "both"}
+                assert {item["camera_id"] for item in desired} == {"fight", "speed", "both", "neither"}
                 both = next(item for item in desired if item["camera_id"] == "both")
                 assert both["use_fight_detection"] and both["use_speed_detection"] and both["speed_config"]
                 store = DesiredCameraStateStore(root / "desired.json")
                 class Client:
+                    def status(self):
+                        return {"runtime_state": "RUNNING"}
+
                     desired_cameras = staticmethod(store.load)
                     def update_desired_cameras(self, payload):
                         update = store.update(payload)

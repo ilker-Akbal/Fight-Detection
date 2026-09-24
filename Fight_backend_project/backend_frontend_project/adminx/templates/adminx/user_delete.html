@@ -14,7 +14,7 @@ Bu kullanıcı hesabını sistemden kalıcı olarak kaldıracaksınız.
       <p>
         <b>Kullanıcı:</b> {{ profile.user.username }}<br />
         <b>Mail:</b> {{ profile.user.email|default:"-" }}<br />
-        <b>Fakülte:</b> {{ profile.get_faculty_display|default:"-" }}<br />
+        <b>Lokasyon:</b> {{ profile.get_faculty_display|default:"-" }}<br />
         <b>Durum:</b> {{ profile.get_status_display }}
       </p>
       <p>Bu işlem geri alınamaz.</p>

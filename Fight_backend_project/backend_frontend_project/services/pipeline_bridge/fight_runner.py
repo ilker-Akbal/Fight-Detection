@@ -241,6 +241,7 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     ]
 
     runtime = {}
+    runtime["preview_live_enabled"] = True
 
     for key in runtime_keys:
         if key in defaults:
@@ -257,6 +258,9 @@ def _build_run_config(sources: list[dict], run_name: str, run_dir: Path) -> dict
     runtime.setdefault("person_camera_result_queue_size", 2)
     runtime.setdefault("person_request_enqueue_timeout_sec", 0.5)
     runtime.setdefault("person_result_enqueue_timeout_sec", 1.0)
+    from .offline_analysis import job_root
+    runtime["offline_job_dir"] = str(job_root())
+    runtime["stop_run_when_all_file_cameras_done"] = False
     runtime.setdefault("person_route_timeout_sec", 0.5)
     runtime.setdefault("person_inference_timeout_sec", 30.0)
     runtime.setdefault("person_batch_enabled", False)

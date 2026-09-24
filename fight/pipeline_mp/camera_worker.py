@@ -3,7 +3,6 @@ from __future__ import annotations
 import queue
 import time
 from collections import deque
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +11,7 @@ import yaml
 
 from fight.pipeline.adapters import MotionAdapter
 from fight.pipeline.clip_buffer import save_clip_mp4
+from fight.pipeline.evidence_metadata import compact_evidence_name, source_time_fields
 from fight.pipeline.pair_selector import LivePairRoiController
 from fight.pipeline.person_stabilizer import TemporalPersonStabilizer
 from fight.pipeline.utils import crop_from_box, open_source, sanitize_box, box_iou
@@ -21,7 +21,6 @@ from fight.pipeline_mp.common import (
     is_file_source,
     now_str,
     redact_source,
-    ts_to_str,
 )
 from fight.pipeline_mp.messages import (
     ActiveEvent,
@@ -441,6 +440,8 @@ class CameraProcessRunner:
         """
         if self.source_is_file and self.capture_fps > 0:
             safe_frame_idx = max(0, int(frame_idx))
+            if self.camera_id.startswith("offline_"):
+                return safe_frame_idx / float(self.capture_fps)
             return float(self.source_timeline_base_ts) + (
                 safe_frame_idx / float(self.capture_fps)
             )
@@ -646,8 +647,8 @@ class CameraProcessRunner:
                 "prebuffer_frames": len(frames),
                 "prebuffer_used": int(use_prebuffer),
                 "frames_since_last_close": int(frames_since_last_close),
-                "event_start_ts": ts_to_str(event_start_ts),
-                "now_ts": ts_to_str(now_ts),
+                **source_time_fields(self.camera_id, event_start_ts, now_ts,
+                                     start_key="event_start_ts", end_key="now_ts"),
                 "capture_fps": round(float(self.capture_fps), 3),
                 "clip_write_fps": round(float(self.clip_write_fps), 3),
             },
@@ -745,25 +746,33 @@ class CameraProcessRunner:
         pose_max = max(ev.pose_scores) if ev.pose_scores else 0.0
         pose_mean = sum(ev.pose_scores) / max(1, len(ev.pose_scores)) if ev.pose_scores else 0.0
 
-        clip_name = (
-            f"cam_{self.camera_id}__evt_{ev.event_id}__"
-            f"{datetime.fromtimestamp(ev.start_ts).strftime('%Y%m%d_%H%M%S_%f')[:-3]}.mp4"
-        )
+        clip_name = compact_evidence_name(self.camera_id, ev.event_id, ev.start_ts,
+            generation=self.generation, consumer_epoch=getattr(self, "consumer_epoch", 0))
         clip_path = self.paths.temp_segments_dir / clip_name
+        persisted_clip_path = ""
+        evidence_error = ""
 
         if ev.frames:
             try:
                 self.save_clip(ev.frames, clip_path)
+                if not clip_path.is_file() or clip_path.stat().st_size == 0:
+                    raise OSError("evidence_write_failed")
+                persisted_clip_path = str(clip_path)
             except Exception as exc:
+                evidence_error = "evidence_write_failed"
                 self.report_status(
                     "clip",
                     "save_failed",
                     {
                         "event_id": ev.event_id,
-                        "clip_path": str(clip_path),
-                        "error": str(exc),
+                        "clip_path": "",
+                        "attempted_clip_path": str(clip_path),
+                        "reason": evidence_error,
+                        "error": type(exc).__name__,
                     },
                 )
+                # Stage3 consumes the in-memory frames, not this serialization.
+                # Downstream evidence handling owns the explicit job error.
 
         queue_status = "not_requested"
         queue_reason = reason
@@ -790,7 +799,8 @@ class CameraProcessRunner:
                     event_end_ts=event_end_ts,
                     pose_score_max=float(pose_max),
                     pose_score_mean=float(pose_mean),
-                    clip_path=str(clip_path),
+                    clip_path=persisted_clip_path,
+                    evidence_error=evidence_error,
                     frames=list(ev.frames),
                     positive_hits=int(ev.positive_hits),
                     frame_count=int(len(ev.frames)),
@@ -814,6 +824,8 @@ class CameraProcessRunner:
                 except Exception:
                     queue_status = "dropped"
                     queue_reason = "stage3_queue_full"
+                    if self.camera_id.startswith("offline_"):
+                        raise
         else:
             queue_status = "skipped"
             queue_reason = "stage3_disabled"
@@ -822,14 +834,14 @@ class CameraProcessRunner:
             "camera_id": self.camera_id,
             "ip": self.source_public,
             "event_id": ev.event_id,
-            "event_start": ts_to_str(ev.start_ts),
-            "event_end": ts_to_str(event_end_ts),
+            **source_time_fields(self.camera_id, ev.start_ts, event_end_ts),
             "duration_sec": round(float(duration), 3),
             "status": reason,
             "pose_score_max": round(float(pose_max), 6),
             "pose_score_mean": round(float(pose_mean), 6),
             "positive_hits": int(ev.positive_hits),
-            "clip_path": str(clip_path),
+            "clip_path": persisted_clip_path,
+            "evidence_error": evidence_error,
             "queue_status": queue_status,
             "queue_reason": queue_reason,
             "frames": int(len(ev.frames)),
@@ -867,7 +879,8 @@ class CameraProcessRunner:
                 "pose_score": round(float(pose_mean), 6),
                 "pose_score_max": round(float(pose_max), 6),
                 "positive_hits": int(ev.positive_hits),
-                "clip_path": str(clip_path),
+                "clip_path": persisted_clip_path,
+                "evidence_error": evidence_error,
                 "capture_fps": round(float(self.capture_fps), 3),
                 "clip_write_fps": round(float(self.clip_write_fps), 3),
                 "source_is_file": int(self.source_is_file),

@@ -54,6 +54,7 @@ def run_preview_consumer_loop(
     generation: int,
     health_queue=None,
     slot_id: int = -1,
+    live_channel=None,
 ) -> None:
     runtime = config.get("runtime", {})
     from fight.pipeline_mp.attribution import AttributionMetrics
@@ -61,7 +62,10 @@ def run_preview_consumer_loop(
     camera_id = str(camera["camera_id"])
     preview_path = MpPaths.from_output_dir(config["output_dir"]).previews_dir / f"{camera_id}.jpg"
     quality = int(runtime.get("preview_jpeg_quality", 75))
-    interval = max(0.0, float(runtime.get("preview_write_interval_sec", 0.25)))
+    interval = (0.0 if live_channel is not None else
+                max(0.0, float(runtime.get("preview_write_interval_sec", 0.25))))
+    if live_channel is not None and hasattr(live_channel, "cancel_join_thread"):
+        live_channel.cancel_join_thread()  # Lossy preview must never delay child exit.
     last_write = 0.0
     frames_received = 0
     frames_written = 0
@@ -103,7 +107,21 @@ def run_preview_consumer_loop(
         now = time.monotonic()
         if now - last_write < interval:
             continue
-        if write_preview_atomic(preview_path, message.frame, quality):
+        if live_channel is None:
+            published = write_preview_atomic(preview_path, message.frame, quality)
+        else:
+            from fight.pipeline_mp.preview_gateway import MAX_JPEG
+            ok, encoded = cv2.imencode(".jpg", message.frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            published = False
+            if ok and encoded.nbytes <= MAX_JPEG:
+                try:
+                    from fight.pipeline_mp.camera_ingest import publish_latest
+                    published, _ = publish_latest(live_channel, (
+                        camera_id, slot_id, generation, message.frame_seq,
+                        message.captured_monotonic, encoded.tobytes()))
+                except (queue.Full, OSError, ValueError):
+                    pass
+        if published:
             frames_written += 1
             last_write = now
             health.emit(
@@ -140,6 +158,7 @@ def camera_preview_process_main(
     generation: int,
     health_queue=None,
     slot_id: int = -1,
+    live_channel=None,
 ) -> None:
     runtime = config.get("runtime", {})
     configure_process_runtime(
@@ -157,4 +176,5 @@ def camera_preview_process_main(
         generation,
         health_queue,
         slot_id,
+        live_channel,
     )

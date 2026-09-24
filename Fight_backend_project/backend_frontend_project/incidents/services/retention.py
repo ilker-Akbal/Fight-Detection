@@ -43,7 +43,8 @@ def evidence_referenced(path):
     query = Q()
     for form in forms:
         query |= Q(evidence_path__iexact=form)
-    return Incident.objects.filter(query).exists()
+    from streams.models import OfflineResult
+    return Incident.objects.filter(query).exists() or OfflineResult.objects.filter(query).exists()
 
 
 def cleanup_tick(*, dry_run=False):

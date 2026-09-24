@@ -78,6 +78,12 @@ function initCameraSourcePanels() {
 
   if (speedModuleCheckbox) {
     speedModuleCheckbox.addEventListener("change", updateSpeedModuleConfigVisibility);
+    speedModuleCheckbox.addEventListener("change", () => {
+      // One explicit capability choice populates both existing backend fields.
+      // Loading an edit form never changes a previously paused configuration.
+      const enabled = document.getElementById("id_enabled");
+      if (enabled) enabled.checked = speedModuleCheckbox.checked;
+    });
   }
 
   updateCameraSourcePanels();

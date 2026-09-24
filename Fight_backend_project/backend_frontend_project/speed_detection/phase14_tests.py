@@ -23,8 +23,7 @@ class SourceOwnershipTests(SimpleTestCase):
             request = RequestFactory().get("/speed/stream/speed/")
             request.user = SimpleNamespace(is_authenticated=True)
             with patch("speed_detection.views._get_speed_config_by_camera_id", return_value=item) as access, patch(
-                "cv2.VideoCapture", side_effect=AssertionError("second source open")), patch(
-                "speed_detection.views._open_camera_source", side_effect=AssertionError("second source open")), patch.object(
+                "cv2.VideoCapture", side_effect=AssertionError("second source open")), patch.object(
                 common_preview, "get_pipeline_status", return_value={"runtime_state": "RUNNING"}) as status, patch.object(
                 common_preview, "get_active_run", return_value=active), patch.object(common_preview.time, "sleep"):
                 response = speed_camera_stream(request, "speed")

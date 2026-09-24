@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Olaylar{% endblock %}
+{% block page_title %}Olaylar{% endblock %}
+{% block page_desc %}Kavga ve hız ihlallerini birlikte inceleyin.{% endblock %}
+{% block content %}
+<nav class="tabs" aria-label="Olay türü">{% for tab in tabs %}<a href="?{{ tab.query }}" {% if tab.active %}aria-current="page"{% endif %}>{{ tab.label }}</a>{% endfor %}</nav>
+<form method="get" class="card filters"><input type="hidden" name="type" value="{{ filters.type }}">
+  <label>Kamera / lokasyon ara<input type="search" name="q" value="{{ filters.q }}" placeholder="Ad ile ara"></label>
+  <label>Kamera<select name="camera"><option value="">Tüm kameralar</option>{% for cam in camera_options %}<option value="{{ cam.camera_id }}" {% if filters.camera == cam.camera_id %}selected{% endif %}>{{ cam.name }}</option>{% endfor %}</select></label>
+  <label>Lokasyon<select name="location"><option value="">Tüm lokasyonlar</option>{% for pk, name in locations.items %}<option value="{{ pk }}" {% if filters.location == pk|stringformat:'s' %}selected{% endif %}>{{ name }}</option>{% endfor %}</select></label>
+  <label>Başlangıç<input type="date" name="from" value="{{ filters.from }}"></label><label>Bitiş<input type="date" name="to" value="{{ filters.to }}"></label>
+  <div class="actions"><button class="btn" type="submit">Filtrele</button><a href="{% url 'dashboard:history' %}">Temizle</a></div>
+</form>
+{% if date_error %}<p class="notice danger" role="alert">{{ date_error }}</p>{% endif %}
+<p class="muted">{{ page_obj.paginator.count }} olay</p>
+<div class="event-grid">{% for event in events %}<article class="card event-{{ event.kind|lower }}">
+  <div class="evidence-thumbnail">{% if event.evidence_url %}{% if event.media_kind == 'image' %}<img src="{{ event.evidence_url }}" alt="{{ event.title }} kanıt görüntüsü" loading="lazy" data-evidence>{% else %}<video src="{{ event.evidence_url }}#t=0.1" preload="metadata" muted playsinline data-evidence aria-label="{{ event.title }} video önizlemesi"></video>{% endif %}<p hidden>Kanıt görüntüsü kullanılamıyor.</p>{% else %}<span>Kanıt kullanılamıyor</span>{% endif %}</div>
+  <span class="badge {{ event.tone }}">{{ event.title }}</span><h2>{{ event.camera }}</h2><p>{{ event.location }}</p><time>{{ event.detected_at|date:"d.m.Y H:i:s" }}</time>
+  {% if event.kind == 'SPEED' %}<p>{{ event.speed|default_if_none:'—' }} km/h · Limit {{ event.limit|default_if_none:'—' }} km/h</p>{% else %}<p>Güven: {{ event.confidence|default_if_none:'—' }}%</p>{% endif %}<a class="btn secondary" href="{{ event.url }}">İncele</a>
+</article>{% empty %}<div class="card empty-state"><h2>Olay bulunamadı</h2><p>Henüz kayıt yok veya seçtiğiniz filtrelerde sonuç bulunmuyor.</p><a href="{% url 'dashboard:history' %}">Filtreleri temizle</a></div>{% endfor %}</div>
+<nav class="pagination" aria-label="Sayfalar">{% if page_obj.has_previous %}<a class="btn secondary" href="?{{ query_string }}&page={{ page_obj.previous_page_number }}">Önceki</a>{% endif %}<span>{{ page_obj.number }} / {{ page_obj.paginator.num_pages }}</span>{% if page_obj.has_next %}<a class="btn secondary" href="?{{ query_string }}&page={{ page_obj.next_page_number }}">Sonraki</a>{% endif %}</nav>
+{% endblock %}

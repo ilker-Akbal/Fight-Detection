@@ -9,7 +9,6 @@ from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
-from django.core.paginator import Paginator
 from django.db import IntegrityError, transaction
 from django.db.models import Count, OuterRef, Subquery
 from django.http import FileResponse, Http404
@@ -23,18 +22,16 @@ from accounts.models import LoginActivity, UserProfile
 from services.access_scope import get_user_accessible_cameras
 from services.email_service import EmailServiceError, send_email
 from services.pipeline_bridge.report_reader import build_dashboard_report
-from services.pipeline_bridge.fight_runner import get_active_run, get_pipeline_status
 from services.speed_bridge.calibration_writer import (
-    is_speed_calibration_ready,
-    resolve_speed_calibration_path,
     sync_speed_calibration_file,
 )
 from speed_detection.models import SpeedCameraConfig
 from streams.models import Camera
 from incidents.models import Incident
 
-from .forms import CameraForm, FacultyLocationForm, SpeedCameraConfigForm, UserEditForm
-from .models import FacultyLocation
+from .forms import CameraForm, FacultyLocationForm, LocationForm, SpeedCameraConfigForm, UserEditForm
+from .forms import UserCreateForm
+from .models import FacultyLocation, Location
 
 
 MAX_ADMIN_INCIDENT_RUNS = 30
@@ -50,76 +47,18 @@ ADMIN_SPEED_RECORDS_PER_PAGE = 6
 @login_required
 @role_required(["admin"])
 def dashboard(request):
-    camera_count = Camera.objects.count()
-    active_camera_count = Camera.objects.filter(is_active=True).count()
-    passive_camera_count = Camera.objects.filter(is_active=False).count()
-
-    fight_camera_count = Camera.objects.filter(
-        is_active=True,
-        use_fight_detection=True,
-    ).count()
-
-    speed_camera_count = SpeedCameraConfig.objects.filter(
-        enabled=True,
-        camera__is_active=True,
-        camera__use_speed_detection=True,
-    ).count()
-
-    total_user_count = User.objects.count()
-
-    approved_user_count = UserProfile.objects.filter(status="approved").count()
-    pending_user_count = UserProfile.objects.filter(status="pending").count()
-    rejected_user_count = UserProfile.objects.filter(status="rejected").count()
-
-    admin_user_count = UserProfile.objects.filter(role="admin").count()
-    operator_user_count = UserProfile.objects.filter(role="operator").count()
-    viewer_user_count = UserProfile.objects.filter(role="viewer").count()
-
-    control_status = get_pipeline_status()
-    active_run = get_active_run() if control_status.get("available") else None
-    pipeline_running = False
-    pipeline_pid = None
-    pipeline_run_dir = ""
-
-    if active_run is not None:
-        pipeline_running = active_run.runtime_state in {
-            "STARTING",
-            "RUNNING",
-            "STOPPING",
-            "BACKOFF",
-        }
-        pipeline_pid = active_run.runtime_pid
-        pipeline_run_dir = str(active_run.run_dir)
-
-    fight_incident_count = len(_admin_collect_incidents())
-    speed_record_count = len(_admin_collect_speed_records())
-
-    context = {
-        "camera_count": camera_count,
-        "active_camera_count": active_camera_count,
-        "passive_camera_count": passive_camera_count,
-        "fight_camera_count": fight_camera_count,
-        "speed_camera_count": speed_camera_count,
-
-        "user_count": UserProfile.objects.count(),
-        "total_user_count": total_user_count,
-        "approved_user_count": approved_user_count,
-        "pending_user_count": pending_user_count,
-        "rejected_user_count": rejected_user_count,
-
-        "admin_user_count": admin_user_count,
-        "operator_user_count": operator_user_count,
-        "viewer_user_count": viewer_user_count,
-
-        "pipeline_running": pipeline_running,
-        "pipeline_pid": pipeline_pid,
-        "pipeline_run_dir": pipeline_run_dir,
-
-        "fight_incident_count": fight_incident_count,
-        "speed_record_count": speed_record_count,
-    }
-
-    return render(request, "adminx/dashboard.html", context)
+    from guvenlik.presentation import camera_cards, incident_card, system_snapshot, visible_incidents
+    system, health = system_snapshot()
+    cards = camera_cards(request.user, system, health)
+    events = visible_incidents(request.user)
+    return render(request, "adminx/dashboard.html", {
+        "system": system, "camera_count": len(cards),
+        "online_count": sum(card["tone"] == "success" for card in cards),
+        "recent_events": [incident_card(item) for item in events[:6]],
+        "event_count": events.count(),
+        "attention": [card for card in cards if card["tone"] in {"warning", "danger"}][:8],
+        "has_locations": Location.objects.exists() or FacultyLocation.objects.exists(),
+    })
 
 
 @never_cache
@@ -129,57 +68,22 @@ def dashboard(request):
 def camera_preview_frame(request, pk):
     camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
 
-    source = str(camera.source or "").strip()
-
-    if not source:
-        raise Http404("Kamera kaynağı boş.")
-
-    cap = None
-
-    try:
-        if source.isdigit():
-            cap = cv2.VideoCapture(int(source))
-        else:
-            cap = cv2.VideoCapture(source)
-
-        if cap is None or not cap.isOpened():
-            raise Http404("Kamera açılamadı.")
-
-        ok, frame = cap.read()
-
-        if not ok or frame is None:
-            raise Http404("Kare okunamadı.")
-
-        max_width = 960
-        h, w = frame.shape[:2]
-
-        if w > max_width:
-            scale = max_width / float(w)
-            new_w = max_width
-            new_h = int(h * scale)
-            frame = cv2.resize(frame, (new_w, new_h))
-
-        ok, buffer = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 90],
-        )
-
-        if not ok:
-            raise Http404("Kare encode edilemedi.")
-
-        from io import BytesIO
-
-        bio = BytesIO(buffer.tobytes())
-        response = FileResponse(bio, content_type="image/jpeg")
-        response["Cache-Control"] = "no-cache, no-store, must-revalidate"
-
-        return response
-
-    finally:
-        if cap is not None:
-            cap.release()
-
+    from services.pipeline_bridge.live_preview import snapshot
+    from io import BytesIO
+    import numpy as np
+    data = snapshot(camera.camera_id)
+    frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR) if data else None
+    if frame is None:
+        raise Http404("Canlı izlemeyi başlatın; kamera görüntüsü henüz hazır değil.")
+    height, width = frame.shape[:2]
+    if width > 960:
+        frame = cv2.resize(frame, (960, int(height * 960 / width)))
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise Http404("Kare hazırlanamadı.")
+    response = FileResponse(BytesIO(encoded.tobytes()), content_type="image/jpeg")
+    response["Cache-Control"] = "no-store"
+    return response
 
 @never_cache
 @login_required
@@ -204,6 +108,11 @@ def user_list(request):
         .order_by("-user__last_login", "-user__date_joined")
     )
 
+    from django.db.models import Prefetch
+    from .models import UserSecurityAssignment
+    users = users.prefetch_related(Prefetch("user__security_assignments",
+        queryset=UserSecurityAssignment.objects.filter(active=True, security_unit__active=True)
+        .select_related("security_unit"), to_attr="active_security_assignments"))
     return render(
         request,
         "adminx/user_list.html",
@@ -415,75 +324,27 @@ def user_update(request, pk):
 @never_cache
 @login_required
 @role_required(["admin"])
+def user_create(request):
+    from django.contrib.auth.models import User
+    user = User()
+    profile = UserProfile(user=user, status="approved", role="viewer")
+    form = UserCreateForm(request.POST or None, instance=profile, user_instance=user)
+    if request.method == "POST" and form.is_valid():
+        form.save(user_instance=user)
+        return redirect("adminx:user_list")
+    return render(request, "adminx/user_form.html", {"form": form, "profile": profile,
+        "page_title": "Kullanıcı Ekle", "submit_label": "Oluştur"})
+
+
+@never_cache
+@login_required
+@role_required(["admin"])
 def camera_list(request):
-    manageable_cameras = get_user_accessible_cameras(request.user)
-
-    for camera in manageable_cameras:
-        SpeedCameraConfig.objects.get_or_create(camera=camera)
-
-    cameras = (
-        manageable_cameras
-        .select_related("speed_config")
-        .order_by("name", "camera_id")
-    )
-
-    for camera in cameras:
-        try:
-            speed_config = camera.speed_config
-        except SpeedCameraConfig.DoesNotExist:
-            speed_config = None
-
-        camera.speed_calibration_ready = False
-        camera.speed_calibration_reason = "Hız konfigürasyonu yok."
-        camera.speed_threshold_kmh = "-"
-
-        if speed_config is not None:
-            try:
-                camera.speed_threshold_kmh = (
-                    speed_config.speed_limit_kmh + speed_config.tolerance_kmh
-                )
-            except Exception:
-                camera.speed_threshold_kmh = "-"
-
-            try:
-                cal_path = resolve_speed_calibration_path(
-                    speed_config.calibration_path,
-                    camera_id=camera.camera_id,
-                )
-                ready, reason = is_speed_calibration_ready(cal_path)
-                camera.speed_calibration_ready = ready
-                camera.speed_calibration_reason = reason
-            except Exception as exc:
-                camera.speed_calibration_ready = False
-                camera.speed_calibration_reason = str(exc)
-
-    active_camera_count = sum(1 for camera in cameras if camera.is_active)
-
-    fight_camera_count = sum(
-        1 for camera in cameras
-        if camera.is_active and camera.use_fight_detection
-    )
-
-    speed_camera_count = sum(
-        1 for camera in cameras
-        if (
-            camera.is_active
-            and camera.use_speed_detection
-            and hasattr(camera, "speed_config")
-            and camera.speed_config.enabled
-        )
-    )
-
-    return render(
-        request,
-        "adminx/camera_list.html",
-        {
-            "cameras": cameras,
-            "active_camera_count": active_camera_count,
-            "fight_camera_count": fight_camera_count,
-            "speed_camera_count": speed_camera_count,
-        },
-    )
+    from guvenlik.presentation import camera_cards, system_snapshot
+    system, health = system_snapshot()
+    return render(request, "adminx/camera_list.html", {
+        "cards": camera_cards(request.user, system, health), "system": system,
+    })
 
 
 @never_cache
@@ -537,6 +398,10 @@ def camera_create(request):
 @role_required(["admin"])
 def camera_edit(request, pk):
     camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
+    if camera.source_kind != "LIVE":
+        from streams.models import OfflineAsset
+        asset = get_object_or_404(OfflineAsset, legacy_camera=camera)
+        return redirect("dashboard:offline_detail", pk=asset.pk)
     speed_config, _ = SpeedCameraConfig.objects.get_or_create(camera=camera)
 
     form = CameraForm(
@@ -589,6 +454,8 @@ def camera_edit(request, pk):
 @role_required(["admin"])
 def camera_delete(request, pk):
     camera = get_object_or_404(get_user_accessible_cameras(request.user), pk=pk)
+    if camera.source_kind != "LIVE":
+        return redirect("dashboard:offline_list")
 
     if request.method == "POST":
         camera_name = camera.name
@@ -657,6 +524,7 @@ def faculty_location_list(request):
             "total_count": total_count,
             "active_count": active_count,
             "passive_count": passive_count,
+            "physical_locations": Location.objects.select_related("parent"),
         },
     )
 
@@ -686,6 +554,7 @@ def faculty_location_edit(request, pk):
             "form": form,
             "items": items,
             "editing_item": item,
+            "physical_locations": Location.objects.select_related("parent"),
             "total_count": total_count,
             "active_count": active_count,
             "passive_count": passive_count,
@@ -718,6 +587,19 @@ def faculty_location_toggle(request, pk):
     messages.success(request, "Fakülte / mevki durumu güncellendi.")
 
     return redirect("adminx:faculty_location_list")
+
+
+@never_cache
+@login_required
+@role_required(["admin"])
+def location_edit(request, pk=None):
+    location = get_object_or_404(Location, pk=pk) if pk else None
+    form = LocationForm(request.POST or None, instance=location)
+    if request.method == "POST" and form.is_valid():
+        form.save()
+        messages.success(request, "Lokasyon kaydedildi.")
+        return redirect("adminx:faculty_location_list")
+    return render(request, "adminx/location_form.html", {"form": form, "location": location})
 
 
 def _admin_pipeline_runs_root() -> Path:
@@ -991,63 +873,8 @@ def _filter_admin_incidents(incidents, selected_faculty, selected_camera, search
 @login_required
 @role_required(["admin"])
 def incident_list(request):
-    selected_faculty = request.GET.get("faculty", "").strip()
-    selected_camera = request.GET.get("camera", "").strip()
-    search_query = request.GET.get("q", "").strip()
-
-    all_incidents = _admin_collect_incidents()
-
-    filtered_incidents = _filter_admin_incidents(
-        incidents=all_incidents,
-        selected_faculty=selected_faculty,
-        selected_camera=selected_camera,
-        search_query=search_query,
-    )
-
-    fight_count = sum(
-        1 for item in filtered_incidents
-        if str(item.get("final_label", "")).lower() == "fight"
-    )
-
-    faculty_count = len(
-        {
-            item.get("faculty")
-            for item in filtered_incidents
-            if item.get("faculty")
-        }
-    )
-
-    paginator = Paginator(filtered_incidents, ADMIN_INCIDENTS_PER_PAGE)
-    page_number = request.GET.get("page")
-    page_obj = paginator.get_page(page_number)
-
-    query_params = request.GET.copy()
-
-    if "page" in query_params:
-        query_params.pop("page")
-
-    return render(
-        request,
-        "adminx/incident_list.html",
-        {
-            "incidents": page_obj.object_list,
-            "page_obj": page_obj,
-            "paginator": paginator,
-
-            "incident_count": len(filtered_incidents),
-            "all_incident_count": len(all_incidents),
-            "fight_count": fight_count,
-            "faculty_count": faculty_count,
-
-            "selected_faculty": selected_faculty,
-            "selected_camera": selected_camera,
-            "search_query": search_query,
-            "query_string": query_params.urlencode(),
-
-            "faculty_options": _admin_faculty_location_options(),
-            "camera_options": Camera.objects.all().order_by("name", "camera_id"),
-        },
-    )
+    query = request.GET.copy()
+    return redirect(reverse("dashboard:history") + ("?" + query.urlencode() if query else ""))
 
 
 def _admin_speed_runs_root() -> Path:
@@ -1286,67 +1113,6 @@ def _filter_admin_speed_records(records, selected_faculty, selected_camera, sear
 @login_required
 @role_required(["admin"])
 def speed_record_list(request):
-    selected_faculty = request.GET.get("faculty", "").strip()
-    selected_camera = request.GET.get("camera", "").strip()
-    search_query = request.GET.get("q", "").strip()
-
-    all_records = _admin_collect_speed_records()
-
-    filtered_records = _filter_admin_speed_records(
-        records=all_records,
-        selected_faculty=selected_faculty,
-        selected_camera=selected_camera,
-        search_query=search_query,
-    )
-
-    camera_count = len(
-        {
-            item.get("camera_id")
-            for item in filtered_records
-            if item.get("camera_id")
-        }
-    )
-
-    max_speed_kmh = "-"
-    numeric_speeds = []
-
-    for item in filtered_records:
-        try:
-            numeric_speeds.append(float(item.get("speed_kmh")))
-        except Exception:
-            pass
-
-    if numeric_speeds:
-        max_speed_kmh = f"{max(numeric_speeds):.2f}"
-
-    paginator = Paginator(filtered_records, ADMIN_SPEED_RECORDS_PER_PAGE)
-    page_number = request.GET.get("page")
-    page_obj = paginator.get_page(page_number)
-
-    query_params = request.GET.copy()
-
-    if "page" in query_params:
-        query_params.pop("page")
-
-    return render(
-        request,
-        "adminx/speed_record_list.html",
-        {
-            "records": page_obj.object_list,
-            "page_obj": page_obj,
-            "paginator": paginator,
-
-            "record_count": len(filtered_records),
-            "all_record_count": len(all_records),
-            "camera_count": camera_count,
-            "max_speed_kmh": max_speed_kmh,
-
-            "selected_faculty": selected_faculty,
-            "selected_camera": selected_camera,
-            "search_query": search_query,
-            "query_string": query_params.urlencode(),
-
-            "faculty_options": _admin_faculty_location_options(),
-            "camera_options": Camera.objects.all().order_by("name", "camera_id"),
-        },
-    )
+    query = request.GET.copy()
+    query["type"] = "SPEED"
+    return redirect(reverse("dashboard:history") + "?" + query.urlencode())

@@ -77,7 +77,7 @@ def _camera_queryset_for_user(user, active_only=False):
         user,
         active_only=active_only,
         fight_only=active_only,
-    )
+    ).filter(source_kind="LIVE")
 
 
 def _allowed_camera_ids_for_user(user) -> set[str]:
@@ -651,21 +651,8 @@ def _report_signature(payload: dict) -> str:
 @never_cache
 @login_required
 def index(request):
-    cameras = list(_camera_queryset_for_user(request.user, active_only=True))
-    pipeline = _pipeline_report()
-    pipeline = _filter_report_for_user(pipeline, request.user)
-    camera_cards = _merge_camera_cards(cameras, pipeline)
-
-    return render(
-        request,
-        "dashboard/index.html",
-        {
-            "cameras": cameras,
-            "camera_cards": camera_cards,
-            "pipeline": pipeline,
-            "operational_inbox": _operational_inbox_payload(request.user),
-        },
-    )
+    from .operator_views import live
+    return live(request)
 
 
 @never_cache
@@ -807,6 +794,8 @@ def start_detection(request):
 @role_required(["admin"])
 @require_POST
 def stop_detection(request):
+    from services.pipeline_bridge.offline_analysis import set_monitoring_hold
+    set_monitoring_hold(True)
     is_ajax = request.headers.get("x-requested-with") == "XMLHttpRequest"
 
     control_status = get_pipeline_status()

@@ -4,6 +4,7 @@ import queue
 import time
 
 from fight.pipeline.adapters import Stage3Adapter
+from fight.pipeline.evidence_metadata import source_time_fields
 from fight.pipeline_mp.common import configure_process_runtime, now_str, ts_to_str
 from fight.pipeline_mp.generation import is_current_generation
 from fight.pipeline_mp.health import HealthEmitter
@@ -92,6 +93,16 @@ def stage3_process_main(
             break
 
         try:
+            from fight.pipeline_mp.offline_jobs import OfflineDrain
+            if isinstance(job, OfflineDrain):
+                if is_current_generation(job, slot_generations):
+                    while not stop_event.is_set():
+                        try:
+                            incident_queue.put(job, timeout=0.25)
+                            break
+                        except queue.Full:
+                            continue
+                continue
             received_monotonic = time.perf_counter()
             jobs_received += 1
             if not is_current_generation(job, slot_generations):
@@ -170,9 +181,9 @@ def stage3_process_main(
                 "camera_id": job.camera_id,
                 "ip": job.source,
                 "event_id": job.event_id,
-                "event_start": ts_to_str(job.event_start_ts),
-                "event_end": ts_to_str(job.event_end_ts),
+                **source_time_fields(job.camera_id, job.event_start_ts, job.event_end_ts),
                 "clip_path": job.clip_path,
+                "evidence_error": job.evidence_error,
                 "fight_prob": round(float(prob), 6),
                 "fight_label": label,
                 "pose_score_max": round(float(job.pose_score_max), 6),
@@ -194,6 +205,7 @@ def stage3_process_main(
                             event_start_ts=job.event_start_ts,
                             event_end_ts=job.event_end_ts,
                             clip_path=job.clip_path,
+                            evidence_error=job.evidence_error,
                             fight_prob=float(prob),
                             fight_label=label,
                             pose_score_max=float(job.pose_score_max),
@@ -209,6 +221,8 @@ def stage3_process_main(
                     )
                     health.emit("result_produced", progress=jobs_received)
                 except Exception:
+                    from fight.pipeline_mp.offline_jobs import record_failure
+                    record_failure(config, job.camera_id, job.generation, "incident_delivery_failed")
                     _report(
                         report_queue,
                         "status",
@@ -247,6 +261,8 @@ def stage3_process_main(
 
         except Exception as exc:
             errors += 1
+            from fight.pipeline_mp.offline_jobs import record_failure
+            record_failure(config, getattr(job, "camera_id", ""), getattr(job, "generation", -1), "stage3_failed")
             _report(
                 report_queue,
                 "status",

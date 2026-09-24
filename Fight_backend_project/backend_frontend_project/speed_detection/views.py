@@ -42,17 +42,7 @@ MAX_SPEED_HISTORY_RUNS = 10
 @never_cache
 @login_required
 def index(request):
-    report = _pipeline_report(request.user)
-
-    return render(
-        request,
-        "speed_detection/index.html",
-        {
-            "speed": report,
-            "camera_cards": report.get("cameras", []),
-            "events": report.get("events", []),
-        },
-    )
+    return redirect(reverse("dashboard:index") + "?capability=speed")
 
 
 def _speed_runs_root() -> Path:
@@ -554,79 +544,33 @@ def _get_speed_config_by_camera_id(camera_id: str, user=None) -> SpeedCameraConf
     )
 
 
-def _open_camera_source(source: str):
-    source = str(source or "").strip()
-
-    if not source:
-        return None
-
-    if source.isdigit():
-        return cv2.VideoCapture(int(source))
-
-    return cv2.VideoCapture(source)
-
-
 @never_cache
 @login_required
 @role_required(["admin"])
 @require_GET
 def speed_calibration_frame(request, camera_id):
     item = _get_speed_config_by_camera_id(camera_id)
-    camera = item.camera
-
-    cap = None
-
-    try:
-        from services.pipeline_bridge.fight_runner import get_pipeline_status, get_active_run, _control_mode
-        status = get_pipeline_status()
-        if _control_mode() == "supervisor" or status.get("runtime_state") in {"STARTING", "RUNNING"}:
-            if status.get("runtime_state") not in {"STARTING", "RUNNING"} or status.get("orphan_detected"):
-                raise Http404("Start the common camera runtime to obtain a calibration preview.")
-            active = get_active_run(status)
-            frame = cv2.imread(str(active.run_dir / "previews" / f"{camera.camera_id}.jpg")) if active else None
-            ok = frame is not None
-        elif status.get("runtime_state") != "STOPPED" or status.get("orphan_detected"):
-            raise Http404("Camera ownership is unavailable; refusing a second source open.")
-        else:
-            cap = _open_camera_source(camera.get_runtime_source())
-            if cap is None or not cap.isOpened():
-                raise Http404("Kamera görüntüsü açılamadı.")
-            ok, frame = cap.read()
-
-        if not ok or frame is None:
-            raise Http404("Kameradan kare okunamadı.")
-
-        speed_defaults = getattr(settings, "SPEED_PIPELINE_DEFAULTS", {})
-        resize_width = int(speed_defaults.get("resize_width", 960) or 960)
-
-        h, w = frame.shape[:2]
-
-        if resize_width > 0 and w != resize_width:
-            scale = resize_width / float(w)
-            frame = cv2.resize(frame, (resize_width, int(h * scale)))
-
-        ok, buffer = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), 92],
-        )
-
-        if not ok:
-            raise Http404("Kalibrasyon karesi hazırlanamadı.")
-
-        response = FileResponse(BytesIO(buffer.tobytes()), content_type="image/jpeg")
-        response["Cache-Control"] = "no-cache, no-store, must-revalidate"
-        response["Pragma"] = "no-cache"
-        response["Expires"] = "0"
-        response["X-Calibration-Frame-Width"] = str(frame.shape[1])
-        response["X-Calibration-Frame-Height"] = str(frame.shape[0])
-
-        return response
-
-    finally:
-        if cap is not None:
-            cap.release()
-
+    from services.pipeline_bridge.live_preview import snapshot
+    import numpy as np
+    data = snapshot(item.camera.camera_id)
+    frame = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR) if data else None
+    if frame is None:
+        raise Http404("Canlı izlemeyi başlatın; kalibrasyon görüntüsü henüz hazır değil.")
+    speed_defaults = getattr(settings, "SPEED_PIPELINE_DEFAULTS", {})
+    resize_width = int(speed_defaults.get("resize_width", 960) or 960)
+    h, w = frame.shape[:2]
+    if resize_width > 0 and w != resize_width:
+        frame = cv2.resize(frame, (resize_width, int(h * resize_width / w)))
+    ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+    if not ok:
+        raise Http404("Kalibrasyon karesi hazırlanamadı.")
+    response = FileResponse(BytesIO(buffer.tobytes()), content_type="image/jpeg")
+    response["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    response["Pragma"] = "no-cache"
+    response["Expires"] = "0"
+    response["X-Calibration-Frame-Width"] = str(frame.shape[1])
+    response["X-Calibration-Frame-Height"] = str(frame.shape[0])
+    return response
 
 @never_cache
 @login_required

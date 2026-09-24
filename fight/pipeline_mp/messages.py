@@ -159,6 +159,7 @@ class Stage3Job:
     generation: int = 0
     slot_id: int = -1
     consumer_epoch: int = 0
+    evidence_error: str = ""
 
 
 @dataclass
@@ -178,6 +179,7 @@ class Stage3ResultMessage:
     slot_id: int = -1
     service_epoch: int = 0
     consumer_epoch: int = 0
+    evidence_error: str = ""
 
 
 @dataclass

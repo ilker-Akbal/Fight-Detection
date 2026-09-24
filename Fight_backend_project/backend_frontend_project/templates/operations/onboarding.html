@@ -1,0 +1,6 @@
+<section class="card onboarding">
+  <span class="eyebrow">HOŞ GELDİNİZ</span><h2>Sistemi kullanmaya başlayın</h2>
+  <p>Önce bir kamera ekleyin; ardından görüntüleri ve olayları aynı çalışma alanından takip edin.</p>
+  <ol class="setup-steps"><li>{% if has_locations %}✓ Lokasyon hazır{% else %}<a href="{% url 'adminx:faculty_location_list' %}">Lokasyon oluştur</a>{% endif %}</li><li>Kamera ekle</li><li>Kavga / Hız analizlerini seç</li><li>Canlı izlemeyi başlat</li></ol>
+  <a class="btn" href="{% url 'adminx:camera_create' %}">İlk Kamerayı Ekle</a>
+</section>

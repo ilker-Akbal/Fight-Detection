@@ -1,0 +1,3 @@
+{% extends 'base.html' %}
+{% block page_title %}Yeni Video Analizi{% endblock %}
+{% block content %}<section class="card"><p>Önce video ve lokasyon yüklenir. Sonraki adımda analiz ve gerekli hız kalibrasyonu seçilir. Canlı kamera oluşturulmaz.</p><form method="post" enctype="multipart/form-data">{% csrf_token %}{{ form.as_p }}<button class="btn">Yükle ve Yapılandır</button></form></section>{% endblock %}

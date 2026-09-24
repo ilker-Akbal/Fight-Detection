@@ -99,6 +99,17 @@ def incident_process_main(
                 break
 
             try:
+                from fight.pipeline_mp.offline_jobs import OfflineDrain, drain_ack_path
+                if isinstance(msg, OfflineDrain):
+                    if is_current_generation(msg, slot_generations):
+                        agg.finalize(msg.camera_id)
+                        agg.raise_if_failed()
+                        from fight.operations import atomic_json
+                        outbox_offset = Path(outbox_path).stat().st_size if Path(outbox_path).exists() else 0
+                        atomic_json(drain_ack_path(config, msg.camera_id), {
+                            "generation": msg.generation, "consumer_epoch": msg.consumer_epoch,
+                            "outbox_offset": outbox_offset})
+                    continue
                 if not isinstance(msg, Stage3ResultMessage):
                     continue
                 if not is_current_generation(msg, slot_generations):
@@ -118,6 +129,16 @@ def incident_process_main(
 
                 received_count += 1
                 health.emit("work_received", progress=received_count)
+
+                if msg.evidence_error:
+                    from fight.pipeline_mp.offline_jobs import record_failure
+                    record_failure(config, msg.camera_id, msg.generation, "evidence_write_failed")
+                    _report(report_queue, "status", {"ts": now_str(), "camera_id": msg.camera_id,
+                        "stage": "incident", "detail": "evidence_write_failed", "event_id": msg.event_id,
+                        "clip_path": ""})
+                    completed_count += 1
+                    health.emit("work_completed", progress=completed_count)
+                    continue  # No fake Incident/evidence path. Inference has completed.
 
                 agg.submit(
                     Stage3Result(
@@ -155,6 +176,8 @@ def incident_process_main(
                 )
 
             except Exception as exc:
+                from fight.pipeline_mp.offline_jobs import record_failure
+                record_failure(config, getattr(msg, "camera_id", ""), getattr(msg, "generation", -1), "incident_failed")
                 _report(
                     report_queue,
                     "status",

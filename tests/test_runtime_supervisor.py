@@ -323,8 +323,11 @@ class RuntimeSupervisorTests(unittest.TestCase):
             invalid = RuntimeSupervisorClient(url, "wrong", timeout=1.0)
             self.assertTrue(valid.health()["ok"])
             self.assertEqual(valid.status()["runtime_state"], STOPPED)
-            with self.assertRaises(SupervisorRequestError):
+            with self.assertRaises(SupervisorRequestError) as rejected:
                 invalid.start(str(self.config_path))
+            self.assertEqual(rejected.exception.http_status, 401)
+            self.assertEqual(rejected.exception.method, "POST")
+            self.assertEqual(rejected.exception.path, "/start")
             with self.assertRaises(SupervisorRequestError):
                 invalid.runtime_health()
             self.assertEqual(len(factory.calls), 0)

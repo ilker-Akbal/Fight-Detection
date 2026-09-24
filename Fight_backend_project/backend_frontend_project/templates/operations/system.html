@@ -1,0 +1,19 @@
+{% extends "adminx/base.html" %}
+{% block title %}Sistem Durumu{% endblock %}
+{% block page_title %}Sistem Durumu{% endblock %}
+{% block page_desc %}Canlı izleme ve analizler bağımsızdır. Durum otomatik güncellenir.{% endblock %}
+{% block content %}
+<section class="card"><h2>Canlı İzleme ve Analizler</h2><span data-system-status class="badge {{ system.tone }}">{{ system.label }}</span>
+<p data-health-stale {% if not stale %}hidden{% endif %}>Güncel sağlık bilgisi alınamıyor. Son kayıt canlı durumun kanıtı değildir.</p>
+<p>Etkin canlı kameralar otomatik izlenir. Analiz yetenekleri kamera ayarlarını izler. Geçmiş videolar Video Analizleri bölümünde işlenir.</p>
+<p>Son başarılı durum: {{ system.last_status_at|default:'Henüz alınmadı' }}</p>
+<details><summary>Teknik / Bakım</summary><p>Analizleri duraklatmak canlı görüntüyü kapatmaz; açık geçmiş video çalışmalarını değiştirmez.</p>
+<div class="actions control-actions">
+<form method="post" action="{% url 'dashboard:analytics_control' 'start' %}" data-control="start">{% csrf_token %}<button class="btn">Analizleri Devam Ettir</button></form>
+<form method="post" action="{% url 'dashboard:analytics_control' 'stop' %}" data-control="stop">{% csrf_token %}<button class="btn secondary">Analizleri Duraklat</button></form>
+</div><p data-control-result role="status"></p>
+<p>Teknik durdurma canlı izleme dahil tüm çalışma zamanını kapatır ve otomatik başlatmayı bakım için askıya alır. Devam Ettir bu bakım kilidini kaldırır.</p><form method="post" action="{% url 'dashboard:stop_detection' %}" data-confirm="Canlı izleme ve devam eden video analizleri durdurulsun mu?">{% csrf_token %}<button class="btn danger">Tüm Çalışma Zamanını Durdur</button></form></details></section>
+<section class="card"><h2>Hizmetler</h2><div class="table-wrap"><table><thead><tr><th>Hizmet</th><th>Durum</th><th>Son sağlık / aktivite</th><th>Yeniden başlatma sayısı</th></tr></thead><tbody>{% for worker in workers %}<tr data-worker="{{ worker.name }}"><td>{{ worker.label }}</td><td data-worker-health>{{ worker.health }}</td><td data-worker-age>{{ worker.heartbeat_age_sec|default_if_none:'—' }} sn</td><td data-worker-restarts>{{ worker.restart_count|default_if_none:'—' }}</td></tr>{% endfor %}</tbody></table></div>
+<details><summary>Teknik Detaylar</summary><p>{{ system.state }} · {{ system.reason }}</p>{% for worker in workers %}<p>{{ worker.name }} · PID {{ worker.pid|default_if_none:'—' }} · Hizmet dönemi {{ worker.service_epoch|default_if_none:'—' }}</p>{% endfor %}</details></section>
+<section class="card"><h2>Kameralar</h2>{% for card in cards %}<div class="feed-item" data-camera="{{ card.camera_id }}"><strong>{{ card.name }}</strong> <span data-camera-status class="badge {{ card.tone }}">{{ card.label }}</span><span data-analysis>{{ card.analysis }}</span></div>{% empty %}<p>Tanımlı kamera yok.</p>{% endfor %}</section>
+{% endblock %}

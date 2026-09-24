@@ -10,6 +10,9 @@ from streams.models import Camera
 
 
 class FakeSupervisorClient:
+    def status(self):
+        return {"runtime_state": "RUNNING"}
+
     def __init__(self, cameras=None, revision=4):
         self.cameras = list(cameras or [])
         self.revision = revision
@@ -30,7 +33,7 @@ class FakeSupervisorClient:
 
 
 class Phase9CameraRegistryTests(TestCase):
-    def test_snapshot_contains_only_active_fight_cameras(self):
+    def test_snapshot_contains_active_monitorable_cameras(self):
         Camera.objects.create(
             camera_id="fight", name="Fight", source="rtsp://host/fight"
         )
@@ -48,7 +51,8 @@ class Phase9CameraRegistryTests(TestCase):
             use_speed_detection=True,
         )
         snapshot = desired_camera_snapshot()
-        self.assertEqual([camera["camera_id"] for camera in snapshot], ["fight"])
+        self.assertEqual([camera["camera_id"] for camera in snapshot], ["fight", "speed"])
+        self.assertFalse(snapshot[1]["use_speed_detection"])
 
     def test_unchanged_snapshot_does_not_spam_supervisor_updates(self):
         Camera.objects.create(camera_id="A", name="A", source="rtsp://host/A")

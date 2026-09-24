@@ -1,0 +1,4 @@
+{% extends "adminx/base.html" %}
+{% block title %}Lokasyon{% endblock %}{% block page_title %}{% if location %}Lokasyonu Düzenle{% else %}Yeni Lokasyon{% endif %}{% endblock %}
+{% block page_desc %}Konumu mevcut hiyerarşiye ekleyin. Kullanılan konumları silmek yerine pasifleştirebilirsiniz.{% endblock %}
+{% block content %}<section class="card camera-form-card"><form method="post">{% csrf_token %}{{ form.non_field_errors }}{% for field in form %}<div class="field">{{ field.label_tag }}{{ field }}{{ field.errors }}{% if field.name == 'code' %}<small>Kısa, benzersiz bir kod: ana-kampus, bina-a, kat-1.</small>{% endif %}</div>{% endfor %}<div class="actions"><button type="submit" class="btn">Kaydet</button><a href="{% url 'adminx:faculty_location_list' %}">Vazgeç</a></div></form></section>{% endblock %}

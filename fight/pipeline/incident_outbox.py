@@ -37,6 +37,7 @@ class IncidentOutboxEnvelope:
     created_wall_time: float
     schema_version: int = OUTBOX_SCHEMA_VERSION
     source_system: str = "fight_runtime"
+    video_time_sec: float | None = None
 
     @classmethod
     def create(cls, **values) -> "IncidentOutboxEnvelope":

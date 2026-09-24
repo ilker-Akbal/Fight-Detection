@@ -280,7 +280,9 @@ class RuntimeSupervisor:
             raise InvalidRuntimeConfig("runtime config is not valid JSON") from exc
         if not isinstance(payload, dict):
             raise InvalidRuntimeConfig("runtime config root must be an object")
-        if not isinstance(payload.get("cameras"), list) or not payload["cameras"]:
+        if not isinstance(payload.get("cameras"), list) or (
+            not payload["cameras"] and not payload.get("runtime", {}).get("offline_job_dir")
+        ):
             raise InvalidRuntimeConfig("runtime config must contain at least one camera")
         output_value = str(payload.get("output_dir") or "").strip()
         if not output_value:
@@ -309,7 +311,7 @@ class RuntimeSupervisor:
         launch_payload["cameras"] = [
             camera
             for camera in desired["cameras"]
-            if camera["enabled"] and (camera["use_fight_detection"] or camera.get("use_speed_detection", False))
+            if camera["enabled"]
         ]
         runtime = dict(launch_payload.get("runtime") or {})
         runtime["run_id"] = run_id
@@ -759,6 +761,7 @@ class RuntimeSupervisor:
                 "snapshot_age_sec": round(age, 3) if age != float("inf") else None,
                 "runtime_health": runtime_health,
                 "snapshot_runtime_health": reported_health,
+                "desired_camera_revision": payload.get("desired_camera_revision"),
                 "disk": payload.get("disk", {}),
                 "reason": "health_snapshot_stale" if stale else str(payload.get("reason") or ""),
                 "updated_at": payload.get("updated_at"),
@@ -806,6 +809,7 @@ class RuntimeSupervisor:
                 result["desired_camera_count"] = len(desired["cameras"])
                 result["desired_camera_state_valid"] = True
                 result["speed_paused"] = desired.get("speed_paused", False)
+                result["analytics_paused"] = desired.get("analytics_paused", False)
             except Exception:
                 result["desired_camera_revision"] = None
                 result["desired_camera_count"] = None

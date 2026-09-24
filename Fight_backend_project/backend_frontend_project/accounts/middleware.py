@@ -1,6 +1,6 @@
 from django.conf import settings
 from django.shortcuts import redirect
-from django.urls import reverse
+from django.urls import reverse, resolve, Resolver404
 
 
 class AuthRequiredMiddleware:
@@ -55,6 +55,11 @@ class AuthRequiredMiddleware:
         is_public = any(path.startswith(p) for p in self.public_paths)
 
         if not request.user.is_authenticated and not is_public:
+            try:
+                resolve(path)
+            except Resolver404:
+                # Unknown paths reach the safe 404. Known views keep guards.
+                return self.get_response(request)
             full_path = f"{prefix}{path}"
             if request.META.get("QUERY_STRING"):
                 full_path = f"{prefix}{path}?{request.META['QUERY_STRING']}"

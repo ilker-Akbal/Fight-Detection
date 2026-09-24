@@ -140,7 +140,8 @@ def test_camera_modes_reconfigure_and_consumer_failure_are_isolated(tmp_path):
     cameras = [camera("fight", True, False), camera("speed", False, True),
                camera("both"), camera("neither", False, False)]
     manager.reconcile(cameras)
-    assert set(manager.runtimes) == {"fight", "speed", "both"}
+    assert set(manager.runtimes) == {"fight", "speed", "both", "neither"}
+    assert set(manager.runtimes["neither"].processes) == {"ingest", "preview"}
     assert set(manager.runtimes["fight"].processes) == {"ingest", "camera", "preview"}
     assert set(manager.runtimes["speed"].processes) == {"ingest", "speed", "preview"}
     both = manager.runtimes["both"]
