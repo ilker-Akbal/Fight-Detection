@@ -31,7 +31,10 @@ from fight.runtime_supervisor.core import (
 from fight.runtime_supervisor.http_api import create_http_server
 from fight.runtime_supervisor.camera_state import (
     DesiredCameraStateStore,
+    DuplicateCameraSources,
+    InvalidDesiredCameraState,
     StaleDesiredCameraRevision,
+    normalize_cameras,
 )
 from fight.runtime_supervisor.locking import SingletonLock, SingletonLockError
 from fight.pipeline_mp.messages import ReportMessage
@@ -133,6 +136,61 @@ class PidExistenceTests(unittest.TestCase):
             with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
                 child.wait(timeout=10)
                 self.assertFalse(_pid_exists(child.pid))
+
+
+class DuplicateSourceBenchmarkTests(unittest.TestCase):
+    def cameras(self):
+        return [
+            {"camera_id": "cam_A", "source": "http://127.0.0.1:8090/stream.mjpg", "enabled": True},
+            {"camera_id": "cam_B", "source": "http://127.0.0.1:8090/stream.mjpg", "enabled": True},
+        ]
+
+    def test_duplicate_sources_are_rejected_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertRaises(DuplicateCameraSources):
+                normalize_cameras(self.cameras())
+
+    def test_duplicate_sources_are_allowed_only_with_explicit_benchmark_flag(self):
+        for value in ("1", "true", "yes", "on", "TRUE", " On "):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"ALLOW_DUPLICATE_CAMERA_SOURCES_FOR_BENCHMARK": value},
+                clear=True,
+            ):
+                normalized = normalize_cameras(self.cameras())
+                self.assertEqual([row["camera_id"] for row in normalized], ["cam_A", "cam_B"])
+
+    def test_false_like_benchmark_flag_keeps_duplicate_guard(self):
+        for value in ("", "0", "false", "no", "off", "unexpected"):
+            with self.subTest(value=value), patch.dict(
+                os.environ,
+                {"ALLOW_DUPLICATE_CAMERA_SOURCES_FOR_BENCHMARK": value},
+                clear=True,
+            ):
+                with self.assertRaises(DuplicateCameraSources):
+                    normalize_cameras(self.cameras())
+
+    def test_duplicate_camera_ids_remain_rejected_when_benchmark_flag_is_enabled(self):
+        cameras = self.cameras()
+        cameras[1]["camera_id"] = cameras[0]["camera_id"]
+        with patch.dict(
+            os.environ,
+            {"ALLOW_DUPLICATE_CAMERA_SOURCES_FOR_BENCHMARK": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(InvalidDesiredCameraState, "camera_id values must be unique"):
+                normalize_cameras(cameras)
+
+    def test_missing_source_remains_rejected_when_benchmark_flag_is_enabled(self):
+        cameras = self.cameras()
+        cameras[1]["source"] = ""
+        with patch.dict(
+            os.environ,
+            {"ALLOW_DUPLICATE_CAMERA_SOURCES_FOR_BENCHMARK": "1"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(InvalidDesiredCameraState, "camera source is missing or too long"):
+                normalize_cameras(cameras)
 
 
 class FakeChild:
