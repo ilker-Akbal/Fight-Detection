@@ -188,6 +188,15 @@ def run_camera_ingest_loop(
     ).lower() == "ordered"
     fight_policy = "ordered" if file_fight_ordered else "latest"
     preview_policy = "latest"
+    preview_live_fps = max(
+        0.0,
+        float(runtime.get("preview_live_max_fps", 10.0)),
+    )
+    preview_interval = (
+        0.0
+        if source_is_file or preview_live_fps <= 0.0
+        else 1.0 / preview_live_fps
+    )
 
     started = time.perf_counter()
     capture = None
@@ -198,6 +207,7 @@ def run_camera_ingest_loop(
     frames_dropped_fight = 0
     frames_published_preview = 0
     frames_dropped_preview = 0
+    last_preview_publish_monotonic = None
     reconnect_count = 0
     reconnect_delay = reconnect_initial
     source_fps = 0.0
@@ -379,21 +389,35 @@ def run_camera_ingest_loop(
                     frames_published_speed += int(published_speed)
                     frames_dropped_speed += dropped_speed
 
-                    with telemetry.measure("preview_enqueue_ms") if preview_channel is not None else nullcontext():
-                        published_preview, dropped_preview = publish_latest(
-                            preview_channel,
-                            envelope,
+                    preview_offered = (
+                        preview_channel is not None
+                        and (
+                            preview_interval <= 0.0
+                            or last_preview_publish_monotonic is None
+                            or captured_monotonic - last_preview_publish_monotonic
+                            >= preview_interval
                         )
+                    )
+                    with telemetry.measure("preview_enqueue_ms") if preview_offered else nullcontext():
+                        if preview_offered:
+                            published_preview, dropped_preview = publish_latest(
+                                preview_channel,
+                                envelope,
+                            )
+                        else:
+                            published_preview, dropped_preview = False, 0
+                    if published_preview:
+                        last_preview_publish_monotonic = captured_monotonic
                     frames_published_preview += int(published_preview)
                     frames_dropped_preview += int(
-                        dropped_preview or not published_preview
+                        dropped_preview or (preview_offered and not published_preview)
                     )
                     if telemetry.enabled:
                         telemetry.observe("fanout_ms", (time.perf_counter() - fanout_started) * 1000)
                         for name, offered, delivered, dropped in (
                             ("fight", fight_offered, published_fight, dropped_fight),
                             ("speed", speed_offered, published_speed, dropped_speed),
-                            ("preview", preview_channel is not None, published_preview, dropped_preview),
+                            ("preview", preview_offered, published_preview, dropped_preview),
                         ):
                             telemetry.count(name + "_offered", int(offered))
                             telemetry.count(name + "_enqueued", int(delivered))
