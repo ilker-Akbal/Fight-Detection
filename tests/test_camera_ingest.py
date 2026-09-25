@@ -157,7 +157,12 @@ class CameraIngestTests(unittest.TestCase):
         reports = queue.Queue()
         started = time.perf_counter()
         run_camera_ingest_loop(
-            {"runtime": {"camera_reconnect_enabled": True}},
+            {
+                "runtime": {
+                    "camera_reconnect_enabled": True,
+                    "preview_live_max_fps": 0,
+                }
+            },
             {"camera_id": "cam_live", "source": "rtsp://user:secret@example.test/live"},
             fight,
             preview,
@@ -175,6 +180,51 @@ class CameraIngestTests(unittest.TestCase):
         self.assertEqual(summary["frames_dropped_preview"], 9)
         self.assertNotIn("user", repr(rows))
         self.assertNotIn("secret", repr(rows))
+
+    def test_live_preview_fanout_is_throttled_before_ipc(self):
+        stop_event = threading.Event()
+        frames = [np.zeros((2, 2, 3), dtype=np.uint8) for _ in range(4)]
+        capture = FakeCapture(
+            frames,
+            stop_event=stop_event,
+            stop_after_frame=4,
+        )
+        fight = queue.Queue(maxsize=8)
+        preview = queue.Queue(maxsize=8)
+        reports = queue.Queue()
+
+        perf_values = iter([0.0, 10.0, 10.03, 10.06, 10.12, 10.2])
+        with patch(
+            "fight.pipeline_mp.camera_ingest.time.perf_counter",
+            side_effect=lambda: next(perf_values),
+        ):
+            run_camera_ingest_loop(
+                {
+                    "runtime": {
+                        "camera_reconnect_enabled": True,
+                        "preview_live_max_fps": 10,
+                    }
+                },
+                {"camera_id": "cam_live", "source": "rtsp://host/live"},
+                fight,
+                preview,
+                reports,
+                stop_event,
+                1,
+                capture_factory=lambda _: capture,
+                sleep_fn=lambda _: None,
+            )
+
+        preview_frames = [
+            item for item in _drain(preview) if isinstance(item, CameraFrame)
+        ]
+        self.assertEqual([item.frame_seq for item in preview_frames], [1, 4])
+
+        rows = _status_rows(reports)
+        summary = next(row for row in rows if row["detail"] == "summary")
+        self.assertEqual(summary["frames_decoded"], 4)
+        self.assertEqual(summary["frames_published_preview"], 2)
+        self.assertEqual(summary["frames_dropped_preview"], 0)
 
     def test_live_read_failure_reconnects_with_bounded_policy(self):
         stop_event = threading.Event()
