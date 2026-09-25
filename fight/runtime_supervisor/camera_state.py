@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -34,6 +35,13 @@ class DesiredCameraRevisionConflict(InvalidDesiredCameraState):
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _benchmark_duplicate_sources_allowed() -> bool:
+    """Explicit local benchmark escape hatch; production default remains fail-closed."""
+    return os.getenv("ALLOW_DUPLICATE_CAMERA_SOURCES_FOR_BENCHMARK", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def normalize_camera(camera: dict) -> dict:
@@ -78,7 +86,7 @@ def normalize_cameras(cameras) -> list[dict]:
     if len(ids) != len(set(ids)):
         raise InvalidDesiredCameraState("camera_id values must be unique")
     sources = [item["source"] for item in normalized if item["enabled"]]
-    if len(sources) != len(set(sources)):
+    if len(sources) != len(set(sources)) and not _benchmark_duplicate_sources_allowed():
         groups = {}
         for camera in normalized:
             if camera["enabled"]:
