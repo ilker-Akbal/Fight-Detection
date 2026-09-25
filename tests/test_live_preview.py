@@ -44,11 +44,57 @@ def test_preview_primary_path_has_no_disk_or_source_and_full_queue_keeps_latest(
     source.put(CameraIngestSignal("a", 1, "eof"))
     with patch("cv2.VideoCapture", side_effect=AssertionError("second source")), patch(
             "fight.pipeline_mp.camera_preview.write_preview_atomic", side_effect=AssertionError("disk")):
-        run_preview_consumer_loop({"output_dir": str(tmp_path)}, {"camera_id": "a"}, source,
-                                  queue.Queue(), threading.Event(), 1, slot_id=0, live_channel=live)
+        run_preview_consumer_loop(
+            {
+                "output_dir": str(tmp_path),
+                "runtime": {"preview_live_max_fps": 0},
+            },
+            {"camera_id": "a"},
+            source,
+            queue.Queue(),
+            threading.Event(),
+            1,
+            slot_id=0,
+            live_channel=live,
+        )
     packet = live.get_nowait()
     assert packet[3] == 3 and packet[-1].startswith(b"\xff\xd8")
     assert not list(tmp_path.iterdir())
+
+
+def test_live_preview_default_throttles_jpeg_encoding(tmp_path):
+    source, live = queue.Queue(), queue.Queue(4)
+    captured = time.perf_counter()
+    wall = time.time()
+    for seq in range(1, 4):
+        source.put(
+            CameraFrame(
+                "a",
+                1,
+                seq,
+                captured,
+                wall,
+                np.zeros((8, 8, 3), np.uint8),
+            )
+        )
+    source.put(CameraIngestSignal("a", 1, "eof"))
+
+    with patch("fight.pipeline_mp.camera_preview.time.monotonic", return_value=100.0):
+        run_preview_consumer_loop(
+            {"output_dir": str(tmp_path)},
+            {"camera_id": "a"},
+            source,
+            queue.Queue(),
+            threading.Event(),
+            1,
+            slot_id=0,
+            live_channel=live,
+        )
+
+    packet = live.get_nowait()
+    assert packet[3] == 1
+    with pytest.raises(queue.Empty):
+        live.get_nowait()
 
 
 def test_private_gateway_auth_and_two_viewers_share_latest_frame(tmp_path):
