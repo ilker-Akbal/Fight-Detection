@@ -62,8 +62,14 @@ def run_preview_consumer_loop(
     camera_id = str(camera["camera_id"])
     preview_path = MpPaths.from_output_dir(config["output_dir"]).previews_dir / f"{camera_id}.jpg"
     quality = int(runtime.get("preview_jpeg_quality", 75))
-    interval = (0.0 if live_channel is not None else
-                max(0.0, float(runtime.get("preview_write_interval_sec", 0.25))))
+    if live_channel is not None:
+        # Browser preview is observational and lossy by design. Encoding every
+        # source frame scales CPU roughly per camera without improving AI
+        # correctness, so cap the live JPEG publish rate by default.
+        live_fps = max(0.0, float(runtime.get("preview_live_max_fps", 10.0)))
+        interval = 0.0 if live_fps <= 0.0 else 1.0 / live_fps
+    else:
+        interval = max(0.0, float(runtime.get("preview_write_interval_sec", 0.25)))
     if live_channel is not None and hasattr(live_channel, "cancel_join_thread"):
         live_channel.cancel_join_thread()  # Lossy preview must never delay child exit.
     last_write = 0.0
