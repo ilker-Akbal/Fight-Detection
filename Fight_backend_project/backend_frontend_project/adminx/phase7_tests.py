@@ -506,6 +506,7 @@ class CentralizedFightPreviewTests(TestCase):
                 self.camera.camera_id,
                 (active.run_id, str(self.run_dir.resolve())),
                 self.preview.resolve(),
+                authorized=lambda: True,
             )
             self.assertIn(b"jpeg-frame", next(generator))
             with self.assertRaises(StopIteration):
@@ -524,6 +525,7 @@ class CentralizedFightPreviewTests(TestCase):
                 self.camera.camera_id,
                 (active.run_id, str(self.run_dir.resolve())),
                 self.preview.resolve(),
+                authorized=lambda: True,
             )
             next(generator)
             with self.assertRaises(StopIteration):

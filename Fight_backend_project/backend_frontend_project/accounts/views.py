@@ -3,7 +3,9 @@ from django.contrib import messages
 from django.contrib.auth import authenticate, login, logout, update_session_auth_hash
 from django.contrib.auth.decorators import login_required
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
 from django.contrib.auth.tokens import default_token_generator
+from django.core.exceptions import ValidationError
 from django.shortcuts import redirect, render
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
@@ -462,8 +464,11 @@ def password_reset_confirm(request, uidb64, token, version):
                 version=version,
             )
 
-        if len(password1) < 8:
-            messages.error(request, "Şifre en az 8 karakter olmalıdır.")
+        try:
+            validate_password(password1, user=user)
+        except ValidationError as exc:
+            for error in exc.messages:
+                messages.error(request, error)
             return redirect(
                 "accounts:password_reset_confirm",
                 uidb64=uidb64,

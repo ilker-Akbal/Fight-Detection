@@ -1,6 +1,7 @@
 from django import forms
 from django.contrib.auth.forms import PasswordChangeForm
 from django.contrib.auth.models import User
+from django.contrib.auth.password_validation import validate_password
 
 from adminx.models import FacultyLocation
 
@@ -106,6 +107,13 @@ class UserRegisterForm(forms.Form):
 
         password1 = cleaned_data.get("password1")
         password2 = cleaned_data.get("password2")
+
+        if password1:
+            email = cleaned_data.get("email", "")
+            try:
+                validate_password(password1, user=User(username=email, email=email))
+            except forms.ValidationError as exc:
+                self.add_error("password1", exc)
 
         if password1 and password2 and password1 != password2:
             self.add_error("password2", "Şifreler eşleşmiyor.")

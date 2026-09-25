@@ -1,0 +1,282 @@
+
+
+===== NEW FILE: Fight_backend_project/backend_frontend_project/guvenlik/security_tests.py =====
+
+"""The legacy disk fan-out must reauthorize, including while frames are idle."""
+import tempfile
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from django.contrib.auth.models import User
+from django.test import Client, SimpleTestCase, TestCase, override_settings
+from django.urls import include, path, reverse
+
+from adminx.models import Location, SecurityUnit, SecurityUnitCoverage, UserSecurityAssignment
+from streams.models import Camera
+
+
+def _test_error(request):
+    raise RuntimeError("PRIVATE_EXCEPTION_MARKER")
+
+
+urlpatterns = [
+    path("accounts/login/test-error/", _test_error),
+    path("", include("backend_frontend_project.urls")),
+]
+
+
+@override_settings(DEBUG=False, ROOT_URLCONF=__name__)
+class ProductionErrorTests(SimpleTestCase):
+    def test_errors_use_generic_templates_without_diagnostics(self):
+        client = Client(raise_request_exception=False)
+        for url, status, template in (("/accounts/login/test-error/", 500, "500.html"), ("/missing/", 404, "404.html")):
+            response = client.get(url)
+            self.assertEqual(response.status_code, status)
+            self.assertTemplateUsed(response, template)
+            for diagnostic in ("PRIVATE_EXCEPTION_MARKER", "Traceback", "URL patterns", "DJANGO_SETTINGS_MODULE"):
+                self.assertNotContains(response, diagnostic, status_code=status)
+
+
+class LegacyStreamSecurityTests(TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        override = override_settings(PIPELINE_OUTPUT_BASE=self.root)
+        override.enable()
+        self.addCleanup(override.disable)
+        self.user = User.objects.create_user("stream-security")
+        self.user.profile.status = "approved"
+        self.user.profile.save()
+        self.location = Location.objects.create(name="Gate", code="stream-security")
+        self.unit = SecurityUnit.objects.create(name="Security", code="stream-security", location=self.location)
+        self.coverage = SecurityUnitCoverage.objects.create(security_unit=self.unit, location=self.location)
+        self.assignment = UserSecurityAssignment.objects.create(user=self.user, security_unit=self.unit)
+        self.camera = Camera.objects.create(name="Gate", camera_id="stream-security", source="rtsp://127.0.0.1/live",
+                                            location=self.location, use_fight_detection=True)
+        run_dir = self.root / "active-run"
+        self.preview = run_dir / "previews" / "stream-security.jpg"
+        self.preview.parent.mkdir(parents=True)
+        self.preview.write_bytes(b"test-jpeg-frame")
+        self.active = SimpleNamespace(run_id="active-run", run_dir=run_dir, runtime_state="RUNNING", process=None)
+        self.client.force_login(self.user)
+        self.url = reverse("dashboard:stream", args=[self.camera.camera_id])
+
+    def assert_revocation(self, revoke):
+        # Zero interval makes the production periodic check deterministic in tests.
+        with patch("guvenlik.views.get_active_run", return_value=self.active), patch(
+            "guvenlik.views.PREVIEW_RUNTIME_CHECK_INTERVAL_SEC", 0
+        ), patch("cv2.VideoCapture") as capture:
+            response = self.client.get(self.url)
+            self.assertEqual(response.status_code, 200)
+            frames = iter(response.streaming_content)
+            self.assertIn(b"test-jpeg-frame", next(frames))
+            revoke()
+            # No new JPEG is needed: idle streams also terminate on revocation.
+            with self.assertRaises(StopIteration):
+                next(frames)
+            response.close()
+            self.assertIn(self.client.get(self.url).status_code, (302, 403, 404))
+            capture.assert_not_called()
+
+    def test_assignment_revocation(self):
+        self.assert_revocation(lambda: UserSecurityAssignment.objects.filter(pk=self.assignment.pk).update(active=False))
+
+    def test_unit_revocation(self):
+        self.assert_revocation(lambda: SecurityUnit.objects.filter(pk=self.unit.pk).update(active=False))
+
+    def test_coverage_revocation(self):
+        self.assert_revocation(lambda: SecurityUnitCoverage.objects.filter(pk=self.coverage.pk).update(active=False))
+
+    def test_location_revocation(self):
+        self.assert_revocation(lambda: Location.objects.filter(pk=self.location.pk).update(active=False))
+
+    def test_user_deactivation(self):
+        self.assert_revocation(lambda: User.objects.filter(pk=self.user.pk).update(is_active=False))
+
+    def test_approval_revocation(self):
+        self.assert_revocation(lambda: type(self.user.profile).objects.filter(user=self.user).update(status="pending"))
+
+    def test_camera_deactivation(self):
+        self.assert_revocation(lambda: Camera.objects.filter(pk=self.camera.pk).update(is_active=False))
+
+    def test_camera_no_longer_live(self):
+        self.assert_revocation(lambda: Camera.objects.filter(pk=self.camera.pk).update(source_kind="OFFLINE"))
+
+    def test_denied_before_first_frame_if_revoked_after_response_creation(self):
+        with patch("guvenlik.views.get_active_run", return_value=self.active):
+            response = self.client.get(self.url)
+            self.assignment.active = False
+            self.assignment.save()
+            with self.assertRaises(StopIteration):
+                next(iter(response.streaming_content))
+            response.close()
+
+
+===== NEW FILE: Fight_backend_project/backend_frontend_project/streams/security_tests.py =====
+
+"""Generic media is not an alternate authorization path or artifact browser."""
+import importlib
+import tempfile
+import uuid
+from pathlib import Path
+
+from django.contrib.auth.models import AnonymousUser, User
+from django.http import Http404
+from django.test import RequestFactory, TestCase, override_settings
+from django.urls import clear_url_caches
+from django.utils import timezone
+
+from adminx.models import Location, SecurityUnit, SecurityUnitCoverage, UserSecurityAssignment
+from incidents.models import Incident
+from streams.models import Camera, OfflineAsset, OfflineRun, OfflineResult
+from streams.protected_media import scoped_media
+
+
+class ScopedMediaSecurityTests(TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.media = self.root / "media"
+        self.media.mkdir()
+        override = override_settings(MEDIA_ROOT=self.media, INCIDENT_EVIDENCE_ROOTS=[self.media / "evidence"])
+        override.enable()
+        self.addCleanup(override.disable)
+        self.viewer = User.objects.create_user("media-viewer")
+        self.viewer.profile.status = "approved"
+        self.viewer.profile.save()
+        self.outsider = User.objects.create_user("media-outsider")
+        self.outsider.profile.status = "approved"
+        self.outsider.profile.save()
+        self.location = Location.objects.create(name="Gate", code="media-security")
+        unit = SecurityUnit.objects.create(name="Security", code="media-security", location=self.location)
+        SecurityUnitCoverage.objects.create(security_unit=unit, location=self.location)
+        self.assignment = UserSecurityAssignment.objects.create(user=self.viewer, security_unit=unit)
+        self.live = Camera.objects.create(name="Live", camera_id="media-live", source="rtsp://127.0.0.1/live", location=self.location)
+        self.historical = Camera.objects.create(name="Historical", camera_id="media-old", source=str(self.media / "original.mp4"), location=self.location)
+        self.asset = OfflineAsset.objects.create(name="Asset", file_path=str(self.file("original.mp4")), location=self.location)
+        run = OfflineRun.objects.create(asset=self.asset, analysis_type="FIGHT")
+        self.file("evidence/result.mp4")
+        OfflineResult.objects.create(run=run, event_id=uuid.uuid4(), analysis_type="FIGHT", evidence_path="evidence/result.mp4")
+        for camera, name in ((self.live, "live"), (self.historical, "historical")):
+            self.file(f"evidence/{name}.mp4")
+            Incident.objects.create(camera=camera, run_id="security", external_incident_id=name,
+                detected_at=timezone.now(), finalized_at=timezone.now(), evidence_valid=True,
+                evidence_path=f"evidence/{name}.mp4")
+
+    def file(self, name):
+        path = self.media / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"MEDIA_TEST_MARKER")
+        return path.resolve()
+
+    def request(self, name, user):
+        request = RequestFactory().get("/dashboard/media/" + name)
+        request.user = user
+        return scoped_media(request, name, document_root=self.media)
+
+    def test_recognized_objects_allow_scope_and_deny_outsiders_in_both_modes(self):
+        for debug in (True, False):
+            with override_settings(DEBUG=debug):
+                for name in ("original.mp4", "evidence/result.mp4", "evidence/live.mp4", "evidence/historical.mp4"):
+                    with self.subTest(debug=debug, media=name):
+                        response = self.request(name, self.viewer)
+                        self.assertEqual(b"".join(response.streaming_content), b"MEDIA_TEST_MARKER")
+                        response.close()
+                        for user in (self.outsider, AnonymousUser()):
+                            with self.assertRaises(Http404):
+                                self.request(name, user)
+
+    def test_unknown_operational_and_unregistered_media_deny_even_admin(self):
+        admin = User.objects.create_superuser("media-admin", "media-admin@example.test", "Test-only!password-923")
+        for debug in (True, False):
+            with override_settings(DEBUG=debug):
+                for name in ("unknown.mp4", "run_config.json", "stderr.log", "runtime_health.json",
+                             "runtime_spool/status.json", "previews/camera.jpg"):
+                    self.file(name)
+                    for user in (admin, self.viewer, self.outsider):
+                        with self.subTest(debug=debug, media=name, user=user.username), self.assertRaises(Http404):
+                            self.request(name, user)
+
+    def test_containment_and_invalid_incident_evidence(self):
+        (self.root / "outside.mp4").write_bytes(b"outside")
+        with self.assertRaises(Http404):
+            self.request("../outside.mp4", self.viewer)
+        with self.assertRaises(Http404):
+            self.request(str(self.root / "outside.mp4"), self.viewer)
+        Incident.objects.filter(external_incident_id="live").update(evidence_valid=False)
+        with self.assertRaises(Http404):
+            self.request("evidence/live.mp4", self.viewer)
+
+    def test_revoked_scope_denies_registered_media(self):
+        self.assignment.active = False
+        self.assignment.save()
+        for name in ("original.mp4", "evidence/result.mp4", "evidence/live.mp4", "evidence/historical.mp4"):
+            with self.assertRaises(Http404):
+                self.request(name, self.viewer)
+
+    def test_development_route_uses_guard_and_production_route_is_absent(self):
+        from guvenlik import urls as dashboard_urls
+        from backend_frontend_project import urls as root_urls
+        self.client.force_login(self.viewer)
+        try:
+            for debug in (True, False):
+                with override_settings(DEBUG=debug):
+                    importlib.reload(dashboard_urls)
+                    importlib.reload(root_urls)
+                    clear_url_caches()
+                    response = self.client.get("/dashboard/media/evidence/live.mp4")
+                    self.assertEqual(response.status_code, 200 if debug else 404)
+                    response.close()
+                    self.assertEqual(self.client.get("/dashboard/media/run_config.json").status_code, 404)
+        finally:
+            importlib.reload(dashboard_urls)
+            importlib.reload(root_urls)
+            clear_url_caches()
+
+
+===== NEW FILE: tests/test_security_hardening.py =====
+
+"""Run security regressions without touching the application's database or runtime."""
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+
+BACKEND = Path(__file__).resolve().parents[1] / "Fight_backend_project" / "backend_frontend_project"
+
+
+def test_django_security_regressions_in_isolated_database():
+    code = (
+        "import os; os.environ['DJANGO_SETTINGS_MODULE']='backend_frontend_project.settings'; "
+        "from django.conf import settings; "
+        "settings.DATABASES={'default':{'ENGINE':'django.db.backends.sqlite3','NAME':':memory:'}}; "
+        "import django; django.setup(); from django.core.management import call_command; "
+        "call_command('test','accounts.tests','speed_detection.tests','guvenlik.security_tests',"
+        "'streams.security_tests',verbosity=1,interactive=False)"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=BACKEND, capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("value,expected", [(None, False), ("0", False), ("1", True)])
+def test_debug_default_and_explicit_opt_in(value, expected):
+    # Disable dotenv only in this child process: test the setting's default,
+    # independently of an operator's explicit development opt-in in .env.
+    env = dict(os.environ)
+    env.pop("DJANGO_DEBUG", None)
+    if value is not None:
+        env["DJANGO_DEBUG"] = value
+    code = (
+        "import runpy, sys, types; "
+        "sys.modules['dotenv']=types.SimpleNamespace(load_dotenv=lambda *a, **kw: None); "
+        "settings=runpy.run_module('backend_frontend_project.settings'); "
+        f"assert settings['DEBUG'] is {expected!r}"
+    )
+    result = subprocess.run([sys.executable, "-c", code], cwd=BACKEND, env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr

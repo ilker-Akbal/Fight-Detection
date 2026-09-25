@@ -610,17 +610,16 @@ def save_speed_calibration(request, camera_id):
                 "ok": True,
                 "message": "Hız kalibrasyonu kaydedildi.",
                 "camera_id": camera.camera_id,
-                "calibration_path": str(saved_path),
                 "calibration_ready": ready,
                 "calibration_reason": reason,
             }
         )
 
-    except Exception as exc:
+    except Exception:
         return JsonResponse(
             {
                 "ok": False,
-                "message": f"Kalibrasyon kaydedilemedi: {exc}",
+                "message": "Kalibrasyon kaydedilemedi. Ayarları kontrol edin.",
             },
             status=400,
         )
@@ -647,21 +646,50 @@ def speed_camera_stream(request, camera_id):
     response["X-Accel-Buffering"] = "no"
 
     return response
+
+
+# Browser contracts deliberately exclude runtime/configuration paths, raw source
+# URLs, arbitrary status detail/error strings, and unrecognized future fields.
+_PUBLIC_CAMERA_FIELDS = (
+    "camera_id", "name", "description", "faculty", "location_id", "location",
+    "speed_limit_kmh", "tolerance_kmh", "calibration_ready", "roi_enabled",
+    "save_snapshot", "save_clip", "admin_url", "stream_url", "preview_url",
+    "stage", "last_ts", "frame_idx", "fps", "tracks", "motion_active",
+    "latest_speed_kmh", "latest_violation",
+)
+_PUBLIC_EVENT_FIELDS = (
+    "camera_id", "run_name", "track_id", "frame_idx", "vehicle_class",
+    "speed_kmh", "speed_limit_kmh", "tolerance_kmh", "threshold_kmh",
+    "created_at", "created_at_text", "snapshot_exists", "clip_exists",
+    "snapshot_url", "clip_url",
+)
+_PUBLIC_STATUS_FIELDS = (
+    "camera_id", "stage", "ts", "created_at", "frame_idx", "fps", "tracks",
+    "motion_active", "latest_speed_kmh", "latest_violation",
+)
+
+
+def _public_rows(rows, fields):
+    return [
+        {key: row[key] for key in fields
+         if key in row and isinstance(row[key], (str, int, float, bool, type(None)))}
+        for row in rows
+    ]
+
+
 def _payload(user=None) -> dict:
     report = _pipeline_report(user)
 
     return {
         "ok": True,
         "running": report.get("running", False),
-        "pid": report.get("pid"),
         "return_code": report.get("return_code"),
         "run_name": report.get("run_name", ""),
-        "run_dir": report.get("run_dir", ""),
         "camera_count": report.get("camera_count", 0),
-        "cameras": report.get("cameras", []),
-        "events": report.get("events", []),
-        "recent_status": report.get("recent_status", []),
-        "last_error": report.get("last_error", ""),
+        "cameras": _public_rows(report.get("cameras", []), _PUBLIC_CAMERA_FIELDS),
+        "events": _public_rows(report.get("events", []), _PUBLIC_EVENT_FIELDS),
+        "recent_status": _public_rows(report.get("recent_status", []), _PUBLIC_STATUS_FIELDS),
+        "last_error": "Runtime error; contact an administrator." if report.get("last_error") else "",
     }
 
 
@@ -685,7 +713,6 @@ def start_speed_detection(request):
                     "running": True,
                     "already_running": True,
                     "pid": active.process.pid,
-                    "run_dir": str(active.run_dir),
                     "run_name": active.run_name,
                 },
                 status=200,
@@ -739,7 +766,7 @@ def start_speed_detection(request):
                     "message": message,
                     "running": False,
                     "calibration_required": True,
-                    "not_ready": not_ready,
+                    "not_ready": _public_rows(not_ready, _PUBLIC_CAMERA_FIELDS),
                 },
                 status=400,
             )
@@ -757,9 +784,7 @@ def start_speed_detection(request):
         if return_code is not None:
             speed_runtime.set(None)
 
-            run_dir = Path(active_run.run_dir)
-            err_text = _speed_run_error_text(run_dir)
-            short_err = err_text[-1600:] if err_text else "Pipeline hemen kapandı fakat stderr.log içinde detay bulunamadı."
+            short_err = "Pipeline başlatılamadı. Yönetici ile iletişime geçin."
 
             message = (
                 "Hız tespiti başlatılamadı. "
@@ -774,7 +799,6 @@ def start_speed_detection(request):
                         "message": message,
                         "running": False,
                         "return_code": return_code,
-                        "run_dir": str(active_run.run_dir),
                         "run_name": active_run.run_name,
                         "last_error": short_err,
                     },
@@ -796,7 +820,6 @@ def start_speed_detection(request):
                     "running": True,
                     "camera_count": len(active_run.cameras),
                     "pid": active_run.process.pid,
-                    "run_dir": str(active_run.run_dir),
                     "run_name": active_run.run_name,
                 },
                 status=200,
@@ -805,10 +828,10 @@ def start_speed_detection(request):
         messages.success(request, message)
         return redirect("speed_detection:index")
 
-    except Exception as exc:
+    except Exception:
         speed_runtime.set(None)
 
-        message = f"Hız tespiti başlatılamadı: {exc}"
+        message = "Hız tespiti başlatılamadı. Yönetici ile iletişime geçin."
 
         if is_ajax:
             return JsonResponse(
@@ -869,8 +892,8 @@ def stop_speed_detection(request):
         messages.success(request, message)
         return redirect("speed_detection:index")
 
-    except Exception as exc:
-        message = f"Hız tespiti durdurulamadı: {exc}"
+    except Exception:
+        message = "Hız tespiti durdurulamadı. Yönetici ile iletişime geçin."
 
         if is_ajax:
             return JsonResponse(

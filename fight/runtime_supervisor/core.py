@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
 import json
 import os
 import signal
@@ -48,11 +50,54 @@ def _path_is_within(path: Path, root: Path) -> bool:
         return False
 
 
-def _pid_exists(pid: int) -> bool:
-    if int(pid) <= 0:
+def _windows_pid_exists(pid: int) -> bool:
+    # DWORD PIDs must not wrap to a different (potentially live) process.
+    if pid > 0xFFFFFFFF:
         return False
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    kernel32.WaitForSingleObject.restype = wintypes.DWORD
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    # SYNCHRONIZE only: no signal, termination, or process-memory permissions.
+    handle = kernel32.OpenProcess(0x00100000, False, pid)
+    if not handle:
+        error = ctypes.get_last_error()
+        if error == 87:  # ERROR_INVALID_PARAMETER: no such PID.
+            return False
+        if error == 5:  # ERROR_ACCESS_DENIED: conservatively retain orphan protection.
+            return True
+        raise ctypes.WinError(error)
     try:
-        os.kill(int(pid), 0)
+        # A terminated process may still have an open handle. Test its signaled
+        # state, not merely whether OpenProcess succeeded (or its exit code).
+        result = kernel32.WaitForSingleObject(handle, 0)
+        if result == 0:  # WAIT_OBJECT_0: process exited.
+            return False
+        if result == 258:  # WAIT_TIMEOUT: process still running.
+            return True
+        if result == 0xFFFFFFFF:  # WAIT_FAILED.
+            raise ctypes.WinError(ctypes.get_last_error())
+        raise OSError(f"unexpected process wait result: {result}")
+    finally:
+        if not kernel32.CloseHandle(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        return _windows_pid_exists(pid)
+    try:
+        os.kill(pid, 0)
         return True
     except ProcessLookupError:
         return False
@@ -243,7 +288,7 @@ class RuntimeSupervisor:
                 "restart_count": int(previous.get("restart_count", 0) or 0),
             }
         )
-        if previous_pid and previous_state in ACTIVE_STATES | {RUNNING}:
+        if previous_pid and (previous_state in ACTIVE_STATES or previous.get("orphan_detected")):
             if self._pid_exists(int(previous_pid)):
                 self._state.update(
                     {
@@ -353,6 +398,8 @@ class RuntimeSupervisor:
                 setattr(self, attr, None)
 
     def _launch_locked(self, config_path: str | Path, *, is_restart: bool) -> dict:
+        if self._state.get("orphan_detected"):
+            raise InvalidRuntimeConfig("orphan_detected_unverified_process")
         with SingletonLock(self.config.state_dir / "maintenance.lock"):
             return self._launch_under_maintenance_lock(config_path, is_restart=is_restart)
 
@@ -509,6 +556,11 @@ class RuntimeSupervisor:
         self._refresh_child_locked()
         child = self._child
         if child is None:
+            if self._state.get("orphan_detected"):
+                # We do not own this PID: neither stop it nor erase the fence.
+                response = self.status()
+                response["result"] = "orphan_detected_unverified_process"
+                return response
             self._state.update(
                 {
                     "supervisor_state": STOPPED,

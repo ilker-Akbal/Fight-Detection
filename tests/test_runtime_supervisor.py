@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import queue
 
 from fight.runtime_supervisor.client import (
@@ -22,6 +25,8 @@ from fight.runtime_supervisor.core import (
     STOPPED,
     RuntimeSupervisor,
     SupervisorConfig,
+    InvalidRuntimeConfig,
+    _pid_exists,
 )
 from fight.runtime_supervisor.http_api import create_http_server
 from fight.runtime_supervisor.camera_state import (
@@ -32,6 +37,102 @@ from fight.runtime_supervisor.locking import SingletonLock, SingletonLockError
 from fight.pipeline_mp.messages import ReportMessage
 from fight.pipeline_mp.performance import build_performance_summary
 from fight.pipeline_mp.reporter import reporter_process_main
+
+
+@contextmanager
+def mocked_windows_probe(*, handle=0x100000001, wait_result=258, error=87):
+    """Exercise the real probe logic on any host, without querying arbitrary PIDs."""
+    kernel32 = Mock()
+    kernel32.OpenProcess.return_value = handle
+    kernel32.WaitForSingleObject.return_value = wait_result
+    kernel32.CloseHandle.return_value = True
+    with patch("fight.runtime_supervisor.core.os", wraps=os) as platform_os, patch(
+        "fight.runtime_supervisor.core.ctypes.WinDLL", return_value=kernel32, create=True
+    ), patch("fight.runtime_supervisor.core.ctypes.get_last_error", return_value=error, create=True), patch(
+        "fight.runtime_supervisor.core.ctypes.WinError",
+        side_effect=lambda code: OSError(code, "Windows probe error"), create=True,
+    ):
+        platform_os.name = "nt"
+        platform_os.kill.side_effect = SystemError("<built-in function kill> returned a result with an exception set")
+        yield kernel32
+        platform_os.kill.assert_not_called()
+
+
+class PidExistenceTests(unittest.TestCase):
+    def test_windows_stale_pid_does_not_use_broken_kill_probe(self):
+        with mocked_windows_probe(handle=0) as kernel32:
+            self.assertFalse(_pid_exists(16264))
+            kernel32.OpenProcess.assert_called_once_with(0x00100000, False, 16264)
+            kernel32.WaitForSingleObject.assert_not_called()
+            kernel32.CloseHandle.assert_not_called()
+
+    def test_windows_live_and_exited_handles_are_closed(self):
+        for result, alive in ((258, True), (0, False)):
+            with self.subTest(result=result), mocked_windows_probe(wait_result=result) as kernel32:
+                self.assertIs(_pid_exists(16264), alive)
+                kernel32.WaitForSingleObject.assert_called_once_with(0x100000001, 0)
+                kernel32.CloseHandle.assert_called_once_with(0x100000001)
+
+    def test_windows_access_denied_conservatively_means_alive(self):
+        with mocked_windows_probe(handle=0, error=5):
+            self.assertTrue(_pid_exists(16264))
+
+    def test_windows_unrelated_open_error_is_not_suppressed(self):
+        with mocked_windows_probe(handle=0, error=8), self.assertRaises(OSError) as raised:
+            _pid_exists(16264)
+        self.assertEqual(raised.exception.errno, 8)
+
+    def test_windows_wait_errors_surface_and_release_handle(self):
+        for result in (0xFFFFFFFF, 128):
+            with self.subTest(result=result), mocked_windows_probe(wait_result=result, error=6) as kernel32:
+                with self.assertRaises(OSError):
+                    _pid_exists(16264)
+                kernel32.CloseHandle.assert_called_once_with(0x100000001)
+
+    def test_windows_close_error_is_not_suppressed(self):
+        with mocked_windows_probe(error=6) as kernel32:
+            kernel32.CloseHandle.return_value = False
+            with self.assertRaises(OSError) as raised:
+                _pid_exists(16264)
+            self.assertEqual(raised.exception.errno, 6)
+
+    def test_invalid_and_nonpositive_pids_never_query_windows(self):
+        with mocked_windows_probe() as kernel32:
+            for pid in (None, "invalid", "", 0, -1, -16264, float("inf"), 2**32):
+                with self.subTest(pid=pid):
+                    self.assertFalse(_pid_exists(pid))
+            kernel32.OpenProcess.assert_not_called()
+
+    def test_non_windows_kill_probe_behavior_is_unchanged(self):
+        with patch("fight.runtime_supervisor.core.os", wraps=os) as platform_os, patch(
+            "fight.runtime_supervisor.core._windows_pid_exists"
+        ) as windows_probe:
+            platform_os.name = "posix"
+            platform_os.kill = Mock()
+            for error, alive in ((None, True), (ProcessLookupError(), False),
+                                 (PermissionError(), True), (OSError(), False)):
+                with self.subTest(error=type(error).__name__):
+                    platform_os.kill.reset_mock()
+                    platform_os.kill.side_effect = error
+                    self.assertIs(_pid_exists(12345), alive)
+                    platform_os.kill.assert_called_once_with(12345, 0)
+            platform_os.kill.reset_mock()
+            for pid in (0, -1):
+                self.assertFalse(_pid_exists(pid))
+            platform_os.kill.assert_not_called()
+            platform_os.kill.side_effect = SystemError("unrelated failure")
+            with self.assertRaises(SystemError):
+                _pid_exists(12345)
+            windows_probe.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "native Windows API smoke test")
+    def test_native_windows_current_and_naturally_exited_process(self):
+        # Read-only query of ourselves and a child that exits on its own.
+        with patch("fight.runtime_supervisor.core.os.kill", side_effect=SystemError("broken kill probe")):
+            self.assertTrue(_pid_exists(os.getpid()))
+            with subprocess.Popen([sys.executable, "-c", "pass"]) as child:
+                child.wait(timeout=10)
+                self.assertFalse(_pid_exists(child.pid))
 
 
 class FakeChild:
@@ -299,6 +400,57 @@ class RuntimeSupervisorTests(unittest.TestCase):
         self.assertTrue(status["orphan_detected"])
         self.assertEqual(status["runtime_pid"], 12345)
 
+    def test_windows_stale_pid_reconciles_despite_legacy_systemerror(self):
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        state_path = state_dir / "runtime_state.json"
+        state_path.write_text(json.dumps({"runtime_state": RUNNING, "runtime_pid": 16264}), encoding="utf-8")
+        factory = Factory()
+        with mocked_windows_probe(handle=0):
+            supervisor = self.make_supervisor(factory)
+        status = supervisor.status()
+        self.assertEqual(status["runtime_state"], STOPPED)
+        self.assertIsNone(status["runtime_pid"])
+        self.assertFalse(status["orphan_detected"])
+        self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["runtime_state"], STOPPED)
+        self.assertEqual(factory.calls, [])
+        self.assertIn("stale_pid_reconciled", supervisor.telemetry_path.read_text(encoding="utf-8"))
+        self.assertEqual(supervisor.start(self.config_path)["result"], "started")
+        self.assertEqual(len(factory.calls), 1)
+
+    def test_windows_live_or_denied_pid_fences_start_stop_restart_and_reconciliation(self):
+        state_dir = self.root / "state"
+        state_dir.mkdir()
+        state_path = state_dir / "runtime_state.json"
+        for handle, error in ((0x100000001, 0), (0, 5)):
+            with self.subTest(handle=handle):
+                state_path.write_text(json.dumps({"runtime_state": RUNNING, "runtime_pid": 16264}), encoding="utf-8")
+                factory, commands = Factory(), Mock()
+                with mocked_windows_probe(handle=handle, error=error):
+                    supervisor = self.make_supervisor(factory, command_runner=commands)
+                    for operation in (supervisor.start, supervisor.restart):
+                        with self.assertRaisesRegex(InvalidRuntimeConfig, "orphan_detected_unverified_process"):
+                            operation(self.config_path)
+                    self.assertEqual(supervisor.stop()["runtime_state"], FAILED)
+                    persisted = json.loads(state_path.read_text(encoding="utf-8"))
+                    self.assertTrue(persisted["orphan_detected"])
+                    self.assertEqual(persisted["runtime_pid"], 16264)
+                    self.assertEqual(persisted["last_failure"], "orphan_detected_unverified_process")
+                    supervisor.close(stop_runtime=False)
+                    # A second Supervisor must not mistake persisted FAILED for STOPPED.
+                    reopened = self.make_supervisor(factory, command_runner=commands)
+                    with self.assertRaisesRegex(InvalidRuntimeConfig, "orphan_detected_unverified_process"):
+                        reopened.start(self.config_path)
+                    reopened.close(stop_runtime=False)
+                self.assertEqual(factory.calls, [])
+                commands.assert_not_called()
+                # Once the persisted orphan is genuinely gone, startup clears it.
+                with mocked_windows_probe(handle=0):
+                    recovered = self.make_supervisor(factory, command_runner=commands)
+                self.assertEqual(recovered.status()["runtime_state"], STOPPED)
+                self.assertFalse(recovered.status()["orphan_detected"])
+                recovered.close(stop_runtime=False)
+
     def test_config_outside_allowlist_is_rejected(self):
         outside_dir = tempfile.TemporaryDirectory()
         try:
@@ -321,7 +473,18 @@ class RuntimeSupervisorTests(unittest.TestCase):
         try:
             valid = RuntimeSupervisorClient(url, secret, timeout=1.0)
             invalid = RuntimeSupervisorClient(url, "wrong", timeout=1.0)
-            self.assertTrue(valid.health()["ok"])
+            self.assertEqual(invalid.health(), {"ok": True, "service": "runtime_supervisor"})
+            with patch.object(supervisor, "status", side_effect=AssertionError("private state read")):
+                self.assertEqual(valid.health(), {"ok": True, "service": "runtime_supervisor"})
+            for operation in (
+                lambda: valid._request("GET", "/status"),  # Missing bearer.
+                invalid.status, invalid.stop, invalid.restart,
+                invalid.desired_cameras, invalid.runtime_health,
+                lambda: invalid.update_desired_cameras({}),
+            ):
+                with self.subTest(operation=operation), self.assertRaises(SupervisorRequestError) as denied:
+                    operation()
+                self.assertEqual(denied.exception.http_status, 401)
             self.assertEqual(valid.status()["runtime_state"], STOPPED)
             with self.assertRaises(SupervisorRequestError) as rejected:
                 invalid.start(str(self.config_path))

@@ -65,11 +65,13 @@ def create_http_server(supervisor, *, host: str, port: int, token: str):
                     {
                         "ok": True,
                         "service": "runtime_supervisor",
-                        "supervisor_pid": supervisor.status()["supervisor_pid"],
                     },
                 )
                 return
             if path == "/status":
+                if not self._authorized():
+                    self._send(401, {"ok": False, "error": "unauthorized"})
+                    return
                 self._send(200, supervisor.status())
                 return
             if path == "/runtime/cameras":

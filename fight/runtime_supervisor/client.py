@@ -58,7 +58,7 @@ class RuntimeSupervisorClient:
         return self._request("GET", "/health")
 
     def status(self) -> dict:
-        return self._request("GET", "/status")
+        return self._request("GET", "/status", authenticated=True)
 
     def start(self, config_path: str) -> dict:
         return self._request("POST", "/start", {"config_path": str(config_path)})

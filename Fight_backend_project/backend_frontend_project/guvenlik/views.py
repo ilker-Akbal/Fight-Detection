@@ -9,6 +9,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.contrib import messages
+from django.contrib.auth import get_user_model
 from django.contrib.auth.decorators import login_required
 from django.core.cache import cache
 from django.core.exceptions import PermissionDenied, ValidationError
@@ -967,13 +968,26 @@ def _active_preview_context(camera_id: str):
     return token, preview_path
 
 
-def _preview_file_mjpeg_generator(camera_id: str, run_token, preview_path: Path):
+def _legacy_preview_authorized(user_id, camera_id: str) -> bool:
+    # Never reuse the request's cached user/profile across a long-lived stream.
+    user = get_user_model().objects.select_related("profile").filter(pk=user_id, is_active=True).first()
+    if user is None:
+        return False
+    profile = getattr(user, "profile", None)
+    if not (user.is_staff or user.is_superuser or (profile and profile.is_approved)):
+        return False
+    return _camera_queryset_for_user(user, active_only=True).filter(camera_id=camera_id).exists()
+
+
+def _preview_file_mjpeg_generator(camera_id: str, run_token, preview_path: Path, *, authorized):
     """Fan out the ingest-owned JPEG without opening the physical camera."""
     last_signature = None
     next_runtime_check = 0.0
     while True:
         monotonic_now = time.monotonic()
         if monotonic_now >= next_runtime_check:
+            if not authorized():
+                return
             current = _active_preview_context(camera_id)
             if current is None or current[0] != run_token:
                 return
@@ -1002,6 +1016,10 @@ def _preview_file_mjpeg_generator(camera_id: str, run_token, preview_path: Path)
 def stream(request, camera_id):
     _make_session_readonly(request)
 
+    user_id = request.user.pk
+    if not _legacy_preview_authorized(user_id, camera_id):
+        raise Http404
+
     get_object_or_404(
         _camera_queryset_for_user(request.user, active_only=True),
         camera_id=camera_id,
@@ -1012,7 +1030,10 @@ def stream(request, camera_id):
         raise Http404("Aktif kamera preview bulunamadı")
     run_token, preview_path = context
     return StreamingHttpResponse(
-        _preview_file_mjpeg_generator(camera_id, run_token, preview_path),
+        _preview_file_mjpeg_generator(
+            camera_id, run_token, preview_path,
+            authorized=lambda: _legacy_preview_authorized(user_id, camera_id),
+        ),
         content_type="multipart/x-mixed-replace; boundary=frame",
     )
 
